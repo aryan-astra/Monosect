@@ -1,0 +1,2 @@
+#define IDI_MONOSECT_ICON 101
+IDI_MONOSECT_ICON ICON "Monosect.ico"
