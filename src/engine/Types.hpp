@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <cctype>
 #include <filesystem>
+#include <functional>
 #include <optional>
 #include <string>
 #include <vector>
@@ -56,14 +57,22 @@ enum class PrecisionMode {
 };
 
 struct SplitRequest {
+    using ProgressCallback = std::function<void(double progress01, const std::string& status)>;
+    using CancelCallback = std::function<bool()>;
+    using PauseCallback = std::function<bool()>;
+
     std::filesystem::path inputPath;
     std::filesystem::path outputDirectory;
     SplitMode splitMode = SplitMode::ExactTime;
     PrecisionMode precisionMode = PrecisionMode::StrictLossless;
     std::optional<double> splitTimeSeconds;
     std::optional<int64_t> splitSizeBytes;
+    std::optional<int64_t> minimumFileSizeBytes;
     bool unrestrictedMode = false;
     bool useHardwareAcceleration = true;
+    ProgressCallback onProgress;
+    CancelCallback shouldCancel;
+    PauseCallback shouldPause;
 };
 
 struct SplitResult {

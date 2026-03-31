@@ -55,17 +55,57 @@ std::string readPipe(HANDLE handle) {
     return data;
 }
 
+void streamPipeLines(HANDLE handle, std::string& aggregate, const FFmpegProcess::OutputCallback& callback) {
+    constexpr DWORD bufferSize = 4096;
+    char buffer[bufferSize];
+    DWORD bytesRead = 0;
+    std::string pending;
+
+    while (ReadFile(handle, buffer, bufferSize, &bytesRead, nullptr) && bytesRead > 0) {
+        aggregate.append(buffer, buffer + bytesRead);
+        pending.append(buffer, buffer + bytesRead);
+        std::size_t lineStart = 0;
+        while (true) {
+            const std::size_t newline = pending.find('\n', lineStart);
+            if (newline == std::string::npos) {
+                pending.erase(0, lineStart);
+                break;
+            }
+            std::string line = pending.substr(lineStart, newline - lineStart);
+            if (!line.empty() && line.back() == '\r') {
+                line.pop_back();
+            }
+            if (callback) {
+                callback(line);
+            }
+            lineStart = newline + 1;
+        }
+    }
+
+    if (!pending.empty()) {
+        if (!pending.empty() && pending.back() == '\r') {
+            pending.pop_back();
+        }
+        if (callback) {
+            callback(pending);
+        }
+    }
+}
+
 } // namespace
 
 FFmpegProcess::FFmpegProcess(std::string ffmpegBinary, std::string ffprobeBinary)
     : ffmpegBinary_(std::move(ffmpegBinary)), ffprobeBinary_(std::move(ffprobeBinary)) {}
 
-FFmpegProcess::Result FFmpegProcess::runFFmpeg(const std::vector<std::string>& args) const {
-    return runProcess(ffmpegBinary_, args);
+FFmpegProcess::Result FFmpegProcess::runFFmpeg(
+    const std::vector<std::string>& args,
+    const OutputCallback& onStdErr,
+    const CancelCallback& shouldCancel) const {
+    return runProcess(ffmpegBinary_, args, nullptr, onStdErr, shouldCancel);
 }
 
 FFmpegProcess::Result FFmpegProcess::runFFprobe(const std::vector<std::string>& args) const {
-    return runProcess(ffprobeBinary_, args);
+    return runProcess(ffprobeBinary_, args, nullptr, nullptr, nullptr);
 }
 
 namespace {
@@ -92,7 +132,12 @@ std::string formatWindowsError(DWORD code) {
 
 } // namespace
 
-FFmpegProcess::Result FFmpegProcess::runProcess(const std::string& program, const std::vector<std::string>& args) const {
+FFmpegProcess::Result FFmpegProcess::runProcess(
+    const std::string& program,
+    const std::vector<std::string>& args,
+    const OutputCallback& onStdOut,
+    const OutputCallback& onStdErr,
+    const CancelCallback& shouldCancel) const {
     Result result;
 
     if (program.empty()) {
@@ -167,21 +212,49 @@ FFmpegProcess::Result FFmpegProcess::runProcess(const std::string& program, cons
     std::string stdErrBuffer;
 
     std::thread outReader([&]() {
+        if (onStdOut) {
+            streamPipeLines(outRead, stdOutBuffer, onStdOut);
+            return;
+        }
         stdOutBuffer = readPipe(outRead);
     });
     std::thread errReader([&]() {
+        if (onStdErr) {
+            streamPipeLines(errRead, stdErrBuffer, onStdErr);
+            return;
+        }
         stdErrBuffer = readPipe(errRead);
     });
 
-    const DWORD waitResult = WaitForSingleObject(processInfo.hProcess, INFINITE);
-    if (waitResult == WAIT_FAILED) {
-        result.stdErr = "Failed waiting for process: " + formatWindowsError(GetLastError());
+    DWORD exitCode = 1;
+    bool canceled = false;
+    while (true) {
+        const DWORD waitResult = WaitForSingleObject(processInfo.hProcess, 50);
+        if (waitResult == WAIT_OBJECT_0) {
+            break;
+        }
+        if (waitResult == WAIT_FAILED) {
+            result.stdErr = "Failed waiting for process: " + formatWindowsError(GetLastError());
+            break;
+        }
+
+        if (shouldCancel && shouldCancel()) {
+            TerminateProcess(processInfo.hProcess, 130);
+            canceled = true;
+            break;
+        }
     }
 
-    DWORD exitCode = 1;
     if (!GetExitCodeProcess(processInfo.hProcess, &exitCode)) {
-        result.stdErr += "\nFailed to get process exit code: " + formatWindowsError(GetLastError());
+        if (!result.stdErr.empty()) {
+            result.stdErr += "\n";
+        }
+        result.stdErr += "Failed to get process exit code: " + formatWindowsError(GetLastError());
         exitCode = 1;
+    }
+
+    if (canceled) {
+        exitCode = 130;
     }
 
     if (outReader.joinable()) {
@@ -197,7 +270,13 @@ FFmpegProcess::Result FFmpegProcess::runProcess(const std::string& program, cons
     }
     result.stdErr += std::move(stdErrBuffer);
     result.exitCode = static_cast<int>(exitCode);
-    result.ok = (exitCode == 0);
+    result.ok = (exitCode == 0) && !canceled;
+    if (canceled) {
+        if (!result.stdErr.empty()) {
+            result.stdErr += "\n";
+        }
+        result.stdErr += "Process canceled";
+    }
 
     CloseHandle(outRead);
     CloseHandle(errRead);

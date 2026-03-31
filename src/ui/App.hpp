@@ -13,11 +13,15 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
+#include <cstdint>
 #include <filesystem>
 #include <mutex>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <thread>
+#include <utility>
 #include <vector>
 
 struct GLFWwindow;
@@ -33,6 +37,15 @@ public:
     void run();
 
 private:
+    struct QueueEntry {
+        uint64_t id = 0;
+        std::filesystem::path path;
+        double progress01 = 0.0;
+        std::string status = "Queued";
+        int estimatedChunks = 0;
+        bool hasEstimate = false;
+    };
+
     GLFWwindow* window_ = nullptr;
 
     SplitEngine splitEngine_;
@@ -42,9 +55,10 @@ private:
     ThreadPool threadPool_;
     WatchFolder watchFolder_;
 
-    std::vector<std::filesystem::path> queue_;
+    std::vector<QueueEntry> queue_;
     mutable std::mutex queueMutex_;
     int selectedQueueIndex_ = -1;
+    uint64_t nextQueueEntryId_ = 1;
 
     std::vector<std::string> logs_;
     std::mutex logsMutex_;
@@ -56,6 +70,7 @@ private:
     bool watchFolderEnabled_ = false;
     bool showAbout_ = false;
     char splitInput_[64] = "60";
+    char minFileSizeInput_[64] = "0";
     char watchFolderInput_[512] = "";
 
     std::vector<std::string> encoderOptions_;
@@ -71,6 +86,19 @@ private:
     SystemMetrics latestMetrics_{};
     std::chrono::steady_clock::time_point lastMetricsTick_{};
     bool dockLayoutInitialized_ = false;
+    std::atomic<bool> splitInProgress_{ false };
+    std::atomic<int> totalSplitJobs_{ 0 };
+    std::atomic<int> completedSplitJobs_{ 0 };
+    std::atomic<double> currentJobProgress01_{ 0.0 };
+    std::string currentJobStatus_;
+    std::filesystem::path currentJobPath_;
+    mutable std::mutex splitStatusMutex_;
+    std::atomic<bool> splitPauseRequested_{ false };
+    std::atomic<bool> splitCancelRequested_{ false };
+    std::atomic<int64_t> minFileSizeBytes_{ 0 };
+    std::atomic<int64_t> currentTargetBytes_{ 0 };
+    mutable std::mutex splitControlMutex_;
+    std::condition_variable splitControlCv_;
 
     // Async FFmpeg bootstrap
     std::atomic<bool> ffmpegReady_{ false };
@@ -85,16 +113,29 @@ private:
     void renderRightPanel();
     void renderBottomPanel();
     void renderMainMenu();
+    void updateResponsiveScale();
 
     void pushLog(const std::string& line);
     void addPath(const std::filesystem::path& path);
+    void addFileToQueue(const std::filesystem::path& path);
     void startSplitJobs();
+    void runDryRunEstimate();
     void removeSelectedFromQueue();
     [[nodiscard]] std::optional<std::filesystem::path> selectedQueuePath() const;
-    [[nodiscard]] std::vector<std::filesystem::path> snapshotQueue() const;
+    [[nodiscard]] std::vector<QueueEntry> snapshotQueueEntries() const;
     [[nodiscard]] std::vector<std::filesystem::path> openFilesDialog() const;
     SplitRequest makeRequest(const std::filesystem::path& path) const;
     void refreshMetrics();
+    void updateQueueEntry(uint64_t id, double progress01, const std::string& status, bool clearEstimate = false);
+    void updateQueueEstimate(uint64_t id, int estimatedChunks, const std::string& status);
+    void markRemainingEntriesCanceled(const std::vector<QueueEntry>& queueCopy, std::size_t startIndex);
+    [[nodiscard]] bool waitWhilePausedOrCanceled();
+    [[nodiscard]] bool shouldPauseSplit() const;
+    [[nodiscard]] bool shouldCancelSplit() const;
+    [[nodiscard]] int64_t parseMegabytesToBytes(const char* text) const;
+    void setCurrentSplitStatus(const std::filesystem::path& path, double progress01, const std::string& status);
+    [[nodiscard]] std::pair<std::filesystem::path, std::string> currentSplitStatusSnapshot() const;
+    [[nodiscard]] double overallSplitProgress01() const;
 
     static void dropCallback(GLFWwindow* window, int count, const char** paths);
 };

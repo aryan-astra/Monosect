@@ -7,6 +7,7 @@
 #include "precision/SizePrecisionEngine.hpp"
 
 #include <filesystem>
+#include <string>
 #include <vector>
 
 namespace vsm {
@@ -24,6 +25,8 @@ private:
     FFmpegProcess process_;
     GOPAnalyzer gopAnalyzer_;
     MediaProbe mediaProbe_;
+
+    static std::string formatSplitStatus(const std::string& stage, double progress01);
 
     [[nodiscard]] SplitResult splitByTime(const SplitRequest& request, double splitTime) const;
     [[nodiscard]] SplitResult splitBySize(const SplitRequest& request, int64_t sizeBytes) const;

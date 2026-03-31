@@ -14,14 +14,46 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdint>
+#include <cfloat>
 #include <cstdlib>
 #include <cstring>
 #include <cmath>
 #include <iterator>
+#include <limits>
 #include <sstream>
 #include <cwchar>
+#include <system_error>
 
 namespace vsm {
+
+namespace {
+
+ImGuiStyle gBaseStyle;
+bool gHasBaseStyle = false;
+float gAppliedUiScale = 1.0f;
+
+void renderHelpMarker(const char* description) {
+    ImGui::SameLine();
+    ImGui::TextDisabled("(?)");
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
+        ImGui::BeginTooltip();
+        ImGui::PushTextWrapPos(ImGui::GetFontSize() * 35.0f);
+        ImGui::TextUnformatted(description);
+        ImGui::PopTextWrapPos();
+        ImGui::EndTooltip();
+    }
+}
+
+void renderFieldLabel(const char* label, const char* description) {
+    ImGui::AlignTextToFramePadding();
+    ImGui::TextUnformatted(label);
+    if (description != nullptr && *description != '\0') {
+        renderHelpMarker(description);
+    }
+}
+
+} // namespace
 
 App::App()
     : threadPool_(std::max(1u, std::thread::hardware_concurrency())) {}
@@ -129,14 +161,15 @@ bool App::initialize() {
     c[ImGuiCol_TextSelectedBg]        = ImVec4(0.40f, 0.40f, 0.40f, 0.35f);
     c[ImGuiCol_NavHighlight]          = ImVec4(0.70f, 0.70f, 0.70f, 1.0f);
 
+    gBaseStyle = style;
+    gHasBaseStyle = true;
+
     // DPI-aware font loading (falls back to built-in font if unavailable)
     float xscale = 1.0f;
     float yscale = 1.0f;
     glfwGetWindowContentScale(window_, &xscale, &yscale);
-    if (xscale > 1.0f) {
-        style.ScaleAllSizes(xscale);
-    }
     io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\segoeui.ttf", std::round(16.0f * xscale));
+    updateResponsiveScale();
 
     ImGui_ImplGlfw_InitForOpenGL(window_, true);
     ImGui_ImplOpenGL3_Init("#version 330");
@@ -252,6 +285,7 @@ void App::run() {
 }
 
 void App::renderFrame() {
+    updateResponsiveScale();
     renderMainMenu();
     renderDockspace();
     renderLeftPanel();
@@ -376,7 +410,13 @@ void App::renderLeftPanel() {
         selectedQueueIndex_ = -1;
     }
     ImGui::SameLine();
-    if (ffmpegBootstrapRunning_.load()) {
+    if (splitInProgress_.load()) {
+        ImGui::BeginDisabled();
+        ImGui::Button("Start Split");
+        ImGui::EndDisabled();
+        ImGui::SameLine();
+        ImGui::TextDisabled("(Split in progress...)");
+    } else if (ffmpegBootstrapRunning_.load()) {
         ImGui::BeginDisabled();
         ImGui::Button("Start Split");
         ImGui::EndDisabled();
@@ -395,7 +435,7 @@ void App::renderLeftPanel() {
     }
 
     ImGui::Separator();
-    const auto queueSnapshot = snapshotQueue();
+    const auto queueSnapshot = snapshotQueueEntries();
     ImGui::Text("Items: %d", static_cast<int>(queueSnapshot.size()));
     ImGui::BeginChild("QueueList", ImVec2(0.0f, -1.0f), true);
     if (queueSnapshot.empty()) {
@@ -403,12 +443,23 @@ void App::renderLeftPanel() {
     }
     for (std::size_t i = 0; i < queueSnapshot.size(); ++i) {
         const bool selected = (selectedQueueIndex_ == static_cast<int>(i));
-        const std::string label = std::to_string(i + 1) + ": " + queueSnapshot[i].filename().string();
+        const int pct = static_cast<int>(std::round(std::clamp(queueSnapshot[i].progress01, 0.0, 1.0) * 100.0));
+        std::string label = std::to_string(i + 1) + ": " + queueSnapshot[i].path.filename().string() + " [" + std::to_string(pct) + "%]";
+        if (queueSnapshot[i].hasEstimate && queueSnapshot[i].estimatedChunks > 0) {
+            label += " ~" + std::to_string(queueSnapshot[i].estimatedChunks) + " chunks";
+        }
         if (ImGui::Selectable(label.c_str(), selected)) {
             selectedQueueIndex_ = static_cast<int>(i);
         }
         if (ImGui::IsItemHovered()) {
-            ImGui::SetTooltip("%s", queueSnapshot[i].string().c_str());
+            ImGui::BeginTooltip();
+            ImGui::TextUnformatted(queueSnapshot[i].path.string().c_str());
+            ImGui::Separator();
+            ImGui::TextWrapped("Status: %s", queueSnapshot[i].status.c_str());
+            if (queueSnapshot[i].hasEstimate && queueSnapshot[i].estimatedChunks > 0) {
+                ImGui::Text("Dry-run estimate: %d chunks", queueSnapshot[i].estimatedChunks);
+            }
+            ImGui::EndTooltip();
         }
     }
     ImGui::EndChild();
@@ -418,6 +469,24 @@ void App::renderLeftPanel() {
 
 void App::renderRightPanel() {
     ImGui::Begin("Controls");
+
+    const float panelWidth = ImGui::GetContentRegionAvail().x;
+    const float compactModeThreshold = 430.0f;
+    const bool compactMode = panelWidth < compactModeThreshold;
+    const float labelWidth = compactMode ? panelWidth : std::clamp(panelWidth * 0.42f, 120.0f, 240.0f);
+    const float inputWidth = compactMode ? panelWidth : std::max(100.0f, panelWidth - labelWidth - 8.0f);
+
+    auto beginFieldLayout = [&](const char* label, const char* helpText) {
+        if (compactMode) {
+            renderFieldLabel(label, helpText);
+            ImGui::SetNextItemWidth(-FLT_MIN);
+            return;
+        }
+        renderFieldLabel(label, helpText);
+        ImGui::SameLine();
+        ImGui::SetCursorPosX(ImGui::GetCursorPosX() + std::max(0.0f, labelWidth - ImGui::GetCursorPosX()));
+        ImGui::SetNextItemWidth(inputWidth);
+    };
 
     ImGui::SeparatorText("Split Configuration");
 
@@ -432,16 +501,22 @@ void App::renderRightPanel() {
         "Torrent 4.7GB",
         "Torrent 8.5GB"
     };
-    ImGui::Combo("Split Mode", &splitModeIndex_, modes, IM_ARRAYSIZE(modes));
+    beginFieldLayout("Split Mode", "How to split files.\nBest default: Exact Size for predictable file chunking. Use Half modes for quick 2-part splits.");
+    ImGui::Combo("##SplitMode", &splitModeIndex_, modes, IM_ARRAYSIZE(modes));
 
     static const char* precisionModes[] = {
         "Strict Lossless",
         "Exact Frame Precision",
         "Hybrid"
     };
-    ImGui::Combo("Precision", &precisionIndex_, precisionModes, IM_ARRAYSIZE(precisionModes));
+    beginFieldLayout("Precision", "Split precision.\nBest option: Strict Lossless for zero quality loss and fastest processing.");
+    ImGui::Combo("##Precision", &precisionIndex_, precisionModes, IM_ARRAYSIZE(precisionModes));
 
-    ImGui::InputText("Time(sec)/Size(MB)", splitInput_, sizeof(splitInput_));
+    beginFieldLayout("Time/Size (MB)", "For Exact Time enter seconds. For Exact Size enter MB.\nExample: 1536 for ~1.5 GB.");
+    ImGui::InputText("##TimeOrSize", splitInput_, sizeof(splitInput_));
+
+    beginFieldLayout("Min File Size (MB)", "Only split files >= this size in size-based modes.\nBest default: set slightly above target chunk size.");
+    ImGui::InputText("##MinFileSize", minFileSizeInput_, sizeof(minFileSizeInput_));
 
     std::vector<const char*> encoderItems;
     encoderItems.reserve(encoderOptions_.size());
@@ -449,10 +524,12 @@ void App::renderRightPanel() {
         encoderItems.push_back(item.c_str());
     }
     if (!encoderItems.empty()) {
-        ImGui::Combo("Encoder", &encoderIndex_, encoderItems.data(), static_cast<int>(encoderItems.size()));
+        beginFieldLayout("Encoder", "Encoder preference.\nFor true lossless split, keep stream copy behavior (no re-encode).");
+        ImGui::Combo("##Encoder", &encoderIndex_, encoderItems.data(), static_cast<int>(encoderItems.size()));
     }
 
-    ImGui::Checkbox("Unrestricted Mode", &unrestrictedMode_);
+    beginFieldLayout("Unrestricted Mode", "When OFF, files smaller than target size are skipped in size-based modes.\nBest default: OFF.");
+    ImGui::Checkbox("##UnrestrictedMode", &unrestrictedMode_);
 
     if (const auto selected = selectedQueuePath(); selected.has_value()) {
         ImGui::SeparatorText("Preview");
@@ -472,8 +549,10 @@ void App::renderRightPanel() {
     }
 
     ImGui::SeparatorText("Watch Folder");
-    ImGui::Checkbox("Enable", &watchFolderEnabled_);
-    ImGui::InputText("Watch Path", watchFolderInput_, sizeof(watchFolderInput_));
+    beginFieldLayout("Enable", "Automatically enqueue new media files from the watch path.");
+    ImGui::Checkbox("##WatchEnable", &watchFolderEnabled_);
+    beginFieldLayout("Watch Path", "Folder path to monitor for incoming files.");
+    ImGui::InputText("##WatchPath", watchFolderInput_, sizeof(watchFolderInput_));
 
     if (ImGui::Button("Apply Watch Folder")) {
         if (watchFolderEnabled_ && std::strlen(watchFolderInput_) > 0) {
@@ -486,12 +565,54 @@ void App::renderRightPanel() {
             pushLog("Watch folder stopped");
         }
     }
+    renderHelpMarker("Apply current watch-folder settings.");
+
+    if (ImGui::Button("Dry-run Estimate")) {
+        runDryRunEstimate();
+    }
+    renderHelpMarker("Computes estimated chunk count for queued files without writing output files.");
 
     ImGui::End();
 }
 
 void App::renderBottomPanel() {
     ImGui::Begin("Logs & Metrics");
+
+    ImGui::SeparatorText("Split Progress");
+    const double overallProgress = overallSplitProgress01();
+    const int completed = completedSplitJobs_.load();
+    const int total = totalSplitJobs_.load();
+    const std::string progressLabel = std::to_string(static_cast<int>(std::round(overallProgress * 100.0))) + "%";
+    ImGui::ProgressBar(static_cast<float>(overallProgress), ImVec2(-1.0f, 0.0f), progressLabel.c_str());
+    ImGui::Text("Jobs: %d / %d", completed, total);
+    const auto [currentPath, currentStatus] = currentSplitStatusSnapshot();
+    if (!currentPath.empty()) {
+        ImGui::TextWrapped("Current file: %s", currentPath.filename().string().c_str());
+    }
+    if (!currentStatus.empty()) {
+        ImGui::TextWrapped("Status: %s", currentStatus.c_str());
+    }
+    if (splitInProgress_.load()) {
+        if (splitPauseRequested_.load()) {
+            if (ImGui::Button("Resume")) {
+                splitPauseRequested_.store(false);
+                splitControlCv_.notify_all();
+                pushLog("Split resumed");
+            }
+        } else {
+            if (ImGui::Button("Pause")) {
+                splitPauseRequested_.store(true);
+                pushLog("Pause requested");
+            }
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Cancel")) {
+            splitCancelRequested_.store(true);
+            splitPauseRequested_.store(false);
+            splitControlCv_.notify_all();
+            pushLog("Cancel requested; stopping active split");
+        }
+    }
 
     // --- Metrics section ---
     ImGui::SeparatorText("System Metrics");
@@ -529,6 +650,37 @@ void App::renderBottomPanel() {
     ImGui::End();
 }
 
+void App::updateResponsiveScale() {
+    if (window_ == nullptr || !gHasBaseStyle) {
+        return;
+    }
+
+    float contentScaleX = 1.0f;
+    float contentScaleY = 1.0f;
+    glfwGetWindowContentScale(window_, &contentScaleX, &contentScaleY);
+    const float dpiScale = std::max(contentScaleX, contentScaleY);
+
+    int width = 0;
+    int height = 0;
+    glfwGetWindowSize(window_, &width, &height);
+    const float windowFactor = std::clamp(static_cast<float>(std::min(width, height)) / 900.0f, 0.88f, 1.18f);
+    const float nextScale = std::clamp(dpiScale * windowFactor, 0.85f, 1.45f);
+
+    if (std::fabs(nextScale - gAppliedUiScale) < 0.01f) {
+        return;
+    }
+
+    auto& style = ImGui::GetStyle();
+    style = gBaseStyle;
+    style.ScaleAllSizes(nextScale);
+    style.WindowPadding = ImVec2(std::max(8.0f, style.WindowPadding.x), std::max(8.0f, style.WindowPadding.y));
+    style.ItemSpacing = ImVec2(std::max(5.0f, style.ItemSpacing.x), std::max(4.0f, style.ItemSpacing.y));
+    style.FramePadding = ImVec2(std::max(6.0f, style.FramePadding.x), std::max(4.0f, style.FramePadding.y));
+
+    ImGui::GetIO().FontGlobalScale = std::clamp(nextScale, 0.9f, 1.35f);
+    gAppliedUiScale = nextScale;
+}
+
 void App::pushLog(const std::string& line) {
     std::scoped_lock lock(logsMutex_);
     logs_.push_back(line);
@@ -555,18 +707,16 @@ void App::addPath(const std::filesystem::path& path) {
             pushLog(std::string("Directory scan warning: ") + e.what());
         }
         if (!discovered.empty()) {
-            std::scoped_lock lock(queueMutex_);
-            queue_.insert(queue_.end(), discovered.begin(), discovered.end());
+            for (const auto& file : discovered) {
+                addFileToQueue(file);
+            }
         }
         pushLog("Added folder entries: " + path.string());
         return;
     }
 
     if (isSupportedMediaExtension(path)) {
-        {
-            std::scoped_lock lock(queueMutex_);
-            queue_.push_back(path);
-        }
+        addFileToQueue(path);
         try {
             const auto info = mediaProbe_.probe(path);
             std::ostringstream line;
@@ -577,6 +727,14 @@ void App::addPath(const std::filesystem::path& path) {
             pushLog("Queued file (probe failed): " + path.string());
         }
     }
+}
+
+void App::addFileToQueue(const std::filesystem::path& path) {
+    std::scoped_lock lock(queueMutex_);
+    QueueEntry entry;
+    entry.id = nextQueueEntryId_++;
+    entry.path = path;
+    queue_.push_back(std::move(entry));
 }
 
 SplitRequest App::makeRequest(const std::filesystem::path& path) const {
@@ -635,7 +793,7 @@ SplitRequest App::makeRequest(const std::filesystem::path& path) const {
 }
 
 void App::startSplitJobs() {
-    std::vector<std::filesystem::path> queueCopy;
+    std::vector<QueueEntry> queueCopy;
     {
         std::scoped_lock lock(queueMutex_);
         if (queue_.empty()) {
@@ -644,12 +802,47 @@ void App::startSplitJobs() {
         }
         queueCopy = queue_;
     }
-    for (const auto& item : queueCopy) {
-        threadPool_.enqueue([this, item]() {
-            const auto start = std::chrono::steady_clock::now();
-            const auto before = std::filesystem::exists(item) ? std::filesystem::file_size(item) : 0;
+    minFileSizeBytes_.store(parseMegabytesToBytes(minFileSizeInput_));
+    currentTargetBytes_.store(parseMegabytesToBytes(splitInput_));
+    splitInProgress_.store(true);
+    splitPauseRequested_.store(false);
+    splitCancelRequested_.store(false);
+    totalSplitJobs_.store(static_cast<int>(queueCopy.size()));
+    completedSplitJobs_.store(0);
+    currentJobProgress01_.store(0.0);
+    {
+        std::scoped_lock statusLock(splitStatusMutex_);
+        currentJobPath_.clear();
+        currentJobStatus_.assign("Queued jobs");
+    }
 
-            const auto request = makeRequest(item);
+    threadPool_.enqueue([this, queueCopy]() {
+        for (std::size_t i = 0; i < queueCopy.size(); ++i) {
+            if (!waitWhilePausedOrCanceled()) {
+                markRemainingEntriesCanceled(queueCopy, i);
+                break;
+            }
+            const auto& item = queueCopy[i];
+            const auto start = std::chrono::steady_clock::now();
+            const auto before = std::filesystem::exists(item.path) ? std::filesystem::file_size(item.path) : 0;
+
+            auto request = makeRequest(item.path);
+            const int64_t minimumFileSizeBytes = minFileSizeBytes_.load();
+            if (minimumFileSizeBytes > 0) {
+                request.minimumFileSizeBytes = minimumFileSizeBytes;
+            }
+            request.shouldPause = [this]() {
+                return shouldPauseSplit();
+            };
+            request.shouldCancel = [this]() {
+                return shouldCancelSplit();
+            };
+            request.onProgress = [this, item](double progress01, const std::string& status) {
+                setCurrentSplitStatus(item.path, progress01, status);
+                updateQueueEntry(item.id, progress01, status);
+            };
+            setCurrentSplitStatus(item.path, 0.0, "Queued");
+            updateQueueEntry(item.id, 0.0, "Queued");
             const auto result = splitEngine_.split(request);
 
             const auto end = std::chrono::steady_clock::now();
@@ -658,13 +851,94 @@ void App::startSplitJobs() {
                 throughputMBps_.store((before / 1024.0 / 1024.0) / elapsedSeconds);
             }
 
-            if (result.success) {
-                pushLog("Split complete: " + item.string());
+            if (!result.success && shouldCancelSplit()) {
+                pushLog("Canceled: " + item.path.string());
+            } else if (result.success) {
+                if (result.outputSegments.empty()) {
+                    pushLog("Skipped: " + item.path.string() + " | " + result.message);
+                } else {
+                    pushLog("Split complete: " + item.path.string());
+                }
             } else {
-                pushLog("Split failed: " + item.string() + " | " + result.message);
+                pushLog("Split failed: " + item.path.string() + " | " + result.message);
             }
-        });
+
+            setCurrentSplitStatus(item.path, 1.0, result.success ? result.message : ("Failed: " + result.message));
+            updateQueueEntry(item.id, 1.0, result.success ? result.message : ("Failed: " + result.message), true);
+            const int done = completedSplitJobs_.fetch_add(1) + 1;
+            if (done >= totalSplitJobs_.load()) {
+                splitInProgress_.store(false);
+                currentJobProgress01_.store(1.0);
+            }
+        }
+        splitInProgress_.store(false);
+    });
+}
+
+void App::runDryRunEstimate() {
+    std::vector<QueueEntry> queueCopy;
+    {
+        std::scoped_lock lock(queueMutex_);
+        if (queue_.empty()) {
+            pushLog("Dry-run skipped: queue is empty");
+            return;
+        }
+        queueCopy = queue_;
     }
+
+    currentTargetBytes_.store(parseMegabytesToBytes(splitInput_));
+    minFileSizeBytes_.store(parseMegabytesToBytes(minFileSizeInput_));
+    const int64_t targetBytes = currentTargetBytes_.load();
+    if (targetBytes <= 0 && splitModeIndex_ == 1) {
+        pushLog("Dry-run skipped: invalid target size");
+        return;
+    }
+
+    threadPool_.enqueue([this, queueCopy, targetBytes]() {
+        const int64_t minimumFileSizeBytes = minFileSizeBytes_.load();
+        for (const auto& entry : queueCopy) {
+            if (!std::filesystem::exists(entry.path)) {
+                updateQueueEstimate(entry.id, 0, "Dry-run: file missing");
+                continue;
+            }
+
+            std::error_code sizeError;
+            const auto fileSize = static_cast<int64_t>(std::filesystem::file_size(entry.path, sizeError));
+            if (sizeError) {
+                updateQueueEstimate(entry.id, 0, "Dry-run: unable to read size");
+                continue;
+            }
+
+            if (minimumFileSizeBytes > 0 && fileSize < minimumFileSizeBytes) {
+                updateQueueEstimate(entry.id, 0, "Dry-run: below minimum file size");
+                continue;
+            }
+
+            int64_t effectiveTarget = targetBytes;
+            if (splitModeIndex_ == 3) {
+                effectiveTarget = std::max<int64_t>(1, fileSize / 2);
+            } else if (splitModeIndex_ == 4) {
+                effectiveTarget = 700LL * 1024LL * 1024LL;
+            } else if (splitModeIndex_ == 5) {
+                effectiveTarget = 1024LL * 1024LL * 1024LL;
+            } else if (splitModeIndex_ == 6) {
+                effectiveTarget = 2LL * 1024LL * 1024LL * 1024LL;
+            } else if (splitModeIndex_ == 7) {
+                effectiveTarget = static_cast<int64_t>(4.7 * 1024.0 * 1024.0 * 1024.0);
+            } else if (splitModeIndex_ == 8) {
+                effectiveTarget = static_cast<int64_t>(8.5 * 1024.0 * 1024.0 * 1024.0);
+            }
+
+            if (effectiveTarget <= 0) {
+                updateQueueEstimate(entry.id, 0, "Dry-run: unsupported mode");
+                continue;
+            }
+
+            const int chunks = static_cast<int>((fileSize + effectiveTarget - 1) / effectiveTarget);
+            updateQueueEstimate(entry.id, chunks, "Dry-run: ~" + std::to_string(chunks) + " chunks");
+        }
+        pushLog("Dry-run estimate complete");
+    });
 }
 
 void App::refreshMetrics() {
@@ -680,6 +954,101 @@ void App::refreshMetrics() {
     cpuPlot_[plotCursor_] = static_cast<float>(latestMetrics_.cpuUsagePercent);
     gpuPlot_[plotCursor_] = static_cast<float>(latestMetrics_.gpuUsagePercent);
     plotCursor_ = (plotCursor_ + 1) % static_cast<int>(throughputPlot_.size());
+}
+
+void App::setCurrentSplitStatus(const std::filesystem::path& path, double progress01, const std::string& status) {
+    currentJobProgress01_.store(std::clamp(progress01, 0.0, 1.0));
+    std::scoped_lock lock(splitStatusMutex_);
+    currentJobPath_ = path;
+    currentJobStatus_ = status;
+}
+
+void App::updateQueueEntry(uint64_t id, double progress01, const std::string& status, bool clearEstimate) {
+    std::scoped_lock lock(queueMutex_);
+    for (auto& entry : queue_) {
+        if (entry.id != id) {
+            continue;
+        }
+        entry.progress01 = std::clamp(progress01, 0.0, 1.0);
+        entry.status = status;
+        if (clearEstimate) {
+            entry.hasEstimate = false;
+            entry.estimatedChunks = 0;
+        }
+        return;
+    }
+}
+
+void App::updateQueueEstimate(uint64_t id, int estimatedChunks, const std::string& status) {
+    std::scoped_lock lock(queueMutex_);
+    for (auto& entry : queue_) {
+        if (entry.id != id) {
+            continue;
+        }
+        entry.hasEstimate = estimatedChunks > 0;
+        entry.estimatedChunks = std::max(0, estimatedChunks);
+        entry.status = status;
+        return;
+    }
+}
+
+void App::markRemainingEntriesCanceled(const std::vector<QueueEntry>& queueCopy, std::size_t startIndex) {
+    for (std::size_t i = startIndex; i < queueCopy.size(); ++i) {
+        updateQueueEntry(queueCopy[i].id, queueCopy[i].progress01, "Canceled");
+        completedSplitJobs_.fetch_add(1);
+    }
+    setCurrentSplitStatus({}, 1.0, "Canceled");
+}
+
+bool App::waitWhilePausedOrCanceled() {
+    if (splitCancelRequested_.load()) {
+        return false;
+    }
+    std::unique_lock lock(splitControlMutex_);
+    splitControlCv_.wait(lock, [this]() {
+        return !splitPauseRequested_.load() || splitCancelRequested_.load();
+    });
+    return !splitCancelRequested_.load();
+}
+
+bool App::shouldPauseSplit() const {
+    return splitPauseRequested_.load();
+}
+
+bool App::shouldCancelSplit() const {
+    return splitCancelRequested_.load();
+}
+
+int64_t App::parseMegabytesToBytes(const char* text) const {
+    if (text == nullptr || *text == '\0') {
+        return 0;
+    }
+    const double value = std::atof(text);
+    if (!std::isfinite(value) || value <= 0.0) {
+        return 0;
+    }
+    const double bytes = value * 1024.0 * 1024.0;
+    if (bytes >= static_cast<double>(std::numeric_limits<int64_t>::max())) {
+        return std::numeric_limits<int64_t>::max();
+    }
+    return static_cast<int64_t>(bytes);
+}
+
+std::pair<std::filesystem::path, std::string> App::currentSplitStatusSnapshot() const {
+    std::scoped_lock lock(splitStatusMutex_);
+    return { currentJobPath_, currentJobStatus_ };
+}
+
+double App::overallSplitProgress01() const {
+    const int total = totalSplitJobs_.load();
+    if (total <= 0) {
+        return 0.0;
+    }
+    const int completed = std::clamp(completedSplitJobs_.load(), 0, total);
+    const double current = std::clamp(currentJobProgress01_.load(), 0.0, 1.0);
+    const double boundedCurrent = completed >= total ? 0.0 : current;
+    const double aggregate = (static_cast<double>(completed) + boundedCurrent) / static_cast<double>(total);
+    return std::clamp(aggregate, 0.0, 1.0);
 }
 
 void App::dropCallback(GLFWwindow* window, int count, const char** paths) {
@@ -711,10 +1080,10 @@ std::optional<std::filesystem::path> App::selectedQueuePath() const {
     if (selectedQueueIndex_ < 0 || selectedQueueIndex_ >= static_cast<int>(queue_.size())) {
         return std::nullopt;
     }
-    return queue_[selectedQueueIndex_];
+    return queue_[selectedQueueIndex_].path;
 }
 
-std::vector<std::filesystem::path> App::snapshotQueue() const {
+std::vector<App::QueueEntry> App::snapshotQueueEntries() const {
     std::scoped_lock lock(queueMutex_);
     return queue_;
 }
