@@ -12,6 +12,8 @@ It is built with C++23, ImGui, and FFmpeg.
 
 No installer needed. Keep the app and image files in one folder and run `Monosect.exe`.
 
+Current version: **v1.1.0**
+
 ## What it can do
 
 - Split by time, size, half, or torrent-style presets.
@@ -63,6 +65,12 @@ cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
 cmake --build build --target Monosect
 ```
 
+Change version in `CMakeLists.txt`:
+
+```cmake
+project(Monosect VERSION 1.1.0 LANGUAGES CXX)
+```
+
 Run:
 
 ```powershell
@@ -85,6 +93,17 @@ resources/    # App icon resources
 - Windows-only app.
 - FFmpeg binaries are stored next to the app after first download.
 - GPU usage graph is placeholder on some setups.
+
+## Auto-release on GitHub (EXE in Releases)
+
+Yes. This repo now supports that with GitHub Actions.
+
+How it works:
+
+1. Push a tag like `v1.1.0`
+2. Action builds `Monosect.exe`
+3. Action creates/updates that GitHub Release
+4. Action uploads `Monosect.exe` as a release asset
 
 ## Branding
 

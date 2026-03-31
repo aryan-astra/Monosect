@@ -29,6 +29,10 @@ namespace vsm {
 
 namespace {
 
+#ifndef MONOSECT_VERSION_STR
+#define MONOSECT_VERSION_STR "dev"
+#endif
+
 ImGuiStyle gBaseStyle;
 bool gHasBaseStyle = false;
 float gAppliedUiScale = 1.0f;
@@ -95,7 +99,8 @@ bool App::initialize() {
     glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
     glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
 
-    window_ = glfwCreateWindow(1600, 960, "Monosect", nullptr, nullptr);
+    const std::string windowTitle = std::string("Monosect v") + MONOSECT_VERSION_STR;
+    window_ = glfwCreateWindow(1600, 960, windowTitle.c_str(), nullptr, nullptr);
     if (window_ == nullptr) {
         return false;
     }
@@ -397,6 +402,7 @@ void App::renderMainMenu() {
         ImGui::Separator();
         ImGui::Spacing();
         ImGui::TextUnformatted("Monosect");
+        ImGui::TextDisabled("Version: v%s", MONOSECT_VERSION_STR);
         ImGui::TextUnformatted("High-performance lossless video split & merge utility");
         ImGui::Spacing();
         ImGui::TextDisabled("Built with ImGui + GLFW + OpenGL | FFmpeg engine");

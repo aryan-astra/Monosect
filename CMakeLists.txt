@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.24)
-project(Monosect LANGUAGES CXX)
+project(Monosect VERSION 1.1.0 LANGUAGES CXX)
 
 if (NOT WIN32)
     message(FATAL_ERROR "This refactor targets Windows + MinGW only.")
@@ -140,6 +140,13 @@ else ()
 endif ()
 
 add_executable(Monosect ${APP_SOURCES})
+
+target_compile_definitions(Monosect PRIVATE
+    MONOSECT_VERSION_MAJOR=${PROJECT_VERSION_MAJOR}
+    MONOSECT_VERSION_MINOR=${PROJECT_VERSION_MINOR}
+    MONOSECT_VERSION_PATCH=${PROJECT_VERSION_PATCH}
+    MONOSECT_VERSION_STR=\"${PROJECT_VERSION}\"
+)
 
 target_compile_options(Monosect PRIVATE -O3 -march=native -flto -ffat-lto-objects)
 target_link_options(Monosect PRIVATE -flto)
