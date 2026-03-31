@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <charconv>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -18,19 +19,31 @@ inline std::vector<std::string> splitCsv(const std::string& line) {
 }
 
 inline double parseDoubleOr(const std::string& value, double fallback) noexcept {
-    try {
-        return std::stod(value);
-    } catch (...) {
+    if (value.empty()) {
         return fallback;
     }
+    double parsed = 0.0;
+    const char* begin = value.data();
+    const char* end = value.data() + value.size();
+    const auto [ptr, ec] = std::from_chars(begin, end, parsed);
+    if (ec != std::errc() || ptr != end) {
+        return fallback;
+    }
+    return parsed;
 }
 
 inline int64_t parseInt64Or(const std::string& value, int64_t fallback) noexcept {
-    try {
-        return std::stoll(value);
-    } catch (...) {
+    if (value.empty()) {
         return fallback;
     }
+    int64_t parsed = 0;
+    const char* begin = value.data();
+    const char* end = value.data() + value.size();
+    const auto [ptr, ec] = std::from_chars(begin, end, parsed);
+    if (ec != std::errc() || ptr != end) {
+        return fallback;
+    }
+    return parsed;
 }
 
 }

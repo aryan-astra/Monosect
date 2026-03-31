@@ -16,6 +16,8 @@
 #include <chrono>
 #include <cstdint>
 #include <cfloat>
+#include <cctype>
+#include <compare>
 #include <cstdlib>
 #include <cstring>
 #include <cmath>
@@ -55,6 +57,33 @@ void renderFieldLabel(const char* label, const char* description) {
     if (description != nullptr && *description != '\0') {
         renderHelpMarker(description);
     }
+}
+
+std::string toLower(std::string value) {
+    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+    return value;
+}
+
+std::string classifySplitFailure(const std::string& message) {
+    const std::string lower = toLower(message);
+    if (lower.find("permission denied") != std::string::npos || lower.find("access is denied") != std::string::npos) {
+        return "io-permission";
+    }
+    if (lower.find("no such file") != std::string::npos || lower.find("not found") != std::string::npos) {
+        return "input-missing";
+    }
+    if (lower.find("invalid data") != std::string::npos || lower.find("invalid argument") != std::string::npos) {
+        return "input-invalid";
+    }
+    if (lower.find("encoder") != std::string::npos || lower.find("codec") != std::string::npos) {
+        return "codec";
+    }
+    if (lower.find("canceled") != std::string::npos || lower.find("terminate") != std::string::npos) {
+        return "canceled";
+    }
+    return "unknown";
 }
 
 } // namespace
@@ -590,17 +619,16 @@ void App::renderRightPanel() {
 
     if (const auto selected = selectedQueuePath(); selected.has_value()) {
         ImGui::SeparatorText("Preview");
-        try {
-            const auto info = mediaProbe_.probe(*selected);
+        if (const auto info = probeMediaCached(*selected); info.has_value()) {
             ImGui::TextWrapped("File: %s", selected->string().c_str());
-            ImGui::Text("Duration: %.2f s", info.durationSeconds);
-            ImGui::Text("Video: %s", info.videoCodec.empty() ? "unknown" : info.videoCodec.c_str());
-            ImGui::Text("Resolution: %d x %d", info.width, info.height);
-            ImGui::Text("FPS: %.2f", info.fps);
-            ImGui::Text("Bitrate: %.2f Mbps", static_cast<double>(info.bitRate) / 1000000.0);
-            ImGui::Text("Audio tracks: %d", static_cast<int>(info.audioTracks.size()));
-            ImGui::Text("Subtitle tracks: %d", static_cast<int>(info.subtitleTracks.size()));
-        } catch (...) {
+            ImGui::Text("Duration: %.2f s", info->durationSeconds);
+            ImGui::Text("Video: %s", info->videoCodec.empty() ? "unknown" : info->videoCodec.c_str());
+            ImGui::Text("Resolution: %d x %d", info->width, info->height);
+            ImGui::Text("FPS: %.2f", info->fps);
+            ImGui::Text("Bitrate: %.2f Mbps", static_cast<double>(info->bitRate) / 1000000.0);
+            ImGui::Text("Audio tracks: %d", static_cast<int>(info->audioTracks.size()));
+            ImGui::Text("Subtitle tracks: %d", static_cast<int>(info->subtitleTracks.size()));
+        } else {
             ImGui::TextDisabled("Preview failed for selected file");
         }
     }
@@ -639,9 +667,14 @@ void App::renderBottomPanel() {
     const double overallProgress = overallSplitProgress01();
     const int completed = completedSplitJobs_.load();
     const int total = totalSplitJobs_.load();
+    const int succeeded = splitSucceededJobs_.load();
+    const int failed = splitFailedJobs_.load();
+    const int canceled = splitCanceledJobs_.load();
     const std::string progressLabel = std::to_string(static_cast<int>(std::round(overallProgress * 100.0))) + "%";
     ImGui::ProgressBar(static_cast<float>(overallProgress), ImVec2(-1.0f, 0.0f), progressLabel.c_str());
     ImGui::Text("Jobs: %d / %d", completed, total);
+    ImGui::SameLine(0.0f, 20.0f);
+    ImGui::Text("OK: %d  Failed: %d  Canceled: %d", succeeded, failed, canceled);
     const auto [currentPath, currentStatus] = currentSplitStatusSnapshot();
     if (!currentPath.empty()) {
         ImGui::TextWrapped("Current file: %s", currentPath.filename().string().c_str());
@@ -680,6 +713,8 @@ void App::renderBottomPanel() {
     ImGui::Text("GPU: %.1f%%", latestMetrics_.gpuUsagePercent);
     ImGui::SameLine(0.0f, 20.0f);
     ImGui::Text("Throughput: %.2f MB/s", latestMetrics_.throughputMBps);
+    ImGui::SameLine(0.0f, 20.0f);
+    ImGui::Text("Avg: %.2f MB/s", averageThroughputMBps_.load());
     ImGui::SameLine(0.0f, 20.0f);
     ImGui::Text("ETA: %.1f s", latestMetrics_.etaSeconds);
 
@@ -747,6 +782,68 @@ void App::pushLog(const std::string& line) {
     }
 }
 
+std::optional<MediaInfo> App::probeMediaCached(const std::filesystem::path& path) {
+    std::error_code ec;
+    if (!std::filesystem::exists(path, ec) || ec) {
+        return std::nullopt;
+    }
+
+    const auto sizeBytes = std::filesystem::file_size(path, ec);
+    if (ec) {
+        return std::nullopt;
+    }
+    const auto modified = std::filesystem::last_write_time(path, ec);
+    if (ec) {
+        return std::nullopt;
+    }
+
+    const std::string key = path.lexically_normal().string();
+    {
+        std::scoped_lock lock(probeCacheMutex_);
+        const auto it = probeCache_.find(key);
+        if (it != probeCache_.end()) {
+            const auto& cached = it->second;
+            if (cached.sizeBytes == sizeBytes) {
+                const auto cmp = modified <=> cached.modifiedTime;
+                if (cmp == std::strong_ordering::equal) {
+                    return cached.info;
+                }
+            }
+        }
+    }
+
+    try {
+        MediaInfo info = mediaProbe_.probe(path);
+        ProbeCacheEntry entry;
+        entry.sizeBytes = sizeBytes;
+        entry.modifiedTime = modified;
+        entry.info = info;
+        std::scoped_lock lock(probeCacheMutex_);
+        probeCache_[key] = std::move(entry);
+        return info;
+    } catch (const std::exception& e) {
+        pushLog(std::string("Probe failed: ") + path.string() + " | " + e.what());
+        return std::nullopt;
+    }
+}
+
+void App::resetThroughputStats() {
+    std::scoped_lock lock(throughputStatsMutex_);
+    throughputSumMBps_ = 0.0;
+    throughputSamples_ = 0;
+    averageThroughputMBps_.store(0.0);
+}
+
+void App::recordJobThroughput(double throughputMBps) {
+    if (!std::isfinite(throughputMBps) || throughputMBps <= 0.0) {
+        return;
+    }
+    std::scoped_lock lock(throughputStatsMutex_);
+    throughputSumMBps_ += throughputMBps;
+    ++throughputSamples_;
+    averageThroughputMBps_.store(throughputSumMBps_ / static_cast<double>(throughputSamples_));
+}
+
 void App::addPath(const std::filesystem::path& path) {
     if (!isSafePath(path) || !std::filesystem::exists(path)) {
         pushLog("Rejected unsafe or missing path: " + path.string());
@@ -775,13 +872,12 @@ void App::addPath(const std::filesystem::path& path) {
 
     if (isSupportedMediaExtension(path)) {
         addFileToQueue(path);
-        try {
-            const auto info = mediaProbe_.probe(path);
+        if (const auto info = probeMediaCached(path); info.has_value()) {
             std::ostringstream line;
-            line << "Queued " << path.string() << " [" << info.width << "x" << info.height << " "
-                 << info.fps << "fps " << (info.bitRate / 1000) << "kbps " << info.durationSeconds << "s]";
+            line << "Queued " << path.string() << " [" << info->width << "x" << info->height << " "
+                 << info->fps << "fps " << (info->bitRate / 1000) << "kbps " << info->durationSeconds << "s]";
             pushLog(line.str());
-        } catch (...) {
+        } else {
             pushLog("Queued file (probe failed): " + path.string());
         }
     }
@@ -883,6 +979,13 @@ void App::startSplitJobs() {
         }
         queueCopy = queue_;
     }
+    std::sort(queueCopy.begin(), queueCopy.end(), [](const QueueEntry& a, const QueueEntry& b) {
+        std::error_code ea;
+        std::error_code eb;
+        const uintmax_t sa = std::filesystem::file_size(a.path, ea);
+        const uintmax_t sb = std::filesystem::file_size(b.path, eb);
+        return sa > sb;
+    });
     minFileSizeBytes_.store(parseMegabytesToBytes(minFileSizeInput_));
     currentTargetBytes_.store(parseMegabytesToBytes(splitInput_));
     tunedMaxWorkers_.store(std::max(1, maxWorkerLimit_));
@@ -894,6 +997,10 @@ void App::startSplitJobs() {
     splitCancelRequested_.store(false);
     totalSplitJobs_.store(static_cast<int>(queueCopy.size()));
     completedSplitJobs_.store(0);
+    splitSucceededJobs_.store(0);
+    splitFailedJobs_.store(0);
+    splitCanceledJobs_.store(0);
+    resetThroughputStats();
     currentJobProgress01_.store(0.0);
     {
         std::scoped_lock statusLock(splitStatusMutex_);
@@ -973,19 +1080,24 @@ void App::startSplitJobs() {
             const auto end = std::chrono::steady_clock::now();
             const auto elapsedSeconds = std::chrono::duration<double>(end - start).count();
             if (elapsedSeconds > 0.0) {
-                throughputMBps_.store((before / 1024.0 / 1024.0) / elapsedSeconds);
+                const double mbps = (before / 1024.0 / 1024.0) / elapsedSeconds;
+                throughputMBps_.store(mbps);
+                recordJobThroughput(mbps);
             }
 
             if (!result.success && shouldCancelSplit()) {
                 pushLog("Canceled: " + item.path.string());
+                splitCanceledJobs_.fetch_add(1);
             } else if (result.success) {
                 if (result.outputSegments.empty()) {
                     pushLog("Skipped: " + item.path.string() + " | " + result.message);
                 } else {
                     pushLog("Split complete: " + item.path.string());
                 }
+                splitSucceededJobs_.fetch_add(1);
             } else {
-                pushLog("Split failed: " + item.path.string() + " | " + result.message);
+                pushLog("Split failed [" + classifySplitFailure(result.message) + "]: " + item.path.string() + " | " + result.message);
+                splitFailedJobs_.fetch_add(1);
             }
 
             setCurrentSplitStatus(item.path, 1.0, result.success ? result.message : ("Failed: " + result.message));
@@ -1157,6 +1269,7 @@ void App::releaseConcurrencySlot() {
 
 void App::runAutoTuner(std::stop_token token) {
     double previousThroughput = 0.0;
+    int holdCounter = 0;
     while (!token.stop_requested()) {
         std::this_thread::sleep_for(std::chrono::milliseconds(700));
         if (token.stop_requested()) {
@@ -1184,16 +1297,24 @@ void App::runAutoTuner(std::stop_token token) {
         const double delta = throughput - previousThroughput;
         previousThroughput = throughput;
 
+        int desiredLimit = currentLimit;
         if (cpu > 97.0) {
-            currentLimit = std::max(1, currentLimit - 1);
+            desiredLimit = std::max(1, currentLimit - 1);
         } else if (cpu < 72.0 && delta >= -0.01) {
-            currentLimit = std::min(maxAllowed, currentLimit + 1);
+            desiredLimit = std::min(maxAllowed, currentLimit + 1);
         } else if (cpu > 88.0 && delta < -0.05) {
-            currentLimit = std::max(1, currentLimit - 1);
+            desiredLimit = std::max(1, currentLimit - 1);
         }
-
-        tunedWorkerLimit_.store(currentLimit);
-        splitConcurrencyCv_.notify_all();
+        if (desiredLimit != currentLimit) {
+            ++holdCounter;
+            if (holdCounter >= 2) {
+                tunedWorkerLimit_.store(desiredLimit);
+                splitConcurrencyCv_.notify_all();
+                holdCounter = 0;
+            }
+        } else {
+            holdCounter = 0;
+        }
     }
 }
 

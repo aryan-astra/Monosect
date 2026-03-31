@@ -105,6 +105,16 @@ How it works:
 3. Action creates/updates that GitHub Release
 4. Action uploads `Monosect.exe` as a release asset
 
+Release workflow also adds:
+
+- `SHA256SUMS.txt` (checksum)
+- `Monosect.exe.asc` (detached signature, when signing secrets are set)
+
+Optional repo secrets for signing:
+
+- `MONOSECT_RELEASE_SIGNING_KEY`
+- `MONOSECT_RELEASE_SIGNING_KEY_ID`
+
 ## Branding
 
 Developed under the **Monosect** brand.

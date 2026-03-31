@@ -17,6 +17,22 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Validate tag matches CMake version
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}"
+          $versionFromTag = $tag.TrimStart('v')
+          $cmake = Get-Content "CMakeLists.txt" -Raw
+          if ($cmake -notmatch 'project\(Monosect VERSION ([0-9]+\.[0-9]+\.[0-9]+)') {
+            throw "Unable to find project version in CMakeLists.txt"
+          }
+          $versionFromCMake = $Matches[1]
+          if ($versionFromTag -ne $versionFromCMake) {
+            throw "Tag version ($versionFromTag) does not match CMake version ($versionFromCMake)"
+          }
+          Write-Host "Tag/CMake version check passed: $versionFromTag"
+
       - name: Setup MSYS2 (MinGW64 toolchain)
         uses: msys2/setup-msys2@v2
         with:
@@ -43,6 +59,21 @@ jobs:
           Copy-Item "build/Monosect.exe" "release/Monosect.exe" -Force
           if (Test-Path "build/Monosect-icon-square.png") { Copy-Item "build/Monosect-icon-square.png" "release/Monosect-icon-square.png" -Force }
           if (Test-Path "build/Monosect-full-logo.png") { Copy-Item "build/Monosect-full-logo.png" "release/Monosect-full-logo.png" -Force }
+          $exePath = "release/Monosect.exe"
+          $sha = (Get-FileHash -Algorithm SHA256 $exePath).Hash.ToLowerInvariant()
+          "SHA256(Monosect.exe)=$sha" | Set-Content "release/SHA256SUMS.txt" -Encoding ascii
+          if ("${{ secrets.MONOSECT_RELEASE_SIGNING_KEY }}" -ne "") {
+            $privateKeyPath = Join-Path $env:RUNNER_TEMP "release-signing.key"
+            "${{ secrets.MONOSECT_RELEASE_SIGNING_KEY }}" | Set-Content $privateKeyPath -Encoding ascii
+            gpg --batch --import $privateKeyPath
+            Remove-Item $privateKeyPath -Force
+            if ("${{ secrets.MONOSECT_RELEASE_SIGNING_KEY_ID }}" -eq "") {
+              throw "MONOSECT_RELEASE_SIGNING_KEY_ID is required when signing key is provided."
+            }
+            gpg --batch --yes --armor --detach-sign --local-user "${{ secrets.MONOSECT_RELEASE_SIGNING_KEY_ID }}" --output "release/Monosect.exe.asc" $exePath
+          } else {
+            "No signing key configured. Skipping detached signature." | Set-Content "release/SIGNING_STATUS.txt" -Encoding ascii
+          }
 
       - name: Create GitHub release and upload EXE
         if: startsWith(github.ref, 'refs/tags/')
@@ -52,4 +83,8 @@ jobs:
             release/Monosect.exe
             release/Monosect-icon-square.png
             release/Monosect-full-logo.png
+            release/SHA256SUMS.txt
+            release/Monosect.exe.asc
+            release/SIGNING_STATUS.txt
           generate_release_notes: true
+          fail_on_unmatched_files: false

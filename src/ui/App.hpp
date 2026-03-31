@@ -21,6 +21,7 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -44,6 +45,11 @@ private:
         std::string status = "Queued";
         int estimatedChunks = 0;
         bool hasEstimate = false;
+    };
+    struct ProbeCacheEntry {
+        uintmax_t sizeBytes = 0;
+        std::filesystem::file_time_type modifiedTime{};
+        MediaInfo info;
     };
 
     GLFWwindow* window_ = nullptr;
@@ -78,6 +84,8 @@ private:
 
     std::vector<std::string> encoderOptions_;
     mutable std::mutex encoderMutex_;
+    mutable std::mutex probeCacheMutex_;
+    std::unordered_map<std::string, ProbeCacheEntry> probeCache_;
     TextureHandle fullLogoTexture_;
 
     std::array<float, 300> throughputPlot_{};
@@ -106,6 +114,13 @@ private:
     std::atomic<int> tunedWorkerLimit_{ 1 };
     std::atomic<int> tunedMaxWorkers_{ 1 };
     std::atomic<int> activeSplitJobs_{ 0 };
+    std::atomic<int> splitSucceededJobs_{ 0 };
+    std::atomic<int> splitFailedJobs_{ 0 };
+    std::atomic<int> splitCanceledJobs_{ 0 };
+    std::atomic<double> averageThroughputMBps_{ 0.0 };
+    mutable std::mutex throughputStatsMutex_;
+    double throughputSumMBps_ = 0.0;
+    int throughputSamples_ = 0;
     mutable std::mutex splitControlMutex_;
     std::condition_variable splitControlCv_;
     mutable std::mutex splitConcurrencyMutex_;
@@ -128,6 +143,9 @@ private:
     void updateResponsiveScale();
 
     void pushLog(const std::string& line);
+    [[nodiscard]] std::optional<MediaInfo> probeMediaCached(const std::filesystem::path& path);
+    void resetThroughputStats();
+    void recordJobThroughput(double throughputMBps);
     void addPath(const std::filesystem::path& path);
     void addFileToQueue(const std::filesystem::path& path);
     void startSplitJobs();
