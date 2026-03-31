@@ -56,9 +56,19 @@ void renderFieldLabel(const char* label, const char* description) {
 } // namespace
 
 App::App()
-    : threadPool_(std::max(1u, std::thread::hardware_concurrency())) {}
+    : threadPool_(std::max(1u, std::thread::hardware_concurrency())),
+      maxWorkerLimit_(std::max(1u, std::thread::hardware_concurrency())),
+      hardwareWorkerCount_(std::max(1u, std::thread::hardware_concurrency())) {
+    tunedWorkerLimit_.store(maxWorkerLimit_);
+    tunedMaxWorkers_.store(maxWorkerLimit_);
+    autoTunerEnabled_.store(autoTunerEnabledUi_);
+}
 
 App::~App() {
+    if (autoTuneThread_.joinable()) {
+        autoTuneThread_.request_stop();
+        autoTuneThread_.join();
+    }
     if (ffmpegBootstrapThread_.joinable()) {
         ffmpegBootstrapThread_.request_stop();
         ffmpegBootstrapThread_.join();
@@ -222,7 +232,11 @@ bool App::initialize() {
 
     // Start FFmpeg bootstrap asynchronously so the UI renders immediately
     exeDir_ = exeDir;
-    encoderOptions_.push_back("copy"); // default until detection finishes
+    {
+        std::scoped_lock lock(encoderMutex_);
+        encoderOptions_.push_back("copy"); // default until detection finishes
+        encoderIndex_ = 0;
+    }
     ffmpegBootstrapRunning_.store(true);
     ffmpegBootstrapThread_ = std::jthread([this](std::stop_token) {
         if (!ensureFFmpeg(exeDir_, [this](const std::string& msg) { pushLog(msg); })) {
@@ -242,18 +256,23 @@ bool App::initialize() {
 
         const auto enc = hardwareDetector_.detect();
         {
-            std::scoped_lock lock(logsMutex_);
+            std::scoped_lock lock(encoderMutex_);
             encoderOptions_.clear();
             if (enc.h264Nvenc) encoderOptions_.push_back("h264_nvenc");
             if (enc.hevcNvenc) encoderOptions_.push_back("hevc_nvenc");
             if (enc.h264Qsv) encoderOptions_.push_back("h264_qsv");
             if (enc.h264Amf) encoderOptions_.push_back("h264_amf");
             encoderOptions_.push_back("copy");
+            encoderIndex_ = static_cast<int>(encoderOptions_.size()) - 1;
         }
 
         ffmpegReady_.store(true);
         ffmpegBootstrapRunning_.store(false);
         pushLog("FFmpeg ready.");
+    });
+
+    autoTuneThread_ = std::jthread([this](std::stop_token token) {
+        runAutoTuner(token);
     });
 
     lastMetricsTick_ = std::chrono::steady_clock::now();
@@ -518,18 +537,50 @@ void App::renderRightPanel() {
     beginFieldLayout("Min File Size (MB)", "Only split files >= this size in size-based modes.\nBest default: set slightly above target chunk size.");
     ImGui::InputText("##MinFileSize", minFileSizeInput_, sizeof(minFileSizeInput_));
 
+    std::vector<std::string> encoderItemsOwned;
+    int encoderIndexLocal = 0;
+    {
+        std::scoped_lock lock(encoderMutex_);
+        encoderItemsOwned = encoderOptions_;
+        if (!encoderItemsOwned.empty()) {
+            encoderIndex_ = std::clamp(encoderIndex_, 0, static_cast<int>(encoderItemsOwned.size()) - 1);
+            encoderIndexLocal = encoderIndex_;
+        }
+    }
     std::vector<const char*> encoderItems;
-    encoderItems.reserve(encoderOptions_.size());
-    for (const auto& item : encoderOptions_) {
+    encoderItems.reserve(encoderItemsOwned.size());
+    for (const auto& item : encoderItemsOwned) {
         encoderItems.push_back(item.c_str());
     }
     if (!encoderItems.empty()) {
         beginFieldLayout("Encoder", "Encoder preference.\nFor true lossless split, keep stream copy behavior (no re-encode).");
-        ImGui::Combo("##Encoder", &encoderIndex_, encoderItems.data(), static_cast<int>(encoderItems.size()));
+        const bool strictLossless = precisionIndex_ == 0;
+        if (strictLossless) {
+            ImGui::BeginDisabled();
+        }
+        if (ImGui::Combo("##Encoder", &encoderIndexLocal, encoderItems.data(), static_cast<int>(encoderItems.size()))) {
+            std::scoped_lock lock(encoderMutex_);
+            encoderIndex_ = std::clamp(encoderIndexLocal, 0, static_cast<int>(encoderItems.size()) - 1);
+        }
+        if (strictLossless) {
+            ImGui::EndDisabled();
+            renderHelpMarker("Strict Lossless mode always uses stream copy (-c copy) for zero quality loss.");
+        }
     }
 
     beginFieldLayout("Unrestricted Mode", "When OFF, files smaller than target size are skipped in size-based modes.\nBest default: OFF.");
     ImGui::Checkbox("##UnrestrictedMode", &unrestrictedMode_);
+
+    beginFieldLayout("Auto-Tuner", "Dynamically adjusts active worker jobs and ffmpeg threading based on CPU pressure and throughput.");
+    if (ImGui::Checkbox("##AutoTuner", &autoTunerEnabledUi_)) {
+        autoTunerEnabled_.store(autoTunerEnabledUi_);
+    }
+    beginFieldLayout("Max Workers", "Upper bound for concurrently active split jobs.");
+    ImGui::SetNextItemWidth(inputWidth);
+    ImGui::SliderInt("##MaxWorkers", &maxWorkerLimit_, 1, std::max(1, hardwareWorkerCount_));
+    renderHelpMarker("Tuned active jobs: current / cap");
+    ImGui::SameLine();
+    ImGui::Text("%d / %d", activeSplitJobs_.load(), tunedWorkerLimit_.load());
 
     if (const auto selected = selectedQueuePath(); selected.has_value()) {
         ImGui::SeparatorText("Preview");
@@ -610,6 +661,7 @@ void App::renderBottomPanel() {
             splitCancelRequested_.store(true);
             splitPauseRequested_.store(false);
             splitControlCv_.notify_all();
+            splitConcurrencyCv_.notify_all();
             pushLog("Cancel requested; stopping active split");
         }
     }
@@ -742,11 +794,25 @@ SplitRequest App::makeRequest(const std::filesystem::path& path) const {
     request.inputPath = path;
     request.outputDirectory = path.parent_path();
     request.unrestrictedMode = unrestrictedMode_;
-    request.useHardwareAcceleration = !encoderOptions_.empty() && encoderOptions_[encoderIndex_] != "copy";
+    const auto encoderValue = selectedEncoderValue();
+    const bool encoderSelected = !encoderValue.empty() && encoderValue != "copy";
+    request.useHardwareAcceleration = encoderSelected;
 
     if (precisionIndex_ == 0) request.precisionMode = PrecisionMode::StrictLossless;
     else if (precisionIndex_ == 1) request.precisionMode = PrecisionMode::ExactFrameBoundary;
     else request.precisionMode = PrecisionMode::Hybrid;
+
+    if (request.precisionMode == PrecisionMode::StrictLossless) {
+        request.codecOverride = "copy";
+        request.fastSeekEnabled = true;
+        request.useHardwareAcceleration = false;
+    } else if (encoderSelected) {
+        request.codecOverride = encoderValue;
+        request.fastSeekEnabled = false;
+    } else {
+        request.codecOverride = "copy";
+        request.fastSeekEnabled = true;
+    }
 
     const double numeric = std::atof(splitInput_);
     const double safeNumeric = (std::isfinite(numeric) && numeric >= 0.0) ? numeric : 0.0;
@@ -792,6 +858,15 @@ SplitRequest App::makeRequest(const std::filesystem::path& path) const {
     return request;
 }
 
+std::string App::selectedEncoderValue() const {
+    std::scoped_lock lock(encoderMutex_);
+    if (encoderOptions_.empty()) {
+        return "copy";
+    }
+    const int idx = std::clamp(encoderIndex_, 0, static_cast<int>(encoderOptions_.size()) - 1);
+    return encoderOptions_[idx];
+}
+
 void App::startSplitJobs() {
     std::vector<QueueEntry> queueCopy;
     {
@@ -804,6 +879,10 @@ void App::startSplitJobs() {
     }
     minFileSizeBytes_.store(parseMegabytesToBytes(minFileSizeInput_));
     currentTargetBytes_.store(parseMegabytesToBytes(splitInput_));
+    tunedMaxWorkers_.store(std::max(1, maxWorkerLimit_));
+    tunedWorkerLimit_.store(std::max(1, std::min(maxWorkerLimit_, hardwareWorkerCount_)));
+    activeSplitJobs_.store(0);
+    splitConcurrencyCv_.notify_all();
     splitInProgress_.store(true);
     splitPauseRequested_.store(false);
     splitCancelRequested_.store(false);
@@ -815,22 +894,62 @@ void App::startSplitJobs() {
         currentJobPath_.clear();
         currentJobStatus_.assign("Queued jobs");
     }
+    {
+        std::scoped_lock lock(queueMutex_);
+        for (auto& entry : queue_) {
+            entry.progress01 = 0.0;
+            entry.status = "Queued";
+            entry.hasEstimate = false;
+            entry.estimatedChunks = 0;
+        }
+    }
 
-    threadPool_.enqueue([this, queueCopy]() {
-        for (std::size_t i = 0; i < queueCopy.size(); ++i) {
-            if (!waitWhilePausedOrCanceled()) {
-                markRemainingEntriesCanceled(queueCopy, i);
-                break;
+    struct PendingSplitJob {
+        QueueEntry queueEntry;
+        SplitRequest baseRequest;
+    };
+
+    std::vector<PendingSplitJob> jobs;
+    jobs.reserve(queueCopy.size());
+    for (const auto& item : queueCopy) {
+        jobs.push_back(PendingSplitJob{ item, makeRequest(item.path) });
+    }
+
+    for (const auto& job : jobs) {
+        threadPool_.enqueue([this, job]() {
+            const auto& item = job.queueEntry;
+            if (!acquireConcurrencySlot()) {
+                updateQueueEntry(item.id, 1.0, "Canceled", true);
+                setCurrentSplitStatus(item.path, 1.0, "Canceled");
+                const int doneCanceled = completedSplitJobs_.fetch_add(1) + 1;
+                if (doneCanceled >= totalSplitJobs_.load()) {
+                    splitInProgress_.store(false);
+                    currentJobProgress01_.store(1.0);
+                }
+                return;
             }
-            const auto& item = queueCopy[i];
-            const auto start = std::chrono::steady_clock::now();
-            const auto before = std::filesystem::exists(item.path) ? std::filesystem::file_size(item.path) : 0;
 
-            auto request = makeRequest(item.path);
+            if (!waitWhilePausedOrCanceled()) {
+                updateQueueEntry(item.id, 1.0, "Canceled", true);
+                setCurrentSplitStatus(item.path, 1.0, "Canceled");
+                const int doneCanceled = completedSplitJobs_.fetch_add(1) + 1;
+                if (doneCanceled >= totalSplitJobs_.load()) {
+                    splitInProgress_.store(false);
+                    currentJobProgress01_.store(1.0);
+                }
+                releaseConcurrencySlot();
+                return;
+            }
+            const auto start = std::chrono::steady_clock::now();
+            std::error_code sizeError;
+            const auto before = std::filesystem::exists(item.path) ? std::filesystem::file_size(item.path, sizeError) : 0;
+
+            auto request = job.baseRequest;
             const int64_t minimumFileSizeBytes = minFileSizeBytes_.load();
             if (minimumFileSizeBytes > 0) {
                 request.minimumFileSizeBytes = minimumFileSizeBytes;
             }
+            request.desiredThreads = std::max(1, hardwareWorkerCount_ / std::max(1, tunedWorkerLimit_.load()));
             request.shouldPause = [this]() {
                 return shouldPauseSplit();
             };
@@ -870,9 +989,9 @@ void App::startSplitJobs() {
                 splitInProgress_.store(false);
                 currentJobProgress01_.store(1.0);
             }
-        }
-        splitInProgress_.store(false);
-    });
+            releaseConcurrencySlot();
+        });
+    }
 }
 
 void App::runDryRunEstimate() {
@@ -889,12 +1008,13 @@ void App::runDryRunEstimate() {
     currentTargetBytes_.store(parseMegabytesToBytes(splitInput_));
     minFileSizeBytes_.store(parseMegabytesToBytes(minFileSizeInput_));
     const int64_t targetBytes = currentTargetBytes_.load();
+    const int splitMode = splitModeIndex_;
     if (targetBytes <= 0 && splitModeIndex_ == 1) {
         pushLog("Dry-run skipped: invalid target size");
         return;
     }
 
-    threadPool_.enqueue([this, queueCopy, targetBytes]() {
+    threadPool_.enqueue([this, queueCopy, targetBytes, splitMode]() {
         const int64_t minimumFileSizeBytes = minFileSizeBytes_.load();
         for (const auto& entry : queueCopy) {
             if (!std::filesystem::exists(entry.path)) {
@@ -915,17 +1035,17 @@ void App::runDryRunEstimate() {
             }
 
             int64_t effectiveTarget = targetBytes;
-            if (splitModeIndex_ == 3) {
+            if (splitMode == 3) {
                 effectiveTarget = std::max<int64_t>(1, fileSize / 2);
-            } else if (splitModeIndex_ == 4) {
+            } else if (splitMode == 4) {
                 effectiveTarget = 700LL * 1024LL * 1024LL;
-            } else if (splitModeIndex_ == 5) {
+            } else if (splitMode == 5) {
                 effectiveTarget = 1024LL * 1024LL * 1024LL;
-            } else if (splitModeIndex_ == 6) {
+            } else if (splitMode == 6) {
                 effectiveTarget = 2LL * 1024LL * 1024LL * 1024LL;
-            } else if (splitModeIndex_ == 7) {
+            } else if (splitMode == 7) {
                 effectiveTarget = static_cast<int64_t>(4.7 * 1024.0 * 1024.0 * 1024.0);
-            } else if (splitModeIndex_ == 8) {
+            } else if (splitMode == 8) {
                 effectiveTarget = static_cast<int64_t>(8.5 * 1024.0 * 1024.0 * 1024.0);
             }
 
@@ -949,6 +1069,7 @@ void App::refreshMetrics() {
     lastMetricsTick_ = now;
 
     latestMetrics_ = systemMonitor_.sample(throughputMBps_.load(), etaSeconds_.load());
+    latestCpuUsage_.store(latestMetrics_.cpuUsagePercent);
 
     throughputPlot_[plotCursor_] = static_cast<float>(latestMetrics_.throughputMBps);
     cpuPlot_[plotCursor_] = static_cast<float>(latestMetrics_.cpuUsagePercent);
@@ -992,14 +1113,6 @@ void App::updateQueueEstimate(uint64_t id, int estimatedChunks, const std::strin
     }
 }
 
-void App::markRemainingEntriesCanceled(const std::vector<QueueEntry>& queueCopy, std::size_t startIndex) {
-    for (std::size_t i = startIndex; i < queueCopy.size(); ++i) {
-        updateQueueEntry(queueCopy[i].id, queueCopy[i].progress01, "Canceled");
-        completedSplitJobs_.fetch_add(1);
-    }
-    setCurrentSplitStatus({}, 1.0, "Canceled");
-}
-
 bool App::waitWhilePausedOrCanceled() {
     if (splitCancelRequested_.load()) {
         return false;
@@ -1017,6 +1130,65 @@ bool App::shouldPauseSplit() const {
 
 bool App::shouldCancelSplit() const {
     return splitCancelRequested_.load();
+}
+
+bool App::acquireConcurrencySlot() {
+    std::unique_lock lock(splitConcurrencyMutex_);
+    splitConcurrencyCv_.wait(lock, [this]() {
+        return shouldCancelSplit() || activeSplitJobs_.load() < std::max(1, tunedWorkerLimit_.load());
+    });
+    if (shouldCancelSplit()) {
+        return false;
+    }
+    activeSplitJobs_.fetch_add(1);
+    return true;
+}
+
+void App::releaseConcurrencySlot() {
+    activeSplitJobs_.fetch_sub(1);
+    splitConcurrencyCv_.notify_all();
+}
+
+void App::runAutoTuner(std::stop_token token) {
+    double previousThroughput = 0.0;
+    while (!token.stop_requested()) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(700));
+        if (token.stop_requested()) {
+            break;
+        }
+        const bool splitting = splitInProgress_.load();
+        if (!splitting) {
+            previousThroughput = 0.0;
+            continue;
+        }
+
+        const int maxAllowed = std::max(1, tunedMaxWorkers_.load());
+        if (!autoTunerEnabled_.load()) {
+            if (tunedWorkerLimit_.load() != maxAllowed) {
+                tunedWorkerLimit_.store(maxAllowed);
+                splitConcurrencyCv_.notify_all();
+            }
+            previousThroughput = throughputMBps_.load();
+            continue;
+        }
+
+        int currentLimit = std::clamp(tunedWorkerLimit_.load(), 1, maxAllowed);
+        const double cpu = latestCpuUsage_.load();
+        const double throughput = throughputMBps_.load();
+        const double delta = throughput - previousThroughput;
+        previousThroughput = throughput;
+
+        if (cpu > 97.0) {
+            currentLimit = std::max(1, currentLimit - 1);
+        } else if (cpu < 72.0 && delta >= -0.01) {
+            currentLimit = std::min(maxAllowed, currentLimit + 1);
+        } else if (cpu > 88.0 && delta < -0.05) {
+            currentLimit = std::max(1, currentLimit - 1);
+        }
+
+        tunedWorkerLimit_.store(currentLimit);
+        splitConcurrencyCv_.notify_all();
+    }
 }
 
 int64_t App::parseMegabytesToBytes(const char* text) const {
@@ -1040,15 +1212,15 @@ std::pair<std::filesystem::path, std::string> App::currentSplitStatusSnapshot() 
 }
 
 double App::overallSplitProgress01() const {
-    const int total = totalSplitJobs_.load();
-    if (total <= 0) {
+    std::scoped_lock lock(queueMutex_);
+    if (queue_.empty()) {
         return 0.0;
     }
-    const int completed = std::clamp(completedSplitJobs_.load(), 0, total);
-    const double current = std::clamp(currentJobProgress01_.load(), 0.0, 1.0);
-    const double boundedCurrent = completed >= total ? 0.0 : current;
-    const double aggregate = (static_cast<double>(completed) + boundedCurrent) / static_cast<double>(total);
-    return std::clamp(aggregate, 0.0, 1.0);
+    double sum = 0.0;
+    for (const auto& entry : queue_) {
+        sum += std::clamp(entry.progress01, 0.0, 1.0);
+    }
+    return std::clamp(sum / static_cast<double>(queue_.size()), 0.0, 1.0);
 }
 
 void App::dropCallback(GLFWwindow* window, int count, const char** paths) {

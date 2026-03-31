@@ -68,6 +68,9 @@ struct SplitRequest {
     std::optional<double> splitTimeSeconds;
     std::optional<int64_t> splitSizeBytes;
     std::optional<int64_t> minimumFileSizeBytes;
+    std::optional<int> desiredThreads;
+    std::optional<std::string> codecOverride;
+    bool fastSeekEnabled = true;
     bool unrestrictedMode = false;
     bool useHardwareAcceleration = true;
     ProgressCallback onProgress;

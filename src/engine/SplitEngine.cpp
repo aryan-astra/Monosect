@@ -180,12 +180,36 @@ SplitResult SplitEngine::splitByTime(const SplitRequest& request, double splitTi
         return { false, "Canceled", {} };
     }
 
+    std::vector<std::string> firstArgs = {
+        "-hide_banner", "-nostats", "-progress", "pipe:2", "-y",
+        "-i", request.inputPath.string(),
+        "-to", splitPoint,
+        "-map", "0"
+    };
+    if (request.codecOverride.has_value() && *request.codecOverride != "copy") {
+        firstArgs.push_back("-c:v");
+        firstArgs.push_back(*request.codecOverride);
+        firstArgs.push_back("-c:a");
+        firstArgs.push_back("copy");
+        firstArgs.push_back("-c:s");
+        firstArgs.push_back("copy");
+    } else {
+        firstArgs.push_back("-c");
+        firstArgs.push_back("copy");
+    }
+    firstArgs.push_back("-avoid_negative_ts");
+    firstArgs.push_back("make_zero");
+    if (request.desiredThreads.has_value() && *request.desiredThreads > 0) {
+        firstArgs.push_back("-threads");
+        firstArgs.push_back(std::to_string(*request.desiredThreads));
+    } else {
+        firstArgs.push_back("-threads");
+        firstArgs.push_back("0");
+    }
+    firstArgs.push_back(first.string());
+
     const auto r1 = process_.runFFmpeg(
-        { "-hide_banner", "-nostats", "-progress", "pipe:2", "-y",
-          "-i", request.inputPath.string(),
-          "-to", splitPoint,
-          "-map", "0", "-c", "copy", "-avoid_negative_ts", "make_zero",
-          first.string() },
+        firstArgs,
         [&](const std::string& line) {
             if (!request.onProgress) {
                 return;
@@ -209,11 +233,46 @@ SplitResult SplitEngine::splitByTime(const SplitRequest& request, double splitTi
     if (!waitIfPaused(request)) {
         return { false, "Canceled", {} };
     }
+    std::vector<std::string> secondArgs = {
+        "-hide_banner", "-nostats", "-progress", "pipe:2", "-y"
+    };
+    if (request.fastSeekEnabled) {
+        secondArgs.push_back("-ss");
+        secondArgs.push_back(splitPoint);
+        secondArgs.push_back("-i");
+        secondArgs.push_back(request.inputPath.string());
+    } else {
+        secondArgs.push_back("-i");
+        secondArgs.push_back(request.inputPath.string());
+        secondArgs.push_back("-ss");
+        secondArgs.push_back(splitPoint);
+    }
+    secondArgs.push_back("-map");
+    secondArgs.push_back("0");
+    if (request.codecOverride.has_value() && *request.codecOverride != "copy") {
+        secondArgs.push_back("-c:v");
+        secondArgs.push_back(*request.codecOverride);
+        secondArgs.push_back("-c:a");
+        secondArgs.push_back("copy");
+        secondArgs.push_back("-c:s");
+        secondArgs.push_back("copy");
+    } else {
+        secondArgs.push_back("-c");
+        secondArgs.push_back("copy");
+    }
+    secondArgs.push_back("-avoid_negative_ts");
+    secondArgs.push_back("make_zero");
+    if (request.desiredThreads.has_value() && *request.desiredThreads > 0) {
+        secondArgs.push_back("-threads");
+        secondArgs.push_back(std::to_string(*request.desiredThreads));
+    } else {
+        secondArgs.push_back("-threads");
+        secondArgs.push_back("0");
+    }
+    secondArgs.push_back(second.string());
+
     const auto r2 = process_.runFFmpeg(
-        { "-hide_banner", "-nostats", "-progress", "pipe:2", "-y",
-          "-ss", splitPoint, "-i", request.inputPath.string(),
-          "-map", "0", "-c", "copy", "-avoid_negative_ts", "make_zero",
-          second.string() },
+        secondArgs,
         [&](const std::string& line) {
             if (!request.onProgress) {
                 return;
@@ -260,72 +319,119 @@ SplitResult SplitEngine::splitBySize(const SplitRequest& request, int64_t sizeBy
         return { true, "Skipped: input size is below target split size", {} };
     }
 
+    int64_t targetBytes = request.splitMode == SplitMode::HalfBySize
+        ? std::max<int64_t>(1, inputSize / 2)
+        : sizeBytes;
+
+    if (targetBytes <= 0) {
+        return { false, "Invalid target size", {} };
+    }
+
+    int chunks = 1;
+    if (request.splitMode == SplitMode::HalfBySize) {
+        chunks = 2;
+    } else {
+        chunks = static_cast<int>((inputSize + targetBytes - 1) / targetBytes);
+        chunks = std::max(chunks, 1);
+    }
+
     const auto info = mediaProbe_.probe(request.inputPath);
     if (info.durationSeconds <= 0.0) {
         return { false, "Unable to determine media duration", {} };
     }
 
-    if (request.onProgress) {
-        request.onProgress(0.0, "Estimating split position");
-    }
-
-    SizePrecisionEngine precision;
-    SizePrecisionEngine::SearchConfig config;
-    config.targetBytes = request.splitMode == SplitMode::HalfBySize
-        ? static_cast<int64_t>(inputSize / 2)
-        : sizeBytes;
-    config.toleranceBytes = 1024 * 1024;
-    config.minTimeSeconds = 0.0;
-    config.maxTimeSeconds = info.durationSeconds;
-
     std::filesystem::create_directories(request.outputDirectory);
     const auto stem = request.inputPath.stem().string();
     const auto ext = request.inputPath.extension().string();
-    const auto nowTick = static_cast<long long>(std::chrono::steady_clock::now().time_since_epoch().count());
-    const auto estimatePath = request.outputDirectory / (stem + "_estimate_" + std::to_string(nowTick) + ext);
-    std::size_t attempts = 0;
+    const double safeDuration = std::max(0.001, info.durationSeconds);
+    const double baseChunkDuration = safeDuration / static_cast<double>(chunks);
+    std::vector<std::filesystem::path> outputs;
+    outputs.reserve(static_cast<std::size_t>(chunks));
 
-    const auto result = precision.findSplitTime(config, [&](double candidate) -> std::optional<int64_t> {
+    for (int index = 0; index < chunks; ++index) {
         if (!waitIfPaused(request)) {
-            return std::nullopt;
-        }
-        ++attempts;
-        if (request.onProgress) {
-            const double phaseProgress = clamp01(static_cast<double>(attempts) / static_cast<double>(config.maxIterations));
-            request.onProgress(phaseProgress * 0.45, "Estimating split position (pass " + std::to_string(attempts) + ")");
+            return { false, "Canceled", outputs };
         }
 
-        const auto attempt = process_.runFFmpeg({ "-hide_banner", "-y", "-i", request.inputPath.string(),
-                                                  "-to", std::to_string(candidate), "-map", "0", "-c", "copy",
-                                                  "-avoid_negative_ts", "make_zero", estimatePath.string() },
-            nullptr,
+        const double startSeconds = baseChunkDuration * static_cast<double>(index);
+        const double remaining = std::max(0.0, safeDuration - startSeconds);
+        const double chunkDuration = (index == chunks - 1)
+            ? std::max(0.001, remaining)
+            : std::max(0.001, baseChunkDuration);
+
+        const auto output = request.outputDirectory / (stem + "_part" + std::to_string(index + 1) + ext);
+        std::vector<std::string> args = {
+            "-hide_banner", "-nostats", "-progress", "pipe:2", "-y"
+        };
+        if (request.fastSeekEnabled) {
+            args.push_back("-ss");
+            args.push_back(std::to_string(startSeconds));
+            args.push_back("-i");
+            args.push_back(request.inputPath.string());
+        } else {
+            args.push_back("-i");
+            args.push_back(request.inputPath.string());
+            args.push_back("-ss");
+            args.push_back(std::to_string(startSeconds));
+        }
+        args.push_back("-t");
+        args.push_back(std::to_string(chunkDuration));
+        args.push_back("-map");
+        args.push_back("0");
+        if (request.codecOverride.has_value() && *request.codecOverride != "copy") {
+            args.push_back("-c:v");
+            args.push_back(*request.codecOverride);
+            args.push_back("-c:a");
+            args.push_back("copy");
+            args.push_back("-c:s");
+            args.push_back("copy");
+        } else {
+            args.push_back("-c");
+            args.push_back("copy");
+        }
+        args.push_back("-avoid_negative_ts");
+        args.push_back("make_zero");
+        if (request.desiredThreads.has_value() && *request.desiredThreads > 0) {
+            args.push_back("-threads");
+            args.push_back(std::to_string(*request.desiredThreads));
+        } else {
+            args.push_back("-threads");
+            args.push_back("0");
+        }
+        args.push_back(output.string());
+
+        if (request.onProgress) {
+            const double base = static_cast<double>(index) / static_cast<double>(chunks);
+            request.onProgress(base, formatSplitStatus("Splitting part " + std::to_string(index + 1) + "/" + std::to_string(chunks), base));
+        }
+
+        const auto result = process_.runFFmpeg(
+            args,
+            [&](const std::string& line) {
+                if (!request.onProgress) {
+                    return;
+                }
+                if (const auto seconds = parseProgressTimeSeconds(line); seconds.has_value()) {
+                    const double partProgress = chunkDuration > 0.0 ? clamp01(*seconds / chunkDuration) : 1.0;
+                    const double overall = (static_cast<double>(index) + partProgress) / static_cast<double>(chunks);
+                    request.onProgress(overall, formatSplitStatus("Splitting part " + std::to_string(index + 1) + "/" + std::to_string(chunks), overall));
+                }
+            },
             [&request]() {
                 return request.shouldCancel && request.shouldCancel();
             });
-        if (!attempt.ok || !std::filesystem::exists(estimatePath)) {
-            return std::nullopt;
+
+        if (!result.ok) {
+            return { false, result.stdErr, outputs };
         }
-        return static_cast<int64_t>(std::filesystem::file_size(estimatePath));
-    });
 
-    if (std::filesystem::exists(estimatePath)) {
-        std::filesystem::remove(estimatePath);
+        outputs.push_back(output);
     }
 
-    if (!result.converged && result.splitTimeSeconds <= 0.0) {
-        return { false, "Precision split did not converge", {} };
-    }
-
-    SplitRequest finalRequest = request;
     if (request.onProgress) {
-        request.onProgress(0.5, "Starting split using estimated position");
-        finalRequest.onProgress = [&](double progress01, const std::string& status) {
-            const double mapped = 0.5 + (clamp01(progress01) * 0.5);
-            request.onProgress(mapped, status);
-        };
+        request.onProgress(1.0, formatSplitStatus("Split complete", 1.0));
     }
-
-    return splitByTime(finalRequest, result.splitTimeSeconds);
+    return { true, "Split completed", outputs };
 }
 
 SplitResult SplitEngine::mergeLossless(const std::vector<std::filesystem::path>& segments,

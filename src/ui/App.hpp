@@ -68,12 +68,16 @@ private:
     int encoderIndex_ = 0;
     bool unrestrictedMode_ = false;
     bool watchFolderEnabled_ = false;
+    bool autoTunerEnabledUi_ = true;
     bool showAbout_ = false;
     char splitInput_[64] = "60";
     char minFileSizeInput_[64] = "0";
     char watchFolderInput_[512] = "";
+    int maxWorkerLimit_ = std::max(1u, std::thread::hardware_concurrency());
+    int hardwareWorkerCount_ = std::max(1u, std::thread::hardware_concurrency());
 
     std::vector<std::string> encoderOptions_;
+    mutable std::mutex encoderMutex_;
     TextureHandle fullLogoTexture_;
 
     std::array<float, 300> throughputPlot_{};
@@ -82,7 +86,9 @@ private:
     int plotCursor_ = 0;
 
     std::atomic<double> throughputMBps_{ 0.0 };
+    std::atomic<double> latestCpuUsage_{ 0.0 };
     std::atomic<double> etaSeconds_{ 0.0 };
+    std::atomic<bool> autoTunerEnabled_{ true };
     SystemMetrics latestMetrics_{};
     std::chrono::steady_clock::time_point lastMetricsTick_{};
     bool dockLayoutInitialized_ = false;
@@ -97,8 +103,14 @@ private:
     std::atomic<bool> splitCancelRequested_{ false };
     std::atomic<int64_t> minFileSizeBytes_{ 0 };
     std::atomic<int64_t> currentTargetBytes_{ 0 };
+    std::atomic<int> tunedWorkerLimit_{ 1 };
+    std::atomic<int> tunedMaxWorkers_{ 1 };
+    std::atomic<int> activeSplitJobs_{ 0 };
     mutable std::mutex splitControlMutex_;
     std::condition_variable splitControlCv_;
+    mutable std::mutex splitConcurrencyMutex_;
+    std::condition_variable splitConcurrencyCv_;
+    std::jthread autoTuneThread_;
 
     // Async FFmpeg bootstrap
     std::atomic<bool> ffmpegReady_{ false };
@@ -125,13 +137,16 @@ private:
     [[nodiscard]] std::vector<QueueEntry> snapshotQueueEntries() const;
     [[nodiscard]] std::vector<std::filesystem::path> openFilesDialog() const;
     SplitRequest makeRequest(const std::filesystem::path& path) const;
+    [[nodiscard]] std::string selectedEncoderValue() const;
     void refreshMetrics();
     void updateQueueEntry(uint64_t id, double progress01, const std::string& status, bool clearEstimate = false);
     void updateQueueEstimate(uint64_t id, int estimatedChunks, const std::string& status);
-    void markRemainingEntriesCanceled(const std::vector<QueueEntry>& queueCopy, std::size_t startIndex);
     [[nodiscard]] bool waitWhilePausedOrCanceled();
     [[nodiscard]] bool shouldPauseSplit() const;
     [[nodiscard]] bool shouldCancelSplit() const;
+    [[nodiscard]] bool acquireConcurrencySlot();
+    void releaseConcurrencySlot();
+    void runAutoTuner(std::stop_token token);
     [[nodiscard]] int64_t parseMegabytesToBytes(const char* text) const;
     void setCurrentSplitStatus(const std::filesystem::path& path, double progress01, const std::string& status);
     [[nodiscard]] std::pair<std::filesystem::path, std::string> currentSplitStatusSnapshot() const;
