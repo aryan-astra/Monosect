@@ -7,31 +7,35 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   build-and-release:
     runs-on: windows-latest
+    permissions:
+      contents: write
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Validate tag matches CMake version
+      - name: Validate tag matches repository version
         if: startsWith(github.ref, 'refs/tags/')
         shell: pwsh
         run: |
           $tag = "${{ github.ref_name }}"
           $versionFromTag = $tag.TrimStart('v')
-          $cmake = Get-Content "CMakeLists.txt" -Raw
-          if ($cmake -notmatch 'project\(Monosect VERSION ([0-9]+\.[0-9]+\.[0-9]+)') {
-            throw "Unable to find project version in CMakeLists.txt"
+          if (-not (Test-Path "version.txt")) {
+            throw "version.txt not found"
           }
-          $versionFromCMake = $Matches[1]
-          if ($versionFromTag -ne $versionFromCMake) {
-            throw "Tag version ($versionFromTag) does not match CMake version ($versionFromCMake)"
+          $versionFromRepo = (Get-Content "version.txt" -Raw).Trim()
+          if ($versionFromRepo -notmatch '^[0-9]+\.[0-9]+\.[0-9]+$') {
+            throw "version.txt must contain MAJOR.MINOR.PATCH"
           }
-          Write-Host "Tag/CMake version check passed: $versionFromTag"
+          if ($versionFromTag -ne $versionFromRepo) {
+            throw "Tag version ($versionFromTag) does not match repository version ($versionFromRepo)"
+          }
+          Write-Host "Tag/version check passed: $versionFromTag"
 
       - name: Setup MSYS2 (MinGW64 toolchain)
         uses: msys2/setup-msys2@v2
@@ -52,16 +56,79 @@ jobs:
         shell: msys2 {0}
         run: cmake --build build --target Monosect
 
-      - name: Prepare release assets
+      - name: Bundle FFmpeg binaries
         shell: pwsh
         run: |
+          $ErrorActionPreference = 'Stop'
           New-Item -ItemType Directory -Force -Path release | Out-Null
+          $ffmpegUrl = "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl.zip"
+          $zipPath = "ffmpeg_download.zip"
+          $tmpDir = "ffmpeg_tmp"
+
+          Invoke-WebRequest -Uri $ffmpegUrl -OutFile $zipPath
+          Expand-Archive -Path $zipPath -DestinationPath $tmpDir -Force
+
+          $ffmpegBin = Get-ChildItem -Path $tmpDir -Recurse -Filter ffmpeg.exe | Select-Object -First 1
+          $ffprobeBin = Get-ChildItem -Path $tmpDir -Recurse -Filter ffprobe.exe | Select-Object -First 1
+          if ($null -eq $ffmpegBin -or $null -eq $ffprobeBin) {
+            throw "Unable to locate ffmpeg.exe/ffprobe.exe in downloaded archive"
+          }
+
+          Copy-Item $ffmpegBin.FullName "release/ffmpeg.exe" -Force
+          Copy-Item $ffprobeBin.FullName "release/ffprobe.exe" -Force
+          Remove-Item -Recurse -Force $tmpDir
+          Remove-Item -Force $zipPath
+
+      - name: Prepare release assets
+        id: prepare_assets
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force -Path release | Out-Null
+          if (-not (Test-Path "build/Monosect.exe")) {
+            throw "Missing build artifact: build/Monosect.exe"
+          }
           Copy-Item "build/Monosect.exe" "release/Monosect.exe" -Force
+          $uploadFiles = @(
+            "release/Monosect.exe"
+            "release/SHA256SUMS.txt"
+          )
+
           if (Test-Path "build/Monosect-icon-square.png") { Copy-Item "build/Monosect-icon-square.png" "release/Monosect-icon-square.png" -Force }
           if (Test-Path "build/Monosect-full-logo.png") { Copy-Item "build/Monosect-full-logo.png" "release/Monosect-full-logo.png" -Force }
+          if (Test-Path "release/Monosect-icon-square.png") { $uploadFiles += "release/Monosect-icon-square.png" }
+          if (Test-Path "release/Monosect-full-logo.png") { $uploadFiles += "release/Monosect-full-logo.png" }
+
           $exePath = "release/Monosect.exe"
-          $sha = (Get-FileHash -Algorithm SHA256 $exePath).Hash.ToLowerInvariant()
-          "SHA256(Monosect.exe)=$sha" | Set-Content "release/SHA256SUMS.txt" -Encoding ascii
+          $portableZipPath = "release/Monosect-${{ github.ref_name }}-portable.zip"
+          if ((Test-Path "release/ffmpeg.exe") -and (Test-Path "release/ffprobe.exe")) {
+            $portableFiles = @(
+              "release/Monosect.exe",
+              "release/ffmpeg.exe",
+              "release/ffprobe.exe"
+            )
+            if (Test-Path "release/Monosect-icon-square.png") { $portableFiles += "release/Monosect-icon-square.png" }
+            if (Test-Path "release/Monosect-full-logo.png") { $portableFiles += "release/Monosect-full-logo.png" }
+            Compress-Archive -Path $portableFiles -DestinationPath $portableZipPath -Force
+            if (Test-Path $portableZipPath) {
+              $uploadFiles += $portableZipPath
+            }
+          }
+
+          $checksumTargets = @($exePath)
+          if (Test-Path $portableZipPath) {
+            $checksumTargets += $portableZipPath
+          }
+          $checksumLines = @()
+          foreach ($target in $checksumTargets) {
+            $sha = (Get-FileHash -Algorithm SHA256 $target).Hash.ToLowerInvariant()
+            $checksumLines += "$sha  $(Split-Path -Path $target -Leaf)"
+          }
+          $checksumLines | Set-Content "release/SHA256SUMS.txt" -Encoding ascii
+          if (-not (Test-Path "release/SHA256SUMS.txt")) {
+            throw "Failed to create checksum file."
+          }
+
           if ("${{ secrets.MONOSECT_RELEASE_SIGNING_KEY }}" -ne "") {
             $privateKeyPath = Join-Path $env:RUNNER_TEMP "release-signing.key"
             "${{ secrets.MONOSECT_RELEASE_SIGNING_KEY }}" | Set-Content $privateKeyPath -Encoding ascii
@@ -71,20 +138,24 @@ jobs:
               throw "MONOSECT_RELEASE_SIGNING_KEY_ID is required when signing key is provided."
             }
             gpg --batch --yes --armor --detach-sign --local-user "${{ secrets.MONOSECT_RELEASE_SIGNING_KEY_ID }}" --output "release/Monosect.exe.asc" $exePath
+            if (-not (Test-Path "release/Monosect.exe.asc")) {
+              throw "Expected detached signature was not created."
+            }
+            "Signature generated: release/Monosect.exe.asc" | Set-Content "release/SIGNING_STATUS.txt" -Encoding ascii
+            $uploadFiles += "release/Monosect.exe.asc"
           } else {
             "No signing key configured. Skipping detached signature." | Set-Content "release/SIGNING_STATUS.txt" -Encoding ascii
           }
+          $uploadFiles += "release/SIGNING_STATUS.txt"
+
+          "files<<EOF" >> $env:GITHUB_OUTPUT
+          ($uploadFiles | Sort-Object -Unique) -join "`n" >> $env:GITHUB_OUTPUT
+          "EOF" >> $env:GITHUB_OUTPUT
 
       - name: Create GitHub release and upload EXE
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          files: |
-            release/Monosect.exe
-            release/Monosect-icon-square.png
-            release/Monosect-full-logo.png
-            release/SHA256SUMS.txt
-            release/Monosect.exe.asc
-            release/SIGNING_STATUS.txt
+          files: ${{ steps.prepare_assets.outputs.files }}
           generate_release_notes: true
-          fail_on_unmatched_files: false
+          fail_on_unmatched_files: true

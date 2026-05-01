@@ -1,5 +1,19 @@
 cmake_minimum_required(VERSION 3.24)
-project(Monosect VERSION 1.1.0 LANGUAGES CXX)
+
+set(MONOSECT_VERSION_FILE "${CMAKE_SOURCE_DIR}/version.txt")
+if (NOT EXISTS "${MONOSECT_VERSION_FILE}")
+    message(FATAL_ERROR "version.txt not found at repository root: ${MONOSECT_VERSION_FILE}")
+endif ()
+
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${MONOSECT_VERSION_FILE}")
+file(READ "${MONOSECT_VERSION_FILE}" MONOSECT_VERSION_RAW)
+string(STRIP "${MONOSECT_VERSION_RAW}" MONOSECT_VERSION)
+
+if (NOT MONOSECT_VERSION MATCHES "^([0-9]+)\\.([0-9]+)\\.([0-9]+)$")
+    message(FATAL_ERROR "version.txt must contain MAJOR.MINOR.PATCH (for example: 1.1.0)")
+endif ()
+
+project(Monosect VERSION "${MONOSECT_VERSION}" LANGUAGES CXX)
 
 if (NOT WIN32)
     message(FATAL_ERROR "This refactor targets Windows + MinGW only.")
@@ -148,7 +162,13 @@ target_compile_definitions(Monosect PRIVATE
     MONOSECT_VERSION_STR=\"${PROJECT_VERSION}\"
 )
 
-target_compile_options(Monosect PRIVATE -O3 -march=native -flto -ffat-lto-objects)
+target_compile_options(Monosect PRIVATE
+    -O3
+    -march=x86-64-v2
+    -mtune=generic
+    -flto
+    -ffat-lto-objects
+)
 target_link_options(Monosect PRIVATE -flto)
 
 target_include_directories(Monosect PRIVATE src)
@@ -162,7 +182,10 @@ target_link_libraries(Monosect
     winhttp
 )
 
-set_target_properties(Monosect PROPERTIES WIN32_EXECUTABLE ON)
+set_target_properties(Monosect PROPERTIES
+    WIN32_EXECUTABLE ON
+    VERSION "${PROJECT_VERSION}"
+)
 
 if (EXISTS "${MONOSECT_ICON_SQUARE}")
     add_custom_command(TARGET Monosect POST_BUILD
@@ -171,4 +194,21 @@ endif ()
 if (EXISTS "${MONOSECT_LOGO_FULL}")
     add_custom_command(TARGET Monosect POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy_if_different "${MONOSECT_LOGO_FULL}" "$<TARGET_FILE_DIR:Monosect>/Monosect-full-logo.png")
+endif ()
+
+include(CTest)
+
+if (BUILD_TESTING)
+    add_executable(MonosectQualityChecks
+        tests/QualityChecks.cpp
+        src/engine/FFmpegBootstrap.cpp
+    )
+
+    target_include_directories(MonosectQualityChecks PRIVATE src)
+    target_link_libraries(MonosectQualityChecks PRIVATE winhttp)
+
+    add_test(
+        NAME monosect-quality-checks
+        COMMAND MonosectQualityChecks
+    )
 endif ()

@@ -11,16 +11,17 @@
 
 #include <windows.h>
 #include <commdlg.h>
+#include <shlobj.h>
 
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <cfloat>
 #include <cctype>
-#include <compare>
 #include <cstdlib>
 #include <cstring>
 #include <cmath>
+#include <fstream>
 #include <iterator>
 #include <limits>
 #include <sstream>
@@ -38,6 +39,10 @@ namespace {
 ImGuiStyle gBaseStyle;
 bool gHasBaseStyle = false;
 float gAppliedUiScale = 1.0f;
+constexpr int kSplitModeCount = 11;
+constexpr int kPrecisionModeCount = 3;
+constexpr int kUiPresetSimple = 0;
+constexpr int kUiPresetAdvanced = 1;
 
 void renderHelpMarker(const char* description) {
     ImGui::SameLine();
@@ -59,11 +64,82 @@ void renderFieldLabel(const char* label, const char* description) {
     }
 }
 
+void renderShortcutTooltip(const char* description, const char* shortcut) {
+    if (!ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
+        return;
+    }
+    ImGui::BeginTooltip();
+    ImGui::PushTextWrapPos(ImGui::GetFontSize() * 35.0f);
+    ImGui::TextUnformatted(description);
+    if (shortcut != nullptr && *shortcut != '\0') {
+        ImGui::Separator();
+        ImGui::Text("Shortcut: %s", shortcut);
+    }
+    ImGui::PopTextWrapPos();
+    ImGui::EndTooltip();
+}
+
 std::string toLower(std::string value) {
     std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) {
         return static_cast<char>(std::tolower(c));
     });
     return value;
+}
+
+std::string trimWhitespace(std::string value) {
+    const auto first = value.find_first_not_of(" \t\r\n");
+    if (first == std::string::npos) {
+        return {};
+    }
+    const auto last = value.find_last_not_of(" \t\r\n");
+    return value.substr(first, last - first + 1);
+}
+
+std::optional<int> parseIntValue(const std::string& text) {
+    if (text.empty()) {
+        return std::nullopt;
+    }
+    char* end = nullptr;
+    const long parsed = std::strtol(text.c_str(), &end, 10);
+    if (end == text.c_str() || *end != '\0') {
+        return std::nullopt;
+    }
+    if (parsed < std::numeric_limits<int>::min() || parsed > std::numeric_limits<int>::max()) {
+        return std::nullopt;
+    }
+    return static_cast<int>(parsed);
+}
+
+std::optional<bool> parseBoolValue(const std::string& text) {
+    const std::string normalized = toLower(trimWhitespace(text));
+    if (normalized == "1" || normalized == "true" || normalized == "yes" || normalized == "on") {
+        return true;
+    }
+    if (normalized == "0" || normalized == "false" || normalized == "no" || normalized == "off") {
+        return false;
+    }
+    return std::nullopt;
+}
+
+std::optional<std::filesystem::path> browseForFolder(HWND owner, const wchar_t* title) {
+    BROWSEINFOW browserInfo{};
+    browserInfo.hwndOwner = owner;
+    browserInfo.lpszTitle = title;
+    browserInfo.ulFlags = BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE;
+
+    PIDLIST_ABSOLUTE itemList = SHBrowseForFolderW(&browserInfo);
+    if (itemList == nullptr) {
+        return std::nullopt;
+    }
+
+    wchar_t selectedPath[MAX_PATH];
+    const bool ok = SHGetPathFromIDListW(itemList, selectedPath) == TRUE;
+    CoTaskMemFree(itemList);
+    if (!ok) {
+        return std::nullopt;
+    }
+
+    return std::filesystem::path(selectedPath);
 }
 
 std::string classifySplitFailure(const std::string& message) {
@@ -92,12 +168,14 @@ App::App()
     : threadPool_(std::max(1u, std::thread::hardware_concurrency())),
       maxWorkerLimit_(std::max(1u, std::thread::hardware_concurrency())),
       hardwareWorkerCount_(std::max(1u, std::thread::hardware_concurrency())) {
+    loadSettings();
     tunedWorkerLimit_.store(maxWorkerLimit_);
     tunedMaxWorkers_.store(maxWorkerLimit_);
     autoTunerEnabled_.store(autoTunerEnabledUi_);
 }
 
 App::~App() {
+    saveSettings();
     if (autoTuneThread_.joinable()) {
         autoTuneThread_.request_stop();
         autoTuneThread_.join();
@@ -338,12 +416,14 @@ void App::run() {
 }
 
 void App::renderFrame() {
+    processKeyboardShortcuts();
     updateResponsiveScale();
     renderMainMenu();
     renderDockspace();
     renderLeftPanel();
     renderRightPanel();
     renderBottomPanel();
+    renderKeyboardShortcutsWindow();
     refreshMetrics();
 }
 
@@ -409,6 +489,19 @@ void App::renderMainMenu() {
             }
             ImGui::EndMenu();
         }
+        if (ImGui::BeginMenu("View")) {
+            if (ImGui::MenuItem("Simple Preset", nullptr, uiPresetIndex_ == kUiPresetSimple)) {
+                uiPresetIndex_ = kUiPresetSimple;
+            }
+            if (ImGui::MenuItem("Advanced Preset", nullptr, uiPresetIndex_ == kUiPresetAdvanced)) {
+                uiPresetIndex_ = kUiPresetAdvanced;
+            }
+            ImGui::Separator();
+            if (ImGui::MenuItem("Keyboard Shortcuts", "F1")) {
+                showShortcuts_ = true;
+            }
+            ImGui::EndMenu();
+        }
         if (ImGui::MenuItem("About")) {
             showAbout_ = true;
         }
@@ -453,10 +546,12 @@ void App::renderLeftPanel() {
             addPath(file);
         }
     }
+    renderShortcutTooltip("Select one or more media files and add them to the queue.", "Ctrl+O");
     ImGui::SameLine();
     if (ImGui::Button("Remove")) {
         removeSelectedFromQueue();
     }
+    renderShortcutTooltip("Remove the currently selected queue item.", "Delete");
     ImGui::SameLine();
     if (ImGui::Button("Clear")) {
         std::scoped_lock lock(queueMutex_);
@@ -468,24 +563,28 @@ void App::renderLeftPanel() {
         ImGui::BeginDisabled();
         ImGui::Button("Start Split");
         ImGui::EndDisabled();
+        renderShortcutTooltip("Start queue processing when FFmpeg is ready and no split is active.", "Ctrl+Enter");
         ImGui::SameLine();
         ImGui::TextDisabled("(Split in progress...)");
     } else if (ffmpegBootstrapRunning_.load()) {
         ImGui::BeginDisabled();
         ImGui::Button("Start Split");
         ImGui::EndDisabled();
+        renderShortcutTooltip("Start queue processing when FFmpeg is ready and no split is active.", "Ctrl+Enter");
         ImGui::SameLine();
         ImGui::TextDisabled("(Setting up FFmpeg...)");
     } else if (!ffmpegReady_.load()) {
         ImGui::BeginDisabled();
         ImGui::Button("Start Split");
         ImGui::EndDisabled();
+        renderShortcutTooltip("Start queue processing when FFmpeg is ready and no split is active.", "Ctrl+Enter");
         ImGui::SameLine();
         ImGui::TextDisabled("(FFmpeg unavailable)");
     } else {
         if (ImGui::Button("Start Split")) {
             startSplitJobs();
         }
+        renderShortcutTooltip("Start queue processing when FFmpeg is ready and no split is active.", "Ctrl+Enter");
     }
 
     ImGui::Separator();
@@ -542,6 +641,15 @@ void App::renderRightPanel() {
         ImGui::SetNextItemWidth(inputWidth);
     };
 
+    ImGui::SeparatorText("UI Preset");
+    beginFieldLayout("Mode", "Simple keeps only essentials visible. Advanced shows all controls.");
+    static const char* uiModes[] = {
+        "Simple",
+        "Advanced"
+    };
+    ImGui::Combo("##UiPreset", &uiPresetIndex_, uiModes, IM_ARRAYSIZE(uiModes));
+
+    const bool showAdvanced = uiPresetIndex_ == kUiPresetAdvanced;
     ImGui::SeparatorText("Split Configuration");
 
     static const char* modes[] = {
@@ -549,73 +657,120 @@ void App::renderRightPanel() {
         "Exact Size",
         "Half By Time",
         "Half By Size",
+        "Telegram 2GB",
         "Torrent 700MB",
         "Torrent 1GB",
         "Torrent 2GB",
         "Torrent 4.7GB",
-        "Torrent 8.5GB"
+        "Torrent 8.5GB",
+        "N Equal Parts"
     };
     beginFieldLayout("Split Mode", "How to split files.\nBest default: Exact Size for predictable file chunking. Use Half modes for quick 2-part splits.");
     ImGui::Combo("##SplitMode", &splitModeIndex_, modes, IM_ARRAYSIZE(modes));
 
-    static const char* precisionModes[] = {
-        "Strict Lossless",
-        "Exact Frame Precision",
-        "Hybrid"
-    };
-    beginFieldLayout("Precision", "Split precision.\nBest option: Strict Lossless for zero quality loss and fastest processing.");
-    ImGui::Combo("##Precision", &precisionIndex_, precisionModes, IM_ARRAYSIZE(precisionModes));
-
     beginFieldLayout("Time/Size (MB)", "For Exact Time enter seconds. For Exact Size enter MB.\nExample: 1536 for ~1.5 GB.");
     ImGui::InputText("##TimeOrSize", splitInput_, sizeof(splitInput_));
-
-    beginFieldLayout("Min File Size (MB)", "Only split files >= this size in size-based modes.\nBest default: set slightly above target chunk size.");
-    ImGui::InputText("##MinFileSize", minFileSizeInput_, sizeof(minFileSizeInput_));
-
-    std::vector<std::string> encoderItemsOwned;
-    int encoderIndexLocal = 0;
-    {
-        std::scoped_lock lock(encoderMutex_);
-        encoderItemsOwned = encoderOptions_;
-        if (!encoderItemsOwned.empty()) {
-            encoderIndex_ = std::clamp(encoderIndex_, 0, static_cast<int>(encoderItemsOwned.size()) - 1);
-            encoderIndexLocal = encoderIndex_;
-        }
+    if (splitModeIndex_ == 10) {
+        beginFieldLayout("Parts", "Number of equal duration segments to produce.");
+        ImGui::SliderInt("##EqualPartCount", &splitPartCount_, 2, 100);
     }
-    std::vector<const char*> encoderItems;
-    encoderItems.reserve(encoderItemsOwned.size());
-    for (const auto& item : encoderItemsOwned) {
-        encoderItems.push_back(item.c_str());
-    }
-    if (!encoderItems.empty()) {
-        beginFieldLayout("Encoder", "Encoder preference.\nFor true lossless split, keep stream copy behavior (no re-encode).");
-        const bool strictLossless = precisionIndex_ == 0;
-        if (strictLossless) {
-            ImGui::BeginDisabled();
+    if (showAdvanced) {
+        static const char* precisionModes[] = {
+            "Strict Lossless",
+            "Exact Frame Precision",
+            "Hybrid"
+        };
+        beginFieldLayout("Precision", "Split precision.\nBest option: Strict Lossless for zero quality loss and fastest processing.");
+        ImGui::Combo("##Precision", &precisionIndex_, precisionModes, IM_ARRAYSIZE(precisionModes));
+
+        beginFieldLayout("Min File Size (MB)", "Only split files >= this size in size-based modes.\nBest default: set slightly above target chunk size.");
+        ImGui::InputText("##MinFileSize", minFileSizeInput_, sizeof(minFileSizeInput_));
+
+        beginFieldLayout("Custom Output", "When enabled, all split files are written to the selected output directory.");
+        ImGui::Checkbox("##UseCustomOutputDir", &useCustomOutputDir_);
+        if (useCustomOutputDir_) {
+            beginFieldLayout("Output Directory", "Destination folder for split outputs.\nIf disabled, outputs are saved next to each source file.");
+            ImGui::InputText("##OutputDirInput", outputDirInput_, sizeof(outputDirInput_));
+            if (compactMode) {
+                if (ImGui::Button("Browse Output Folder")) {
+                    if (const auto selected = browseForFolder(nullptr, L"Select output folder"); selected.has_value()) {
+                        if (isSafePath(*selected)) {
+                            std::strncpy(outputDirInput_, selected->string().c_str(), sizeof(outputDirInput_) - 1);
+                            outputDirInput_[sizeof(outputDirInput_) - 1] = '\0';
+                        } else {
+                            pushLog("Rejected unsafe output directory: " + selected->string());
+                        }
+                    }
+                }
+            } else {
+                ImGui::SameLine();
+                if (ImGui::Button("Browse##OutputDir")) {
+                    if (const auto selected = browseForFolder(nullptr, L"Select output folder"); selected.has_value()) {
+                        if (isSafePath(*selected)) {
+                            std::strncpy(outputDirInput_, selected->string().c_str(), sizeof(outputDirInput_) - 1);
+                            outputDirInput_[sizeof(outputDirInput_) - 1] = '\0';
+                        } else {
+                            pushLog("Rejected unsafe output directory: " + selected->string());
+                        }
+                    }
+                }
+            }
         }
-        if (ImGui::Combo("##Encoder", &encoderIndexLocal, encoderItems.data(), static_cast<int>(encoderItems.size()))) {
+
+        beginFieldLayout("Output Pattern", "Naming template for generated segments.\nSupported tokens: {stem}, {n}, {n:02d}, {ext}.");
+        ImGui::InputText("##OutputPattern", outputPatternInput_, sizeof(outputPatternInput_));
+
+        std::vector<std::string> encoderItemsOwned;
+        int encoderIndexLocal = 0;
+        {
             std::scoped_lock lock(encoderMutex_);
-            encoderIndex_ = std::clamp(encoderIndexLocal, 0, static_cast<int>(encoderItems.size()) - 1);
+            encoderItemsOwned = encoderOptions_;
+            if (!encoderItemsOwned.empty()) {
+                encoderIndex_ = std::clamp(encoderIndex_, 0, static_cast<int>(encoderItemsOwned.size()) - 1);
+                encoderIndexLocal = encoderIndex_;
+            }
         }
-        if (strictLossless) {
-            ImGui::EndDisabled();
-            renderHelpMarker("Strict Lossless mode always uses stream copy (-c copy) for zero quality loss.");
+        std::vector<const char*> encoderItems;
+        encoderItems.reserve(encoderItemsOwned.size());
+        for (const auto& item : encoderItemsOwned) {
+            encoderItems.push_back(item.c_str());
         }
-    }
+        if (!encoderItems.empty()) {
+            beginFieldLayout("Encoder", "Encoder preference.\nFor true lossless split, keep stream copy behavior (no re-encode).");
+            const bool strictLossless = precisionIndex_ == 0;
+            if (strictLossless) {
+                ImGui::BeginDisabled();
+            }
+            if (ImGui::Combo("##Encoder", &encoderIndexLocal, encoderItems.data(), static_cast<int>(encoderItems.size()))) {
+                std::scoped_lock lock(encoderMutex_);
+                encoderIndex_ = std::clamp(encoderIndexLocal, 0, static_cast<int>(encoderItems.size()) - 1);
+            }
+            if (strictLossless) {
+                ImGui::EndDisabled();
+                renderHelpMarker("Strict Lossless mode always uses stream copy (-c copy) for zero quality loss.");
+            }
+        }
 
-    beginFieldLayout("Unrestricted Mode", "When OFF, files smaller than target size are skipped in size-based modes.\nBest default: OFF.");
-    ImGui::Checkbox("##UnrestrictedMode", &unrestrictedMode_);
+        beginFieldLayout("Unrestricted Mode", "When OFF, files smaller than target size are skipped in size-based modes.\nBest default: OFF.");
+        ImGui::Checkbox("##UnrestrictedMode", &unrestrictedMode_);
 
-    beginFieldLayout("Auto-Tuner", "Dynamically adjusts active worker jobs and ffmpeg threading based on CPU pressure and throughput.");
-    if (ImGui::Checkbox("##AutoTuner", &autoTunerEnabledUi_)) {
-        autoTunerEnabled_.store(autoTunerEnabledUi_);
+        beginFieldLayout("Validate Splits", "Runs a post-split validation pass (readability + duration/stream consistency) before marking success.");
+        ImGui::Checkbox("##ValidateSplits", &validateOutputSegments_);
+
+        beginFieldLayout("Auto-Tuner", "Dynamically adjusts active worker jobs and ffmpeg threading based on CPU pressure and throughput.");
+        if (ImGui::Checkbox("##AutoTuner", &autoTunerEnabledUi_)) {
+            autoTunerEnabled_.store(autoTunerEnabledUi_);
+        }
+        beginFieldLayout("Max Workers", "Upper bound for concurrently active split jobs.");
+        ImGui::SetNextItemWidth(inputWidth);
+        ImGui::SliderInt("##MaxWorkers", &maxWorkerLimit_, 1, std::max(1, hardwareWorkerCount_));
+        renderHelpMarker("Tuned active jobs: current / cap");
+        ImGui::SameLine();
+        ImGui::Text("%d / %d", activeSplitJobs_.load(), tunedWorkerLimit_.load());
+    } else {
+        ImGui::TextDisabled("Advanced options are hidden in Simple mode.");
+        ImGui::TextDisabled("Switch to Advanced for precision, encoder, and worker tuning.");
     }
-    beginFieldLayout("Max Workers", "Upper bound for concurrently active split jobs.");
-    ImGui::SetNextItemWidth(inputWidth);
-    ImGui::SliderInt("##MaxWorkers", &maxWorkerLimit_, 1, std::max(1, hardwareWorkerCount_));
-    renderHelpMarker("Tuned active jobs: current / cap");
-    ImGui::SameLine();
-    ImGui::Text("%d / %d", activeSplitJobs_.load(), tunedWorkerLimit_.load());
 
     if (const auto selected = selectedQueuePath(); selected.has_value()) {
         ImGui::SeparatorText("Preview");
@@ -633,29 +788,144 @@ void App::renderRightPanel() {
         }
     }
 
-    ImGui::SeparatorText("Watch Folder");
-    beginFieldLayout("Enable", "Automatically enqueue new media files from the watch path.");
-    ImGui::Checkbox("##WatchEnable", &watchFolderEnabled_);
-    beginFieldLayout("Watch Path", "Folder path to monitor for incoming files.");
-    ImGui::InputText("##WatchPath", watchFolderInput_, sizeof(watchFolderInput_));
+    if (showAdvanced) {
+        ImGui::SeparatorText("Watch Folder");
+        beginFieldLayout("Enable", "Automatically enqueue new media files from the watch path.");
+        ImGui::Checkbox("##WatchEnable", &watchFolderEnabled_);
+        beginFieldLayout("Watch Path", "Folder path to monitor for incoming files.");
+        ImGui::InputText("##WatchPath", watchFolderInput_, sizeof(watchFolderInput_));
 
-    if (ImGui::Button("Apply Watch Folder")) {
-        if (watchFolderEnabled_ && std::strlen(watchFolderInput_) > 0) {
-            watchFolder_.start(watchFolderInput_, [this](const std::filesystem::path& path) {
-                threadPool_.enqueue([this, path]() { addPath(path); });
-            });
-            pushLog(std::string("Watching folder: ") + watchFolderInput_);
+        if (ImGui::Button("Apply Watch Folder")) {
+            if (watchFolderEnabled_ && std::strlen(watchFolderInput_) > 0) {
+                watchFolder_.start(watchFolderInput_, [this](const std::filesystem::path& path) {
+                    threadPool_.enqueue([this, path]() { addPath(path); });
+                });
+                pushLog(std::string("Watching folder: ") + watchFolderInput_);
+            } else {
+                watchFolder_.stop();
+                pushLog("Watch folder stopped");
+            }
+        }
+        renderHelpMarker("Apply current watch-folder settings.");
+
+        ImGui::SeparatorText("Merge (Lossless)");
+        if (ImGui::Button("Add Merge Segments")) {
+            const auto files = openFilesDialog();
+            for (const auto& file : files) {
+                if (!isSupportedMediaExtension(file)) {
+                    continue;
+                }
+                mergeSegments_.push_back(file);
+            }
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Clear Merge List")) {
+            mergeSegments_.clear();
+            selectedMergeSegmentIndex_ = -1;
+        }
+        ImGui::BeginChild("MergeSegmentsList", ImVec2(0.0f, 100.0f), true);
+        if (mergeSegments_.empty()) {
+            ImGui::TextDisabled("Add 2+ compatible split segments to merge.");
         } else {
-            watchFolder_.stop();
-            pushLog("Watch folder stopped");
+            for (std::size_t i = 0; i < mergeSegments_.size(); ++i) {
+                const bool selected = selectedMergeSegmentIndex_ == static_cast<int>(i);
+                const std::string label = std::to_string(i + 1) + ". " + mergeSegments_[i].filename().string();
+                if (ImGui::Selectable(label.c_str(), selected)) {
+                    selectedMergeSegmentIndex_ = static_cast<int>(i);
+                }
+                if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
+                    ImGui::SetTooltip("%s", mergeSegments_[i].string().c_str());
+                }
+            }
+        }
+        ImGui::EndChild();
+
+        if (selectedMergeSegmentIndex_ >= 0 && selectedMergeSegmentIndex_ < static_cast<int>(mergeSegments_.size())) {
+            if (ImGui::Button("Move Up") && selectedMergeSegmentIndex_ > 0) {
+                std::swap(mergeSegments_[selectedMergeSegmentIndex_], mergeSegments_[selectedMergeSegmentIndex_ - 1]);
+                --selectedMergeSegmentIndex_;
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Move Down") && selectedMergeSegmentIndex_ < static_cast<int>(mergeSegments_.size()) - 1) {
+                std::swap(mergeSegments_[selectedMergeSegmentIndex_], mergeSegments_[selectedMergeSegmentIndex_ + 1]);
+                ++selectedMergeSegmentIndex_;
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Remove Segment")) {
+                mergeSegments_.erase(mergeSegments_.begin() + selectedMergeSegmentIndex_);
+                if (selectedMergeSegmentIndex_ >= static_cast<int>(mergeSegments_.size())) {
+                    selectedMergeSegmentIndex_ = static_cast<int>(mergeSegments_.size()) - 1;
+                }
+            }
+        }
+
+        beginFieldLayout("Merge Output", "Output file path for merged result. If empty, Monosect auto-generates one.");
+        ImGui::InputText("##MergeOutput", mergeOutputInput_, sizeof(mergeOutputInput_));
+        if (compactMode) {
+            if (ImGui::Button("Browse Merge Output")) {
+                if (const auto selected = saveFileDialog(); selected.has_value()) {
+                    std::strncpy(mergeOutputInput_, selected->string().c_str(), sizeof(mergeOutputInput_) - 1);
+                    mergeOutputInput_[sizeof(mergeOutputInput_) - 1] = '\0';
+                }
+            }
+        } else {
+            ImGui::SameLine();
+            if (ImGui::Button("Browse##MergeOutput")) {
+                if (const auto selected = saveFileDialog(); selected.has_value()) {
+                    std::strncpy(mergeOutputInput_, selected->string().c_str(), sizeof(mergeOutputInput_) - 1);
+                    mergeOutputInput_[sizeof(mergeOutputInput_) - 1] = '\0';
+                }
+            }
+        }
+
+        const bool canMerge = mergeSegments_.size() >= 2;
+        if (!canMerge) {
+            ImGui::BeginDisabled();
+        }
+        if (ImGui::Button("Run Merge")) {
+            auto segments = mergeSegments_;
+            std::filesystem::path outputPath;
+            if (std::strlen(mergeOutputInput_) > 0) {
+                outputPath = std::filesystem::path(mergeOutputInput_);
+            } else {
+                const auto& first = segments.front();
+                outputPath = first.parent_path() / (first.stem().string() + "_merged" + first.extension().string());
+            }
+
+            if (!isSafePath(outputPath)) {
+                pushLog("Rejected unsafe merge output path: " + outputPath.string());
+            } else {
+                bool unsafeSegment = false;
+                for (const auto& segment : segments) {
+                    if (!isSafePath(segment)) {
+                        unsafeSegment = true;
+                        break;
+                    }
+                }
+                if (unsafeSegment) {
+                    pushLog("Rejected unsafe merge segment path");
+                } else {
+                    pushLog("Merge started: " + outputPath.string());
+                    threadPool_.enqueue([this, segments = std::move(segments), outputPath]() {
+                        const auto result = splitEngine_.mergeLossless(segments, outputPath);
+                        if (result.success) {
+                            pushLog("Merge complete: " + outputPath.string());
+                        } else {
+                            pushLog("Merge failed: " + result.message);
+                        }
+                    });
+                }
+            }
+        }
+        if (!canMerge) {
+            ImGui::EndDisabled();
         }
     }
-    renderHelpMarker("Apply current watch-folder settings.");
 
     if (ImGui::Button("Dry-run Estimate")) {
         runDryRunEstimate();
     }
-    renderHelpMarker("Computes estimated chunk count for queued files without writing output files.");
+    renderHelpMarker("Computes estimated chunk count for queued files without writing output files.\nShortcut: Ctrl+D");
 
     ImGui::End();
 }
@@ -685,15 +955,14 @@ void App::renderBottomPanel() {
     if (splitInProgress_.load()) {
         if (splitPauseRequested_.load()) {
             if (ImGui::Button("Resume")) {
-                splitPauseRequested_.store(false);
-                splitControlCv_.notify_all();
-                pushLog("Split resumed");
+                togglePauseResumeSplit();
             }
+            renderShortcutTooltip("Resume currently paused split jobs.", "Ctrl+P");
         } else {
             if (ImGui::Button("Pause")) {
-                splitPauseRequested_.store(true);
-                pushLog("Pause requested");
+                togglePauseResumeSplit();
             }
+            renderShortcutTooltip("Pause active split jobs.", "Ctrl+P");
         }
         ImGui::SameLine();
         if (ImGui::Button("Cancel")) {
@@ -741,6 +1010,191 @@ void App::renderBottomPanel() {
     ImGui::EndChild();
 
     ImGui::End();
+}
+
+void App::renderKeyboardShortcutsWindow() {
+    if (!showShortcuts_) {
+        return;
+    }
+    ImGui::SetNextWindowSize(ImVec2(480.0f, 0.0f), ImGuiCond_FirstUseEver);
+    ImGui::Begin("Keyboard Shortcuts", &showShortcuts_, ImGuiWindowFlags_AlwaysAutoResize);
+    ImGui::TextUnformatted("Core actions");
+    ImGui::Separator();
+    ImGui::BulletText("Ctrl+O  - Add files");
+    ImGui::BulletText("Ctrl+Enter - Start split");
+    ImGui::BulletText("Ctrl+P - Pause / Resume split");
+    ImGui::BulletText("Delete - Remove selected queue item");
+    ImGui::BulletText("Ctrl+D - Run dry-run estimate");
+    ImGui::Spacing();
+    ImGui::TextDisabled("Shortcuts are disabled while typing into text fields.");
+    if (ImGui::Button("Close", ImVec2(120.0f, 0.0f))) {
+        showShortcuts_ = false;
+    }
+    ImGui::End();
+}
+
+void App::processKeyboardShortcuts() {
+    ImGuiIO& io = ImGui::GetIO();
+    if (io.WantTextInput) {
+        return;
+    }
+
+    if (ImGui::IsKeyPressed(ImGuiKey_F1, false)) {
+        showShortcuts_ = !showShortcuts_;
+    }
+
+    const bool ctrl = io.KeyCtrl;
+    if (ctrl && ImGui::IsKeyPressed(ImGuiKey_O, false)) {
+        const auto files = openFilesDialog();
+        for (const auto& file : files) {
+            addPath(file);
+        }
+    }
+
+    if (ctrl && (ImGui::IsKeyPressed(ImGuiKey_Enter, false) || ImGui::IsKeyPressed(ImGuiKey_KeypadEnter, false))) {
+        if (!splitInProgress_.load() && ffmpegReady_.load() && !ffmpegBootstrapRunning_.load()) {
+            startSplitJobs();
+        }
+    }
+
+    if (ctrl && ImGui::IsKeyPressed(ImGuiKey_P, false)) {
+        togglePauseResumeSplit();
+    }
+
+    if (ImGui::IsKeyPressed(ImGuiKey_Delete, false)) {
+        removeSelectedFromQueue();
+    }
+
+    if (ctrl && ImGui::IsKeyPressed(ImGuiKey_D, false)) {
+        runDryRunEstimate();
+    }
+}
+
+void App::togglePauseResumeSplit() {
+    if (!splitInProgress_.load()) {
+        return;
+    }
+    if (splitPauseRequested_.load()) {
+        splitPauseRequested_.store(false);
+        splitControlCv_.notify_all();
+        pushLog("Split resumed");
+    } else {
+        splitPauseRequested_.store(true);
+        pushLog("Pause requested");
+    }
+}
+
+std::filesystem::path App::settingsFilePath() const {
+    return executableDirectory() / "monosect.settings";
+}
+
+void App::loadSettings() {
+    const auto path = settingsFilePath();
+    std::ifstream in(path, std::ios::in);
+    if (!in.is_open()) {
+        return;
+    }
+
+    auto writeText = [](char* destination, std::size_t capacity, const std::string& value) {
+        if (capacity == 0) {
+            return;
+        }
+        std::strncpy(destination, value.c_str(), capacity - 1);
+        destination[capacity - 1] = '\0';
+    };
+
+    std::string line;
+    while (std::getline(in, line)) {
+        if (line.empty() || line[0] == '#' || line[0] == ';') {
+            continue;
+        }
+        const auto separator = line.find('=');
+        if (separator == std::string::npos) {
+            continue;
+        }
+
+        const std::string key = trimWhitespace(line.substr(0, separator));
+        const std::string value = trimWhitespace(line.substr(separator + 1));
+
+        if (key == "split_mode_index") {
+            if (const auto parsed = parseIntValue(value); parsed.has_value()) {
+                splitModeIndex_ = std::clamp(*parsed, 0, kSplitModeCount - 1);
+            }
+        } else if (key == "split_part_count") {
+            if (const auto parsed = parseIntValue(value); parsed.has_value()) {
+                splitPartCount_ = std::clamp(*parsed, 2, 100);
+            }
+        } else if (key == "precision_index") {
+            if (const auto parsed = parseIntValue(value); parsed.has_value()) {
+                precisionIndex_ = std::clamp(*parsed, 0, kPrecisionModeCount - 1);
+            }
+        } else if (key == "split_input") {
+            writeText(splitInput_, sizeof(splitInput_), value);
+        } else if (key == "min_file_size_input") {
+            writeText(minFileSizeInput_, sizeof(minFileSizeInput_), value);
+        } else if (key == "output_pattern") {
+            writeText(outputPatternInput_, sizeof(outputPatternInput_), value);
+        } else if (key == "use_custom_output_dir") {
+            if (const auto parsed = parseBoolValue(value); parsed.has_value()) {
+                useCustomOutputDir_ = *parsed;
+            }
+        } else if (key == "output_dir") {
+            writeText(outputDirInput_, sizeof(outputDirInput_), value);
+        } else if (key == "auto_tuner_enabled") {
+            if (const auto parsed = parseBoolValue(value); parsed.has_value()) {
+                autoTunerEnabledUi_ = *parsed;
+            }
+        } else if (key == "max_workers") {
+            if (const auto parsed = parseIntValue(value); parsed.has_value()) {
+                maxWorkerLimit_ = std::clamp(*parsed, 1, std::max(1, hardwareWorkerCount_));
+            }
+        } else if (key == "unrestricted_mode") {
+            if (const auto parsed = parseBoolValue(value); parsed.has_value()) {
+                unrestrictedMode_ = *parsed;
+            }
+        } else if (key == "validate_output_segments") {
+            if (const auto parsed = parseBoolValue(value); parsed.has_value()) {
+                validateOutputSegments_ = *parsed;
+            }
+        } else if (key == "watch_folder_enabled") {
+            if (const auto parsed = parseBoolValue(value); parsed.has_value()) {
+                watchFolderEnabled_ = *parsed;
+            }
+        } else if (key == "watch_folder_path") {
+            writeText(watchFolderInput_, sizeof(watchFolderInput_), value);
+        } else if (key == "merge_output_path") {
+            writeText(mergeOutputInput_, sizeof(mergeOutputInput_), value);
+        } else if (key == "ui_preset_index") {
+            if (const auto parsed = parseIntValue(value); parsed.has_value()) {
+                uiPresetIndex_ = std::clamp(*parsed, kUiPresetSimple, kUiPresetAdvanced);
+            }
+        }
+    }
+}
+
+void App::saveSettings() const {
+    const auto path = settingsFilePath();
+    std::ofstream out(path, std::ios::out | std::ios::trunc);
+    if (!out.is_open()) {
+        return;
+    }
+
+    out << "split_mode_index=" << splitModeIndex_ << '\n';
+    out << "split_part_count=" << splitPartCount_ << '\n';
+    out << "precision_index=" << precisionIndex_ << '\n';
+    out << "split_input=" << splitInput_ << '\n';
+    out << "min_file_size_input=" << minFileSizeInput_ << '\n';
+    out << "output_pattern=" << outputPatternInput_ << '\n';
+    out << "use_custom_output_dir=" << (useCustomOutputDir_ ? "true" : "false") << '\n';
+    out << "output_dir=" << outputDirInput_ << '\n';
+    out << "auto_tuner_enabled=" << (autoTunerEnabledUi_ ? "true" : "false") << '\n';
+    out << "max_workers=" << maxWorkerLimit_ << '\n';
+    out << "unrestricted_mode=" << (unrestrictedMode_ ? "true" : "false") << '\n';
+    out << "validate_output_segments=" << (validateOutputSegments_ ? "true" : "false") << '\n';
+    out << "watch_folder_enabled=" << (watchFolderEnabled_ ? "true" : "false") << '\n';
+    out << "watch_folder_path=" << watchFolderInput_ << '\n';
+    out << "merge_output_path=" << mergeOutputInput_ << '\n';
+    out << "ui_preset_index=" << uiPresetIndex_ << '\n';
 }
 
 void App::updateResponsiveScale() {
@@ -803,11 +1257,8 @@ std::optional<MediaInfo> App::probeMediaCached(const std::filesystem::path& path
         const auto it = probeCache_.find(key);
         if (it != probeCache_.end()) {
             const auto& cached = it->second;
-            if (cached.sizeBytes == sizeBytes) {
-                const auto cmp = modified <=> cached.modifiedTime;
-                if (cmp == std::strong_ordering::equal) {
-                    return cached.info;
-                }
+            if (cached.sizeBytes == sizeBytes && modified == cached.modifiedTime) {
+                return cached.info;
             }
         }
     }
@@ -894,8 +1345,16 @@ void App::addFileToQueue(const std::filesystem::path& path) {
 SplitRequest App::makeRequest(const std::filesystem::path& path) const {
     SplitRequest request;
     request.inputPath = path;
-    request.outputDirectory = path.parent_path();
+    if (useCustomOutputDir_ && std::strlen(outputDirInput_) > 0) {
+        request.outputDirectory = std::filesystem::path(outputDirInput_);
+    } else {
+        request.outputDirectory = path.parent_path();
+    }
+    if (std::strlen(outputPatternInput_) > 0) {
+        request.outputPattern = std::string(outputPatternInput_);
+    }
     request.unrestrictedMode = unrestrictedMode_;
+    request.validateOutputSegments = validateOutputSegments_;
     const auto encoderValue = selectedEncoderValue();
     const bool encoderSelected = !encoderValue.empty() && encoderValue != "copy";
     request.useHardwareAcceleration = encoderSelected;
@@ -936,24 +1395,32 @@ SplitRequest App::makeRequest(const std::filesystem::path& path) const {
         request.splitSizeBytes = 0;
         break;
     case 4:
-        request.splitMode = SplitMode::TorrentPreset;
-        request.splitSizeBytes = 700LL * 1024LL * 1024LL;
+        request.splitMode = SplitMode::ExactSize;
+        request.splitSizeBytes = 1950LL * 1024LL * 1024LL;
         break;
     case 5:
         request.splitMode = SplitMode::TorrentPreset;
-        request.splitSizeBytes = 1024LL * 1024LL * 1024LL;
+        request.splitSizeBytes = 700LL * 1024LL * 1024LL;
         break;
     case 6:
         request.splitMode = SplitMode::TorrentPreset;
-        request.splitSizeBytes = 2LL * 1024LL * 1024LL * 1024LL;
+        request.splitSizeBytes = 1024LL * 1024LL * 1024LL;
         break;
     case 7:
         request.splitMode = SplitMode::TorrentPreset;
+        request.splitSizeBytes = 2LL * 1024LL * 1024LL * 1024LL;
+        break;
+    case 8:
+        request.splitMode = SplitMode::TorrentPreset;
         request.splitSizeBytes = static_cast<int64_t>(4.7 * 1024.0 * 1024.0 * 1024.0);
         break;
-    default:
+    case 9:
         request.splitMode = SplitMode::TorrentPreset;
         request.splitSizeBytes = static_cast<int64_t>(8.5 * 1024.0 * 1024.0 * 1024.0);
+        break;
+    default:
+        request.splitMode = SplitMode::EqualParts;
+        request.splitPartCount = std::clamp(splitPartCount_, 2, 100);
         break;
     }
 
@@ -1127,12 +1594,13 @@ void App::runDryRunEstimate() {
     minFileSizeBytes_.store(parseMegabytesToBytes(minFileSizeInput_));
     const int64_t targetBytes = currentTargetBytes_.load();
     const int splitMode = splitModeIndex_;
+    const int splitPartCount = std::clamp(splitPartCount_, 2, 100);
     if (targetBytes <= 0 && splitModeIndex_ == 1) {
         pushLog("Dry-run skipped: invalid target size");
         return;
     }
 
-    threadPool_.enqueue([this, queueCopy, targetBytes, splitMode]() {
+    threadPool_.enqueue([this, queueCopy, targetBytes, splitMode, splitPartCount]() {
         const int64_t minimumFileSizeBytes = minFileSizeBytes_.load();
         for (const auto& entry : queueCopy) {
             if (!std::filesystem::exists(entry.path)) {
@@ -1153,17 +1621,27 @@ void App::runDryRunEstimate() {
             }
 
             int64_t effectiveTarget = targetBytes;
+            if (splitMode == 10) {
+                updateQueueEstimate(entry.id, splitPartCount, "Dry-run: exactly " + std::to_string(splitPartCount) + " parts");
+                continue;
+            }
             if (splitMode == 3) {
                 effectiveTarget = std::max<int64_t>(1, fileSize / 2);
             } else if (splitMode == 4) {
-                effectiveTarget = 700LL * 1024LL * 1024LL;
+                effectiveTarget = 1950LL * 1024LL * 1024LL;
+                if (fileSize <= 2LL * 1024LL * 1024LL * 1024LL) {
+                    updateQueueEstimate(entry.id, 0, "Dry-run: no split needed (Telegram-safe)");
+                    continue;
+                }
             } else if (splitMode == 5) {
-                effectiveTarget = 1024LL * 1024LL * 1024LL;
+                effectiveTarget = 700LL * 1024LL * 1024LL;
             } else if (splitMode == 6) {
-                effectiveTarget = 2LL * 1024LL * 1024LL * 1024LL;
+                effectiveTarget = 1024LL * 1024LL * 1024LL;
             } else if (splitMode == 7) {
-                effectiveTarget = static_cast<int64_t>(4.7 * 1024.0 * 1024.0 * 1024.0);
+                effectiveTarget = 2LL * 1024LL * 1024LL * 1024LL;
             } else if (splitMode == 8) {
+                effectiveTarget = static_cast<int64_t>(4.7 * 1024.0 * 1024.0 * 1024.0);
+            } else if (splitMode == 9) {
                 effectiveTarget = static_cast<int64_t>(8.5 * 1024.0 * 1024.0 * 1024.0);
             }
 
@@ -1421,6 +1899,24 @@ std::vector<std::filesystem::path> App::openFilesDialog() const {
     }
 
     return selected;
+}
+
+std::optional<std::filesystem::path> App::saveFileDialog() const {
+    wchar_t buffer[4096] = {};
+    OPENFILENAMEW ofn{};
+    ofn.lStructSize = sizeof(ofn);
+    ofn.hwndOwner = nullptr;
+    ofn.lpstrFile = buffer;
+    ofn.nMaxFile = static_cast<DWORD>(std::size(buffer));
+    ofn.lpstrFilter = L"Matroska Video\0*.mkv\0MP4 Video\0*.mp4\0All Files\0*.*\0";
+    ofn.nFilterIndex = 1;
+    ofn.lpstrDefExt = L"mkv";
+    ofn.Flags = OFN_EXPLORER | OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST;
+
+    if (!GetSaveFileNameW(&ofn)) {
+        return std::nullopt;
+    }
+    return std::filesystem::path(buffer);
 }
 
 }

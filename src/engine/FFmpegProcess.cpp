@@ -2,7 +2,9 @@
 
 #include <windows.h>
 
+#include <algorithm>
 #include <sstream>
+#include <string_view>
 #include <thread>
 
 namespace vsm {
@@ -33,6 +35,18 @@ std::wstring quoteArg(const std::wstring& arg) {
     }
     escaped += L"\"";
     return escaped;
+}
+
+bool containsUnsafeProcessContent(std::string_view value) {
+    return value.find('\0') != std::string_view::npos ||
+           value.find('\n') != std::string_view::npos ||
+           value.find('\r') != std::string_view::npos;
+}
+
+bool isBlankProgramPath(std::string_view value) {
+    return std::all_of(value.begin(), value.end(), [](char c) {
+        return c == ' ' || c == '\t';
+    });
 }
 
 std::wstring buildCommandLine(const std::string& program, const std::vector<std::string>& args) {
@@ -140,9 +154,21 @@ FFmpegProcess::Result FFmpegProcess::runProcess(
     const CancelCallback& shouldCancel) const {
     Result result;
 
-    if (program.empty()) {
+    if (containsUnsafeProcessContent(program)) {
+        result.stdErr = "Program path contains unsafe characters (NUL/newline)";
+        return result;
+    }
+
+    if (program.empty() || isBlankProgramPath(program)) {
         result.stdErr = "Program path is empty";
         return result;
+    }
+
+    for (size_t index = 0; index < args.size(); ++index) {
+        if (containsUnsafeProcessContent(args[index])) {
+            result.stdErr = "Process argument[" + std::to_string(index) + "] contains unsafe characters (NUL/newline)";
+            return result;
+        }
     }
 
     SECURITY_ATTRIBUTES securityAttributes{};

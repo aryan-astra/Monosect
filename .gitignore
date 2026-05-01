@@ -2,5 +2,10 @@ build/
 third_party/
 .vscode/
 imgui.ini
+monosect.settings
+monosect-xml.xml
+release/
 *.exe
 *.zip
+*.log
+*.tmp

@@ -47,7 +47,8 @@ enum class SplitMode {
     ExactSize,
     HalfByTime,
     HalfBySize,
-    TorrentPreset
+    TorrentPreset,
+    EqualParts
 };
 
 enum class PrecisionMode {
@@ -67,12 +68,15 @@ struct SplitRequest {
     PrecisionMode precisionMode = PrecisionMode::StrictLossless;
     std::optional<double> splitTimeSeconds;
     std::optional<int64_t> splitSizeBytes;
+    std::optional<int> splitPartCount;
     std::optional<int64_t> minimumFileSizeBytes;
     std::optional<int> desiredThreads;
     std::optional<std::string> codecOverride;
+    std::optional<std::string> outputPattern;
     bool fastSeekEnabled = true;
     bool unrestrictedMode = false;
     bool useHardwareAcceleration = true;
+    bool validateOutputSegments = false;
     ProgressCallback onProgress;
     CancelCallback shouldCancel;
     PauseCallback shouldPause;

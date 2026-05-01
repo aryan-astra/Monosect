@@ -65,6 +65,8 @@ private:
     mutable std::mutex queueMutex_;
     int selectedQueueIndex_ = -1;
     uint64_t nextQueueEntryId_ = 1;
+    std::vector<std::filesystem::path> mergeSegments_;
+    int selectedMergeSegmentIndex_ = -1;
 
     std::vector<std::string> logs_;
     std::mutex logsMutex_;
@@ -75,12 +77,20 @@ private:
     bool unrestrictedMode_ = false;
     bool watchFolderEnabled_ = false;
     bool autoTunerEnabledUi_ = true;
+    bool validateOutputSegments_ = false;
     bool showAbout_ = false;
+    bool showShortcuts_ = false;
+    int splitPartCount_ = 2;
     char splitInput_[64] = "60";
     char minFileSizeInput_[64] = "0";
+    char outputPatternInput_[128] = "{stem}_part{n:02d}{ext}";
+    char outputDirInput_[512] = "";
+    char mergeOutputInput_[512] = "";
     char watchFolderInput_[512] = "";
+    bool useCustomOutputDir_ = false;
     int maxWorkerLimit_ = std::max(1u, std::thread::hardware_concurrency());
     int hardwareWorkerCount_ = std::max(1u, std::thread::hardware_concurrency());
+    int uiPresetIndex_ = 1;
 
     std::vector<std::string> encoderOptions_;
     mutable std::mutex encoderMutex_;
@@ -140,7 +150,9 @@ private:
     void renderRightPanel();
     void renderBottomPanel();
     void renderMainMenu();
+    void renderKeyboardShortcutsWindow();
     void updateResponsiveScale();
+    void processKeyboardShortcuts();
 
     void pushLog(const std::string& line);
     [[nodiscard]] std::optional<MediaInfo> probeMediaCached(const std::filesystem::path& path);
@@ -151,9 +163,15 @@ private:
     void startSplitJobs();
     void runDryRunEstimate();
     void removeSelectedFromQueue();
+    void togglePauseResumeSplit();
+    void applyWatchFolderSettings(bool logStatus);
+    void loadSettings();
+    void saveSettings() const;
+    [[nodiscard]] std::filesystem::path settingsFilePath() const;
     [[nodiscard]] std::optional<std::filesystem::path> selectedQueuePath() const;
     [[nodiscard]] std::vector<QueueEntry> snapshotQueueEntries() const;
     [[nodiscard]] std::vector<std::filesystem::path> openFilesDialog() const;
+    [[nodiscard]] std::optional<std::filesystem::path> saveFileDialog() const;
     SplitRequest makeRequest(const std::filesystem::path& path) const;
     [[nodiscard]] std::string selectedEncoderValue() const;
     void refreshMetrics();

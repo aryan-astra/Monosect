@@ -1,6 +1,7 @@
 #include "engine/GOPAnalyzer.hpp"
 #include "engine/ParseUtils.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <limits>
 #include <sstream>
@@ -10,17 +11,29 @@ namespace vsm {
 GOPAnalyzer::GOPAnalyzer(FFmpegProcess process)
     : process_(std::move(process)) {}
 
-GOPAnalysis GOPAnalyzer::analyze(const std::filesystem::path& path) const {
+GOPAnalysis GOPAnalyzer::analyze(const std::filesystem::path& path, double nearSeconds, double windowSeconds) const {
     GOPAnalysis analysis;
 
-    const auto result = process_.runFFprobe({
+    std::vector<std::string> args = {
         "-v", "error",
         "-select_streams", "v:0",
-        "-show_frames",
-        "-show_entries", "frame=key_frame,pkt_pts_time,pkt_dts_time,pkt_pos,best_effort_timestamp_time",
-        "-of", "csv=p=0",
-        path.string()
-    });
+    };
+
+    if (nearSeconds >= 0.0 && std::isfinite(nearSeconds) && windowSeconds > 0.0 && std::isfinite(windowSeconds)) {
+        const double intervalStart = std::max(0.0, nearSeconds - windowSeconds);
+        const double intervalEnd = std::max(intervalStart, nearSeconds + windowSeconds);
+        const std::string readInterval = "%" + std::to_string(intervalStart) + "%" + std::to_string(intervalEnd);
+        args.push_back("-read_intervals");
+        args.push_back(readInterval);
+    }
+
+    args.push_back("-show_entries");
+    args.push_back("packet=pts_time,flags");
+    args.push_back("-of");
+    args.push_back("csv=p=0");
+    args.push_back(path.string());
+
+    const auto result = process_.runFFprobe(args);
 
     if (!result.ok) {
         return analysis;
@@ -38,20 +51,33 @@ GOPAnalysis GOPAnalyzer::analyze(const std::filesystem::path& path) const {
             continue;
         }
 
-        const bool keyframe = cols[0] == "1";
-        if (!keyframe) {
+        if (cols.size() < 2) {
             continue;
         }
 
-        const double ptsTime = cols.size() > 1 ? parseDoubleOr(cols[1], 0.0) : 0.0;
-        const double dtsTime = cols.size() > 2 ? parseDoubleOr(cols[2], ptsTime) : ptsTime;
-        const int64_t pos = cols.size() > 3 ? parseInt64Or(cols[3], 0) : 0;
+        std::string ptsToken;
+        std::string flagsToken;
+        if (cols.size() >= 3 && cols[0] == "packet") {
+            ptsToken = cols[1];
+            flagsToken = cols[2];
+        } else {
+            ptsToken = cols[0];
+            flagsToken = cols[1];
+        }
+
+        if (flagsToken.find('K') == std::string::npos) {
+            continue;
+        }
+
+        const double ptsTime = parseDoubleOr(ptsToken, -1.0);
+        if (ptsTime < 0.0) {
+            continue;
+        }
 
         GOPEntry entry;
         entry.pts = static_cast<int64_t>(ptsTime * 1000000.0);
-        entry.dts = static_cast<int64_t>(dtsTime * 1000000.0);
+        entry.dts = entry.pts;
         entry.timeSeconds = ptsTime;
-        entry.byteOffset = pos;
         analysis.entries.push_back(entry);
     }
 
@@ -74,9 +100,29 @@ GOPAnalysis GOPAnalyzer::analyze(const std::filesystem::path& path) const {
     return analysis;
 }
 
-std::optional<GOPEntry> GOPAnalyzer::nearestKeyframe(const GOPAnalysis& analysis, double timeSeconds) const {
+std::optional<GOPEntry> GOPAnalyzer::nearestKeyframe(const GOPAnalysis& analysis,
+                                                     double timeSeconds,
+                                                     KeyframeSearchDir dir) const {
     if (analysis.entries.empty()) {
         return std::nullopt;
+    }
+
+    if (dir == KeyframeSearchDir::AtOrBefore) {
+        for (int i = static_cast<int>(analysis.entries.size()) - 1; i >= 0; --i) {
+            if (analysis.entries[static_cast<std::size_t>(i)].timeSeconds <= timeSeconds) {
+                return analysis.entries[static_cast<std::size_t>(i)];
+            }
+        }
+        return analysis.entries.front();
+    }
+
+    if (dir == KeyframeSearchDir::AtOrAfter) {
+        for (const auto& entry : analysis.entries) {
+            if (entry.timeSeconds >= timeSeconds) {
+                return entry;
+            }
+        }
+        return analysis.entries.back();
     }
 
     std::size_t bestIndex = 0;

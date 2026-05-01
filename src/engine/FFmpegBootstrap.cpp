@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <fstream>
 #include <string>
+#include <string_view>
 #include <vector>
 
 // winhttp.lib is linked via CMakeLists.txt
@@ -14,6 +15,26 @@
 namespace vsm {
 
 namespace {
+
+bool containsUnsafeProcessContent(std::wstring_view value) {
+    return value.find(L'\0') != std::wstring_view::npos ||
+           value.find(L'\n') != std::wstring_view::npos ||
+           value.find(L'\r') != std::wstring_view::npos;
+}
+
+std::wstring toPowerShellSingleQuotedLiteral(const std::filesystem::path& path) {
+    std::wstring value = path.wstring();
+    std::wstring escaped;
+    escaped.reserve(value.size() + 8);
+    for (const wchar_t ch : value) {
+        if (ch == L'\'') {
+            escaped += L"''";
+        } else {
+            escaped.push_back(ch);
+        }
+    }
+    return L"'" + escaped + L"'";
+}
 
 // Download a URL to a local file using WinHTTP. Follows one redirect level.
 bool downloadFile(const std::wstring& host, const std::wstring& path,
@@ -152,13 +173,28 @@ bool extractFFmpegFromZip(const std::filesystem::path& zipPath,
 
     // Use PowerShell to extract + locate binaries
     const auto tempDir = destDir / "ffmpeg_temp";
+    const std::wstring zipPathWide = zipPath.wstring();
+    const std::wstring tempDirWide = tempDir.wstring();
+    const std::wstring destDirWide = destDir.wstring();
+
+    if (zipPathWide.empty() || destDirWide.empty()) {
+        if (onStatus) onStatus("Extraction aborted: source or destination path is empty.");
+        return false;
+    }
+
+    if (containsUnsafeProcessContent(zipPathWide) ||
+        containsUnsafeProcessContent(tempDirWide) ||
+        containsUnsafeProcessContent(destDirWide)) {
+        if (onStatus) onStatus("Extraction aborted: path contains unsafe characters.");
+        return false;
+    }
 
     // Build PowerShell command
-    std::wstring cmd = L"powershell.exe -NoProfile -ExecutionPolicy Bypass -Command \"";
+    std::wstring cmd = L"powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command \"";
     cmd += L"$ErrorActionPreference='Stop'; ";
-    cmd += L"$zip='" + zipPath.wstring() + L"'; ";
-    cmd += L"$tmp='" + tempDir.wstring() + L"'; ";
-    cmd += L"$dst='" + destDir.wstring() + L"'; ";
+    cmd += L"$zip=" + toPowerShellSingleQuotedLiteral(zipPath) + L"; ";
+    cmd += L"$tmp=" + toPowerShellSingleQuotedLiteral(tempDir) + L"; ";
+    cmd += L"$dst=" + toPowerShellSingleQuotedLiteral(destDir) + L"; ";
     cmd += L"if(Test-Path $tmp){Remove-Item -Recurse -Force $tmp}; ";
     cmd += L"Expand-Archive -Path $zip -DestinationPath $tmp -Force; ";
     cmd += L"$ff=Get-ChildItem -Path $tmp -Recurse -Filter ffmpeg.exe | Select-Object -First 1; ";

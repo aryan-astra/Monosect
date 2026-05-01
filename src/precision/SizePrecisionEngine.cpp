@@ -8,6 +8,7 @@ namespace vsm {
 
 SizePrecisionEngine::SearchResult SizePrecisionEngine::findSplitTime(const SearchConfig& config, const Evaluator& evaluator) {
     SearchResult result;
+    cache_.clear();
 
     double low = config.minTimeSeconds;
     double high = config.maxTimeSeconds;
