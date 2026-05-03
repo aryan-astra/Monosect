@@ -35,7 +35,7 @@ jobs:
           if ($versionFromTag -ne $versionFromRepo) {
             throw "Tag version ($versionFromTag) does not match repository version ($versionFromRepo)"
           }
-          Write-Host "Tag/version check passed: $versionFromTag"
+          Write-Host "✓ Tag/version validation passed: $versionFromTag"
 
       - name: Setup MSYS2 (MinGW64 toolchain)
         uses: msys2/setup-msys2@v2
@@ -48,114 +48,152 @@ jobs:
             mingw-w64-x86_64-cmake
             mingw-w64-x86_64-ninja
 
-      - name: Configure
+      - name: Configure CMake
         shell: msys2 {0}
         run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
 
-      - name: Build
+      - name: Build Monosect
         shell: msys2 {0}
-        run: cmake --build build --target Monosect
+        run: cmake --build build --target Monosect -j 4
+
+      - name: Run quality checks
+        shell: msys2 {0}
+        run: |
+          if [ -f "build/MonosectQualityChecks" ]; then
+            build/MonosectQualityChecks
+          fi
 
       - name: Bundle FFmpeg binaries
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
+          Write-Host "Downloading FFmpeg binaries..."
           New-Item -ItemType Directory -Force -Path release | Out-Null
+          
           $ffmpegUrl = "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl.zip"
           $zipPath = "ffmpeg_download.zip"
           $tmpDir = "ffmpeg_tmp"
-
-          Invoke-WebRequest -Uri $ffmpegUrl -OutFile $zipPath
-          Expand-Archive -Path $zipPath -DestinationPath $tmpDir -Force
-
-          $ffmpegBin = Get-ChildItem -Path $tmpDir -Recurse -Filter ffmpeg.exe | Select-Object -First 1
-          $ffprobeBin = Get-ChildItem -Path $tmpDir -Recurse -Filter ffprobe.exe | Select-Object -First 1
-          if ($null -eq $ffmpegBin -or $null -eq $ffprobeBin) {
-            throw "Unable to locate ffmpeg.exe/ffprobe.exe in downloaded archive"
+          
+          try {
+            Invoke-WebRequest -Uri $ffmpegUrl -OutFile $zipPath -ErrorAction Stop
+            Expand-Archive -Path $zipPath -DestinationPath $tmpDir -Force
+            
+            $ffmpegBin = Get-ChildItem -Path $tmpDir -Recurse -Filter ffmpeg.exe | Select-Object -First 1
+            $ffprobeBin = Get-ChildItem -Path $tmpDir -Recurse -Filter ffprobe.exe | Select-Object -First 1
+            
+            if ($null -eq $ffmpegBin -or $null -eq $ffprobeBin) {
+              throw "Unable to locate ffmpeg.exe/ffprobe.exe in downloaded archive"
+            }
+            
+            Copy-Item $ffmpegBin.FullName "release/ffmpeg.exe" -Force
+            Copy-Item $ffprobeBin.FullName "release/ffprobe.exe" -Force
+            Write-Host "✓ FFmpeg binaries bundled successfully"
+          } finally {
+            if (Test-Path $tmpDir) { Remove-Item -Recurse -Force $tmpDir }
+            if (Test-Path $zipPath) { Remove-Item -Force $zipPath }
           }
-
-          Copy-Item $ffmpegBin.FullName "release/ffmpeg.exe" -Force
-          Copy-Item $ffprobeBin.FullName "release/ffprobe.exe" -Force
-          Remove-Item -Recurse -Force $tmpDir
-          Remove-Item -Force $zipPath
 
       - name: Prepare release assets
         id: prepare_assets
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          New-Item -ItemType Directory -Force -Path release | Out-Null
+          Write-Host "Preparing release assets..."
+          
           if (-not (Test-Path "build/Monosect.exe")) {
-            throw "Missing build artifact: build/Monosect.exe"
+            throw "Build artifact not found: build/Monosect.exe"
           }
-          Copy-Item "build/Monosect.exe" "release/Monosect.exe" -Force
-          $uploadFiles = @(
-            "release/Monosect.exe"
-            "release/SHA256SUMS.txt"
-          )
-
-          if (Test-Path "build/Monosect-icon-square.png") { Copy-Item "build/Monosect-icon-square.png" "release/Monosect-icon-square.png" -Force }
-          if (Test-Path "build/Monosect-full-logo.png") { Copy-Item "build/Monosect-full-logo.png" "release/Monosect-full-logo.png" -Force }
-          if (Test-Path "release/Monosect-icon-square.png") { $uploadFiles += "release/Monosect-icon-square.png" }
-          if (Test-Path "release/Monosect-full-logo.png") { $uploadFiles += "release/Monosect-full-logo.png" }
-
+          if (-not ((Test-Path "release/ffmpeg.exe") -and (Test-Path "release/ffprobe.exe"))) {
+            throw "FFmpeg binaries not found in release directory"
+          }
+          
+          $version = "${{ github.ref_name }}".TrimStart('v')
           $exePath = "release/Monosect.exe"
-          $portableZipPath = "release/Monosect-${{ github.ref_name }}-portable.zip"
-          if ((Test-Path "release/ffmpeg.exe") -and (Test-Path "release/ffprobe.exe")) {
-            $portableFiles = @(
-              "release/Monosect.exe",
-              "release/ffmpeg.exe",
-              "release/ffprobe.exe"
-            )
-            if (Test-Path "release/Monosect-icon-square.png") { $portableFiles += "release/Monosect-icon-square.png" }
-            if (Test-Path "release/Monosect-full-logo.png") { $portableFiles += "release/Monosect-full-logo.png" }
-            Compress-Archive -Path $portableFiles -DestinationPath $portableZipPath -Force
-            if (Test-Path $portableZipPath) {
-              $uploadFiles += $portableZipPath
-            }
+          $portableZipPath = "release/Monosect-$version-portable.zip"
+          
+          Copy-Item "build/Monosect.exe" $exePath -Force
+          
+          # Create portable package with bundled FFmpeg
+          $portableFiles = @($exePath, "release/ffmpeg.exe", "release/ffprobe.exe")
+          if (Test-Path "Monosect-icon-square.png") { $portableFiles += "Monosect-icon-square.png" }
+          if (Test-Path "Monosect-full-logo.png") { $portableFiles += "Monosect-full-logo.png" }
+          
+          Compress-Archive -Path $portableFiles -DestinationPath $portableZipPath -Force
+          if (-not (Test-Path $portableZipPath)) {
+            throw "Failed to create portable ZIP"
           }
-
-          $checksumTargets = @($exePath)
-          if (Test-Path $portableZipPath) {
-            $checksumTargets += $portableZipPath
-          }
+          Write-Host "✓ Created portable package: $(Split-Path -Leaf $portableZipPath)"
+          
+          # Generate SHA256 checksums
           $checksumLines = @()
+          $checksumTargets = @($exePath, $portableZipPath)
+          
           foreach ($target in $checksumTargets) {
-            $sha = (Get-FileHash -Algorithm SHA256 $target).Hash.ToLowerInvariant()
-            $checksumLines += "$sha  $(Split-Path -Path $target -Leaf)"
+            if (Test-Path $target) {
+              $sha = (Get-FileHash -Algorithm SHA256 $target).Hash.ToLowerInvariant()
+              $checksumLines += "$sha  $(Split-Path -Path $target -Leaf)"
+            }
           }
           $checksumLines | Set-Content "release/SHA256SUMS.txt" -Encoding ascii
-          if (-not (Test-Path "release/SHA256SUMS.txt")) {
-            throw "Failed to create checksum file."
-          }
-
+          Write-Host "✓ Generated SHA256SUMS.txt"
+          
+          # Prepare upload list
+          $uploadFiles = @(
+            $exePath,
+            $portableZipPath,
+            "release/SHA256SUMS.txt"
+          )
+          
+          # GPG sign if credentials provided
           if ("${{ secrets.MONOSECT_RELEASE_SIGNING_KEY }}" -ne "") {
+            Write-Host "Signing release with GPG..."
             $privateKeyPath = Join-Path $env:RUNNER_TEMP "release-signing.key"
             "${{ secrets.MONOSECT_RELEASE_SIGNING_KEY }}" | Set-Content $privateKeyPath -Encoding ascii
-            gpg --batch --import $privateKeyPath
+            
+            gpg --batch --import $privateKeyPath 2>&1 | Out-Null
             Remove-Item $privateKeyPath -Force
+            
             if ("${{ secrets.MONOSECT_RELEASE_SIGNING_KEY_ID }}" -eq "") {
-              throw "MONOSECT_RELEASE_SIGNING_KEY_ID is required when signing key is provided."
+              throw "MONOSECT_RELEASE_SIGNING_KEY_ID required when signing key is provided"
             }
+            
             gpg --batch --yes --armor --detach-sign --local-user "${{ secrets.MONOSECT_RELEASE_SIGNING_KEY_ID }}" --output "release/Monosect.exe.asc" $exePath
-            if (-not (Test-Path "release/Monosect.exe.asc")) {
-              throw "Expected detached signature was not created."
+            
+            if (Test-Path "release/Monosect.exe.asc") {
+              $uploadFiles += "release/Monosect.exe.asc"
+              Write-Host "✓ GPG signature generated"
             }
-            "Signature generated: release/Monosect.exe.asc" | Set-Content "release/SIGNING_STATUS.txt" -Encoding ascii
-            $uploadFiles += "release/Monosect.exe.asc"
           } else {
-            "No signing key configured. Skipping detached signature." | Set-Content "release/SIGNING_STATUS.txt" -Encoding ascii
+            Write-Host "⚠ No GPG credentials configured; skipping signature"
           }
-          $uploadFiles += "release/SIGNING_STATUS.txt"
-
+          
           "files<<EOF" >> $env:GITHUB_OUTPUT
           ($uploadFiles | Sort-Object -Unique) -join "`n" >> $env:GITHUB_OUTPUT
           "EOF" >> $env:GITHUB_OUTPUT
 
-      - name: Create GitHub release and upload EXE
+      - name: Create GitHub release
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
           files: ${{ steps.prepare_assets.outputs.files }}
+          body: |
+            **Monosect ${{ github.ref_name }}**
+
+            ### Installation
+            **Recommended:** Download the portable ZIP, extract anywhere, and run `Monosect.exe`.
+
+            ### Contents
+            - `Monosect.exe` — Standalone executable
+            - `Monosect-${{ github.ref_name }}-portable.zip` — Complete package (executable + bundled FFmpeg + resources)
+            - `SHA256SUMS.txt` — Checksums for file integrity verification
+
+            ### Verification
+            ```bash
+            sha256sum -c SHA256SUMS.txt
+            ```
+
+            For documentation, source code, and issue tracking, visit [github.com/aryan-astra/Monosect](https://github.com/aryan-astra/Monosect).
           generate_release_notes: true
           fail_on_unmatched_files: true
+          draft: false
+          prerelease: false
