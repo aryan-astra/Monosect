@@ -478,18 +478,32 @@ def section_formats(cli: str, fixtures: Path, work: Path) -> None:
             continue
         produced = sorted(p for p in out.iterdir() if p.is_file() and not p.name.startswith("."))
         REPORT.ok(f"{label} produced {len(produced)} part(s)", len(produced) >= 1)
-        # Every part must carry the same stream set as the source.
         source_streams = probe_stream_names(str(source))
+        # Every part must carry the same stream *kinds* as the source, but a stream
+        # with nothing in a part's time range is legitimately absent from it: a
+        # subtitle track whose only cue is at 0.5 s contributes nothing to a part
+        # covering 4-6 s.  Asserting equality would demand the impossible - that a
+        # part invent a cue that is not there - and it did: the multi-stream
+        # fixture's last part was reported as "not keeping the source's stream
+        # kinds" for correctly omitting a subtitle stream it has no cue for.
+        #
+        # So the check is that the part's kinds are a subsequence of the source's,
+        # in the same order, with the timed (video/audio) streams all present.
+        source_kinds = [k for _, k, _ in source_streams]
+        timed = {"video", "audio"}
+        missing = [k for k in source_kinds if k in timed]
         for part in produced:
-            part_streams = probe_stream_names(str(part))
-            if source_streams and part_streams and \
-                    [k for _, k, _ in part_streams] != [k for _, k, _ in source_streams]:
+            part_kinds = [k for _, k, _ in probe_stream_names(str(part))]
+            lost = [k for k in missing if k not in part_kinds]
+            reordered = [k for k in part_kinds if k not in source_kinds]
+            subset = part_kinds == [k for k in source_kinds if k in part_kinds]
+            if lost or reordered or not subset:
                 REPORT.ok(f"{label}: {part.name} keeps the source's stream kinds",
-                          False, f"source={source_streams} part={part_streams}")
+                          False, f"source={source_kinds} part={part_kinds} lost={lost}")
                 break
         else:
-            REPORT.ok(f"{label}: every part keeps the source's stream kinds", True,
-                      f"{[k for _, k, _ in source_streams]}")
+            REPORT.ok(f"{label}: every part keeps the source's timed streams", True,
+                      f"source={source_kinds}")
 
 
 # ---------------------------------------------------------------------------
