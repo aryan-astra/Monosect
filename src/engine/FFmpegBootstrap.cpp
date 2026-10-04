@@ -1,5 +1,7 @@
 #include "engine/FFmpegBootstrap.hpp"
 
+#include "core/DependencyPin.hpp"
+
 #include <windows.h>
 #include <winhttp.h>
 #include <shlwapi.h>
@@ -20,6 +22,56 @@ bool containsUnsafeProcessContent(std::wstring_view value) {
     return value.find(L'\0') != std::wstring_view::npos ||
            value.find(L'\n') != std::wstring_view::npos ||
            value.find(L'\r') != std::wstring_view::npos;
+}
+
+// Splits the pinned https:// URL into the host and the path the downloader
+// takes.  The URL is a compile-time constant so a malformed one is a build
+// error in the release process, not something a user can influence.
+bool splitPinnedUrl(const std::string& url, std::wstring& host, std::wstring& path) {
+    const std::string prefix = "https://";
+    if (url.rfind(prefix, 0) != 0) {
+        return false;
+    }
+    const std::size_t slash = url.find('/', prefix.size());
+    if (slash == std::string::npos) {
+        return false;
+    }
+    const std::string hostPart = url.substr(prefix.size(), slash - prefix.size());
+    const std::string pathPart = url.substr(slash);
+    if (hostPart.empty() || pathPart.size() < 2) {
+        return false;
+    }
+    host.assign(hostPart.begin(), hostPart.end());
+    path.assign(pathPart.begin(), pathPart.end());
+    return true;
+}
+
+// Verifies the two tools against the pins.  `onStatus` is told what happened in
+// the same words the verification uses, so the window and the job log cannot
+// disagree about whether the tools were identified.
+bool verifyToolchain(const std::filesystem::path& appDirectory,
+                     const std::function<void(const std::string&)>& onStatus,
+                     bool discardOnFailure) {
+    const std::vector<std::pair<std::filesystem::path, monosect::core::DependencyPin>> tools = {
+        {appDirectory / "ffmpeg.exe", monosect::core::pinnedFfmpeg()},
+        {appDirectory / "ffprobe.exe", monosect::core::pinnedFfprobe()},
+    };
+    bool allOk = true;
+    for (const auto& [toolPath, pin] : tools) {
+        const monosect::core::DependencyCheck check = monosect::core::verifyToolFile(toolPath, pin);
+        if (onStatus) {
+            onStatus(pin.name + ": " + check.message);
+        }
+        if (!check.ok()) {
+            allOk = false;
+            if (discardOnFailure) {
+                std::error_code error;
+                std::filesystem::remove(toolPath, error);
+                std::filesystem::remove(pin.sidecarPath(toolPath), error);
+            }
+        }
+    }
+    return allOk;
 }
 
 std::wstring toPowerShellSingleQuotedLiteral(const std::filesystem::path& path) {
@@ -165,45 +217,69 @@ bool downloadFile(const std::wstring& host, const std::wstring& path,
     return totalRead > 0;
 }
 
-// Extract ffmpeg.exe and ffprobe.exe from a zip using PowerShell's Expand-Archive.
+// Extract ffmpeg.exe and ffprobe.exe from a verified zip.
+//
+// Why PowerShell: Windows has no documented API that reads a ZIP container.
+// `cabapi.dll` decompresses XPRESS/LZMS, not the raw DEFLATE (RFC 1951) that a
+// ZIP entry uses, and `RtlDecompressBuffer` offers the same formats.  Writing a
+// native inflate would be a few hundred lines of new parsing code on the
+// installation path - a much larger risk than the dependency it removes - so the
+// documented, shipped implementation (`Expand-Archive`) is used.  The decision is
+// recorded in docs/RESEARCH.md so it is not re-litigated without new information.
+//
+// What is fixed relative to the previous implementation, and why it matters:
+//   * the wait result is checked.  `WaitForSingleObject` returning WAIT_TIMEOUT
+//     used to be discarded, `GetExitCodeProcess` then reported 259
+//     (STILL_ACTIVE) and the caller concluded "failed" - while the PowerShell
+//     child kept running, and its last statement deleted the archive.  On a slow
+//     or large extraction that is a silently wedged, half-installed toolchain.
+//     A timeout now terminates the child and waits for it to die.
+//   * nothing is written into the destination directory.  Extraction happens in
+//     a temporary folder that is verified *before* anything is moved into place,
+//     so a failed verification can never have half-replaced a working toolchain.
+//   * the command no longer passes `-ExecutionPolicy Bypass`.  Inline
+//     `-Command` is not subject to the script execution policy, so the bypass was
+//     both unnecessary and a suppression of a machine's policy.
 bool extractFFmpegFromZip(const std::filesystem::path& zipPath,
-                          const std::filesystem::path& destDir,
-                          const std::function<void(const std::string&)>& onStatus) {
+                          const std::filesystem::path& destinationDir,
+                          const std::function<void(const std::string&)>& onStatus,
+                          std::string& failureReason) {
     if (onStatus) onStatus("Extracting FFmpeg binaries...");
 
-    // Use PowerShell to extract + locate binaries
-    const auto tempDir = destDir / "ffmpeg_temp";
+    const std::filesystem::path tempDir = destinationDir / "ffmpeg_extract_tmp";
+
     const std::wstring zipPathWide = zipPath.wstring();
     const std::wstring tempDirWide = tempDir.wstring();
-    const std::wstring destDirWide = destDir.wstring();
 
-    if (zipPathWide.empty() || destDirWide.empty()) {
-        if (onStatus) onStatus("Extraction aborted: source or destination path is empty.");
+    if (zipPathWide.empty() || tempDirWide.empty()) {
+        failureReason = "Extraction aborted: the archive or working path is empty.";
+        return false;
+    }
+    if (containsUnsafeProcessContent(zipPathWide) || containsUnsafeProcessContent(tempDirWide)) {
+        failureReason = "Extraction aborted: a path contains a NUL or a line break.";
         return false;
     }
 
-    if (containsUnsafeProcessContent(zipPathWide) ||
-        containsUnsafeProcessContent(tempDirWide) ||
-        containsUnsafeProcessContent(destDirWide)) {
-        if (onStatus) onStatus("Extraction aborted: path contains unsafe characters.");
-        return false;
-    }
+    std::error_code error;
+    std::filesystem::remove_all(tempDir, error);
+    error.clear();
 
-    // Build PowerShell command
-    std::wstring cmd = L"powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command \"";
-    cmd += L"$ErrorActionPreference='Stop'; ";
-    cmd += L"$zip=" + toPowerShellSingleQuotedLiteral(zipPath) + L"; ";
-    cmd += L"$tmp=" + toPowerShellSingleQuotedLiteral(tempDir) + L"; ";
-    cmd += L"$dst=" + toPowerShellSingleQuotedLiteral(destDir) + L"; ";
-    cmd += L"if(Test-Path $tmp){Remove-Item -Recurse -Force $tmp}; ";
-    cmd += L"Expand-Archive -Path $zip -DestinationPath $tmp -Force; ";
-    cmd += L"$ff=Get-ChildItem -Path $tmp -Recurse -Filter ffmpeg.exe | Select-Object -First 1; ";
-    cmd += L"$fp=Get-ChildItem -Path $tmp -Recurse -Filter ffprobe.exe | Select-Object -First 1; ";
-    cmd += L"if($ff){Copy-Item $ff.FullName (Join-Path $dst 'ffmpeg.exe') -Force}; ";
-    cmd += L"if($fp){Copy-Item $fp.FullName (Join-Path $dst 'ffprobe.exe') -Force}; ";
-    cmd += L"Remove-Item -Recurse -Force $tmp; ";
-    cmd += L"Remove-Item -Force $zip; ";
-    cmd += L"\"";
+    // Every path goes through the single-quoted PowerShell literal, which is the
+    // only quoting form in which nothing in a Windows path is interpreted: an
+    // apostrophe in a user name ("C:\Users\O'Brien\...") would otherwise end the
+    // string, and a `$` or a backtick would be expanded.
+    std::wstring command = L"powershell.exe -NoLogo -NoProfile -NonInteractive -Command \"";
+    command += L"$ErrorActionPreference='Stop'; ";
+    command += L"$zip=" + toPowerShellSingleQuotedLiteral(zipPath) + L"; ";
+    command += L"$tmp=" + toPowerShellSingleQuotedLiteral(tempDir) + L"; ";
+    command += L"Expand-Archive -Path $zip -DestinationPath $tmp -Force; ";
+    command += L"$ff=Get-ChildItem -Path $tmp -Recurse -Filter ffmpeg.exe | Select-Object -First 1; ";
+    command += L"$fp=Get-ChildItem -Path $tmp -Recurse -Filter ffprobe.exe | Select-Object -First 1; ";
+    command += L"if(-not $ff){throw 'the archive does not contain ffmpeg.exe'}; ";
+    command += L"if(-not $fp){throw 'the archive does not contain ffprobe.exe'}; ";
+    command += L"Copy-Item -LiteralPath $ff.FullName -Destination (Join-Path $tmp 'extracted-ffmpeg.exe') -Force; ";
+    command += L"Copy-Item -LiteralPath $fp.FullName -Destination (Join-Path $tmp 'extracted-ffprobe.exe') -Force; ";
+    command += L"\"";
 
     STARTUPINFOW si{};
     si.cb = sizeof(si);
@@ -211,66 +287,210 @@ bool extractFFmpegFromZip(const std::filesystem::path& zipPath,
     si.wShowWindow = SW_HIDE;
     PROCESS_INFORMATION pi{};
 
-    if (!CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, FALSE,
-                        CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) {
+    if (!CreateProcessW(nullptr, command.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &si,
+                        &pi)) {
+        failureReason = "Extraction failed: PowerShell could not be started (Windows error " +
+                        std::to_string(static_cast<unsigned long>(::GetLastError())) + ").";
         return false;
     }
 
-    WaitForSingleObject(pi.hProcess, 120000); // 2 min timeout
+    constexpr DWORD kExtractionTimeoutMs = 300000;   // 5 minutes for a ~200 MB archive
+    const DWORD waited = WaitForSingleObject(pi.hProcess, kExtractionTimeoutMs);
+    bool timedOut = false;
+    if (waited == WAIT_TIMEOUT) {
+        timedOut = true;
+        // Terminate and *wait*: a child that is still alive after this point would
+        // keep writing into the folder the caller is about to delete.
+        ::TerminateProcess(pi.hProcess, 1);
+        WaitForSingleObject(pi.hProcess, 10000);
+    }
     DWORD exitCode = 1;
-    GetExitCodeProcess(pi.hProcess, &exitCode);
-    CloseHandle(pi.hThread);
-    CloseHandle(pi.hProcess);
+    ::GetExitCodeProcess(pi.hProcess, &exitCode);
+    ::CloseHandle(pi.hThread);
+    ::CloseHandle(pi.hProcess);
 
-    if (exitCode != 0) return false;
+    if (timedOut) {
+        failureReason = "Extraction did not finish within " + std::to_string(kExtractionTimeoutMs / 1000) +
+                        " seconds and was stopped. Retry, or extract ffmpeg.exe and ffprobe.exe from the archive "
+                        "yourself and place them next to MonoSect.exe.";
+        std::filesystem::remove_all(tempDir, error);
+        return false;
+    }
+    if (exitCode != 0) {
+        failureReason = "Extraction failed (PowerShell exit code " + std::to_string(static_cast<unsigned long>(exitCode)) +
+                        "). The archive may be incomplete; retry the download.";
+        std::filesystem::remove_all(tempDir, error);
+        return false;
+    }
 
-    // Verify both exist
-    return std::filesystem::exists(destDir / "ffmpeg.exe") &&
-           std::filesystem::exists(destDir / "ffprobe.exe");
+    const std::filesystem::path extractedFfmpeg = tempDir / "extracted-ffmpeg.exe";
+    const std::filesystem::path extractedFfprobe = tempDir / "extracted-ffprobe.exe";
+    if (!std::filesystem::exists(extractedFfmpeg) || !std::filesystem::exists(extractedFfprobe)) {
+        failureReason = "Extraction reported success but the two tools are not there.";
+        std::filesystem::remove_all(tempDir, error);
+        return false;
+    }
+    return true;
 }
 
 } // namespace
 
 bool ensureFFmpeg(const std::filesystem::path& appDirectory,
                   const std::function<void(const std::string&)>& onStatus) {
-    const auto ffmpegPath  = appDirectory / "ffmpeg.exe";
-    const auto ffprobePath = appDirectory / "ffprobe.exe";
+    const std::filesystem::path ffmpegPath = appDirectory / "ffmpeg.exe";
+    const std::filesystem::path ffprobePath = appDirectory / "ffprobe.exe";
+    const std::filesystem::path zipPath = appDirectory / "ffmpeg_download.zip";
+    const monosect::core::DependencyPin archivePin = monosect::core::pinnedArchive();
 
-    // Already present?
+    const auto report = [&onStatus](const std::string& line) {
+        if (onStatus) {
+            onStatus(line);
+        }
+    };
+    const auto cleanupArchive = [&zipPath]() {
+        std::error_code error;
+        std::filesystem::remove(zipPath, error);
+    };
+    const auto discardTools = [&appDirectory, &ffmpegPath, &ffprobePath]() {
+        std::error_code error;
+        std::filesystem::remove(ffmpegPath, error);
+        std::filesystem::remove(ffprobePath, error);
+        std::filesystem::remove(monosect::core::pinnedFfmpeg().sidecarPath(ffmpegPath), error);
+        std::filesystem::remove(monosect::core::pinnedFfprobe().sidecarPath(ffprobePath), error);
+        (void)appDirectory;
+    };
+
+    // ---- 1. Are the tools already there, and are they identifiable? ---------
+    //
+    // The files still have to pass verification.  A tool that was swapped,
+    // patched or half-written is not run silently, and - importantly - an
+    // existing good toolchain is not thrown away before the replacement has been
+    // verified either.
     if (std::filesystem::exists(ffmpegPath) && std::filesystem::exists(ffprobePath)) {
-        return true;
+        if (verifyToolchain(appDirectory, onStatus, /*discardOnFailure=*/false)) {
+            report("FFmpeg ready: the tools next to MonoSect are the pinned release.");
+            return true;
+        }
+        report("The tools next to MonoSect are not the pinned release. A fresh copy will be downloaded.");
     }
 
-    if (onStatus) onStatus("FFmpeg not found. Downloading (~30 MB)...");
-
-    // Download from GitHub BtbN releases (static essentials build)
-    const std::wstring host = L"github.com";
-    const std::wstring path = L"/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl.zip";
-    const auto zipPath = appDirectory / "ffmpeg_download.zip";
-
+    // ---- 2. Download the pinned archive -------------------------------------
+    std::wstring host;
+    std::wstring path;
+    if (!splitPinnedUrl(archivePin.url, host, path)) {
+        report("The pinned FFmpeg address is not a valid https URL, which is a build defect: " + archivePin.url);
+        return false;
+    }
+    report("Downloading the pinned FFmpeg build: " + archivePin.version);
     if (!downloadFile(host, path, zipPath, onStatus)) {
-        if (onStatus) onStatus("FFmpeg download failed. Please place ffmpeg.exe and ffprobe.exe next to the application.");
-        // Clean up partial download
-        std::error_code ec;
-        std::filesystem::remove(zipPath, ec);
+        cleanupArchive();
+        report("The FFmpeg download failed. Place ffmpeg.exe and ffprobe.exe next to MonoSect.exe to use MonoSect "
+               "without downloading anything.");
         return false;
     }
 
-    if (onStatus) onStatus("Download complete. Extracting...");
+    // ---- 3. Verify the archive BEFORE anything opens it ----------------------
+    //
+    // This is the trust anchor: a hash mismatch means the bytes on disk are not
+    // the bytes the release published, and the file is deleted rather than
+    // unpacked.  When this build pins no archive hash the check is skipped rather
+    // than faked, and that is said out loud.
+    report("Download complete. Verifying the archive...");
+    const monosect::core::DependencyCheck archiveCheck =
+        monosect::core::verifyToolFile(zipPath, archivePin, /*recordWhenUnpinned=*/false);
+    report(archiveCheck.message);
+    if (!archiveCheck.ok()) {
+        cleanupArchive();
+        report("The downloaded archive was discarded because it is not the pinned release. MonoSect will not "
+               "execute a tool it cannot identify.");
+        return false;
+    }
+    if (!archivePin.hasPinnedHash()) {
+        report("This build of MonoSect does not pin an archive digest, so the download could only be checked for "
+               "being readable. A release build pins it.");
+    }
 
-    if (!extractFFmpegFromZip(zipPath, appDirectory, onStatus)) {
-        if (onStatus) onStatus("Extraction failed. Please manually extract ffmpeg.exe and ffprobe.exe.");
+    // ---- 4. Extract into a temporary folder ----------------------------------
+    std::string extractionFailure;
+    if (!extractFFmpegFromZip(zipPath, appDirectory, onStatus, extractionFailure)) {
+        cleanupArchive();
+        report(extractionFailure);
         return false;
     }
 
-    // Final verify
-    if (std::filesystem::exists(ffmpegPath) && std::filesystem::exists(ffprobePath)) {
-        if (onStatus) onStatus("FFmpeg ready.");
-        return true;
+    // ---- 5. Verify the extracted executables BEFORE installing them -----------
+    const std::filesystem::path staging = appDirectory / "ffmpeg_extract_tmp";
+    const std::filesystem::path stagedFfmpeg = staging / "extracted-ffmpeg.exe";
+    const std::filesystem::path stagedFfprobe = staging / "extracted-ffprobe.exe";
+    const std::vector<std::pair<std::filesystem::path, monosect::core::DependencyPin>> staged = {
+        {stagedFfmpeg, monosect::core::pinnedFfmpeg()},
+        {stagedFfprobe, monosect::core::pinnedFfprobe()},
+    };
+    bool stagedOk = true;
+    for (const auto& [toolPath, pin] : staged) {
+        const monosect::core::DependencyCheck check =
+            monosect::core::verifyToolFile(toolPath, pin, /*recordWhenUnpinned=*/false);
+        report(pin.name + ": " + check.message);
+        if (!check.ok()) {
+            stagedOk = false;
+        }
+    }
+    if (!stagedOk) {
+        std::error_code stagingError;
+        std::filesystem::remove_all(staging, stagingError);
+        cleanupArchive();
+        discardTools();
+        report("The tools inside the archive did not match the pinned release, so nothing was installed. MonoSect "
+               "will not run a tool it cannot identify.");
+        return false;
     }
 
-    if (onStatus) onStatus("FFmpeg setup incomplete. Binaries not found after extraction.");
-    return false;
+    // ---- 6. Install ----------------------------------------------------------
+    //
+    // Verified files are moved into place.  MoveFileExW with
+    // MOVEFILE_REPLACE_EXISTING is used because a broken toolchain may still be
+    // sitting there from the step-1 failure, and leaving it would be worse than
+    // replacing it.  Only after the move is the staging folder removed, so the
+    // verified bytes are never deleted before they are installed.
+    std::error_code error;
+    if (!MoveFileExW(stagedFfmpeg.wstring().c_str(), ffmpegPath.wstring().c_str(),
+                     MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) ||
+        !MoveFileExW(stagedFfprobe.wstring().c_str(), ffprobePath.wstring().c_str(),
+                     MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        const DWORD code = ::GetLastError();
+        std::filesystem::remove_all(staging, error);
+        cleanupArchive();
+        discardTools();
+        report("The verified tools could not be installed next to MonoSect (Windows error " +
+               std::to_string(static_cast<unsigned long>(code)) +
+               "). Choose a folder you can write to.");
+        return false;
+    }
+    std::filesystem::remove_all(staging, error);
+    cleanupArchive();
+
+    // A build without executable pins records what it just installed, so a later
+    // substitution of either file is detected even though the archive was
+    // verified.  This runs *after* the verified files are in place, so the
+    // sidecar records the file that is actually going to be used.
+    for (const auto& [toolPath, pin] : std::vector<std::pair<std::filesystem::path, monosect::core::DependencyPin>>{
+             {ffmpegPath, monosect::core::pinnedFfmpeg()},
+             {ffprobePath, monosect::core::pinnedFfprobe()}}) {
+        if (pin.hasPinnedHash()) {
+            continue;
+        }
+        const monosect::core::DependencyCheck record =
+            monosect::core::verifyToolFile(toolPath, pin, /*recordWhenUnpinned=*/true);
+        report(record.message);
+    }
+
+    if (!verifyToolchain(appDirectory, onStatus, /*discardOnFailure=*/true)) {
+        discardTools();
+        report("The installed tools did not pass verification and were removed.");
+        return false;
+    }
+    report("FFmpeg ready: " + archivePin.version);
+    return true;
 }
 
 }
