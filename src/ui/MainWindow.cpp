@@ -2,6 +2,7 @@
 #include "ui/MainWindow.hpp"
 
 #include "core/Bytes.hpp"
+#include "core/Utf8Path.hpp"
 #include "engine/FFmpegBootstrap.hpp"
 #include "engine/ProcessRunners.hpp"
 #include "ui/Branding.hpp"
@@ -987,8 +988,13 @@ private:
         if (ImGui::Button("Open the output folder")) {
             const std::string folder = controller_->outputDirectory();
             if (!folder.empty()) {
-                ShellExecuteW(nullptr, L"open", std::wstring(folder.begin(), folder.end()).c_str(), nullptr, nullptr,
-                              SW_SHOWNORMAL);
+                // The output folder is a UTF-8 std::string, and ShellExecuteW
+                // needs UTF-16.  Widening it one byte at a time - which is what
+                // std::wstring(begin, end) does - is not a conversion: each byte
+                // becomes one wchar_t, so "é" (0xC3 0xA9) becomes two CJK-looking
+                // characters.  Explorer then opens a folder that does not exist,
+                // and the user is told nothing.  See core/Utf8Path.hpp.
+                ::ShellExecuteW(nullptr, L"open", wideFromUtf8(folder).c_str(), nullptr, nullptr, SW_SHOWNORMAL);
             }
         }
     }

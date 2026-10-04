@@ -63,6 +63,7 @@ set(MONOSECT_CORE_SOURCES
     src/core/Bytes.cpp
     src/core/Rational.cpp
     src/core/Json.cpp
+    src/core/Utf8Path.cpp
     src/core/Sha256.cpp
     src/core/MediaModel.cpp
     src/core/ProbeParsing.cpp
@@ -214,6 +215,7 @@ if (MONOSECT_BUILD_TESTS)
         tests/core/BytesTests.cpp
         tests/core/RationalTests.cpp
         tests/core/JsonTests.cpp
+        tests/core/Utf8Tests.cpp
         tests/core/ProbeParsingTests.cpp
         tests/core/PacketIndexTests.cpp
         tests/core/ConstraintsTests.cpp

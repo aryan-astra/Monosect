@@ -34,6 +34,7 @@
 // both platforms.
 #if defined(_WIN32)
 
+#include "core/Utf8Path.hpp"
 #include "engine/ProcessRunner.hpp"
 
 #include <windows.h>
@@ -110,14 +111,11 @@ std::string windowsErrorMessage(DWORD error) {
     return message;
 }
 
+/// The argument vector is UTF-8 - it is UTF-8 everywhere else in this engine -
+/// and CreateProcessW needs UTF-16, so it goes through the one conversion in the
+/// codebase that is not a byte-at-a-time widening.  See core/Utf8Path.hpp.
 std::wstring widen(const std::string& text) {
-    if (text.empty()) {
-        return {};
-    }
-    const int size = ::MultiByteToWideChar(CP_UTF8, 0, text.c_str(), static_cast<int>(text.size()), nullptr, 0);
-    std::wstring wide(static_cast<std::size_t>(size), L'\0');
-    ::MultiByteToWideChar(CP_UTF8, 0, text.c_str(), static_cast<int>(text.size()), wide.data(), size);
-    return wide;
+    return core::wideFromUtf8(text);
 }
 
 /// Reads one pipe until it is closed, splitting text into lines.  Runs on its own

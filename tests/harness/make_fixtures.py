@@ -118,11 +118,15 @@ def ffmpeg_run(arguments: list[str]) -> None:
     run([FFMPEG, "-hide_banner", "-nostdin", "-loglevel", "error", "-y", *arguments])
 
 
-def generate(name: str, target: Path, work: Path) -> None:
+def generate(name: str, target: Path, work: Path, fixtures_dir: Path) -> None:
     if name in SIDECARS:
         target.write_text(SUBTITLES, encoding="utf-8")
         return
 
+    # `fixtures_dir` is the directory the fixtures will finally live in.  The
+    # multi-stream fixture *reads* the subtitle sidecar from there, so it has to be
+    # told where that is rather than inferring it from its own output path - which
+    # during staging points at the .incomplete folder.
     if name in HOSTILE_NAMES:
         ffmpeg_run(
             [
@@ -190,7 +194,7 @@ def generate(name: str, target: Path, work: Path) -> None:
                 "-f", "lavfi", "-i", V6,
                 "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=44100:duration=6",
                 "-f", "lavfi", "-i", "sine=frequency=880:sample_rate=48000:duration=6",
-                "-i", str(target.parent / "subtitles.srt"),
+                "-i", str(fixtures_dir / "subtitles.srt"),
                 "-f", "ffmetadata", "-i", str(chapters),
                 "-map", "0:v", "-map", "1:a", "-map", "2:a", "-map", "3:s",
                 "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", "-g", "50",
@@ -202,7 +206,7 @@ def generate(name: str, target: Path, work: Path) -> None:
                 "-metadata:s:a:0", "language=eng",
                 "-metadata:s:a:1", "language=deu",
                 "-metadata:s:s:0", "language=eng",
-                "-attach", str(target.parent / "subtitles.srt"),
+                "-attach", str(fixtures_dir / "subtitles.srt"),
                 "-metadata:s:t", "mimetype=application/x-subrip",
                 "-map_metadata", "4", "-map_chapters", "4",
                 str(target),
@@ -305,26 +309,33 @@ def main(argv: list[str]) -> int:
     # The subtitle sidecar is an input to the multi-stream fixture.
     subtitles = target_dir / "subtitles.srt"
     if force or not subtitles.exists():
-        generate("subtitles.srt", work / "subtitles.srt", work)
+        generate("subtitles.srt", work / "subtitles.srt", work, target_dir)
         (work / "subtitles.srt").replace(subtitles)
 
     generated = 0
     skipped = 0
-    for name, _ in FIXTURES:
-        if name in SIDECARS:
-            continue
-        final = target_dir / name
-        if not force and final.exists():
-            skipped += 1
-            continue
-        temporary = work / name
-        generate(name, temporary, work)
-        temporary.replace(final)
-        generated += 1
-
-    for leftover in work.iterdir():
-        leftover.unlink()
-    work.rmdir()
+    try:
+        for name, _ in FIXTURES:
+            if name in SIDECARS:
+                continue
+            final = target_dir / name
+            if not force and final.exists():
+                skipped += 1
+                continue
+            temporary = work / name
+            generate(name, temporary, work, target_dir)
+            temporary.replace(final)
+            generated += 1
+    finally:
+        # The staging folder is removed whether or not generation succeeded: a
+        # leftover .incomplete directory is itself a trap, because the next run
+        # treats its contents as deletable leftovers and a partial fixture inside
+        # it looks like a real one to anything that globs the directory.
+        if work.exists():
+            for leftover in work.iterdir():
+                if leftover.is_file():
+                    leftover.unlink()
+            work.rmdir()
     print(f"fixtures: {generated} generated, {skipped} already present, directory {target_dir}")
     return 0
 

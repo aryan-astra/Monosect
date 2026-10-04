@@ -39,6 +39,20 @@ CHECK = HERE / "check_parts.py"
 FIXTURES_SCRIPT = HERE / "make_fixtures.py"
 SKIP = {s.strip() for s in os.environ.get("MONOSECT_E2E_SKIP", "").split(",") if s.strip()}
 
+# Windows consoles still default to a legacy code page (cp1252 here), and this
+# suite both *prints* media file names and *decodes* child output that contains
+# them.  Several fixtures are deliberately named with characters a legacy code
+# page cannot represent, because that is exactly what the product has to survive.
+# Left alone, the very failure being reported raises UnicodeEncodeError from
+# inside the reporting call and the run dies with a traceback instead of a verdict.
+# So every stream is forced to UTF-8 and told to replace what it cannot encode:
+# a mangled byte in a log line is acceptable, losing the failure is not.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[union-attr]
+    except (AttributeError, ValueError):  # pragma: no cover - non-reconfigurable stream
+        pass
+
 
 class Report:
     def __init__(self) -> None:

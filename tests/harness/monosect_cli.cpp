@@ -15,6 +15,7 @@
 #include "core/PacketIndex.hpp"
 #include "core/ProbeParsing.hpp"
 #include "core/SplitPlanner.hpp"
+#include "core/Utf8Path.hpp"
 #include "engine/FFprobeService.hpp"
 #include "engine/JobRunner.hpp"
 #include "core/MergePlanner.hpp"
@@ -32,6 +33,7 @@
 #include <vector>
 
 #include <csignal>
+#include <exception>
 
 #if defined(_WIN32)
 #include <windows.h>
@@ -164,7 +166,8 @@ void printUsage() {
     return true;
 }
 
-[[nodiscard]] bool parseArguments(int argc, char** argv, Options* options, std::string* error) {
+[[nodiscard]] bool parseArguments(const std::vector<std::string>& argv, Options* options, std::string* error) {
+    const int argc = static_cast<int>(argv.size());
     if (argc < 2) {
         *error = "no command given";
         return false;
@@ -757,11 +760,21 @@ int commandJobs(const Options& options) {
 
 } // namespace
 
-int main(int argc, char** argv) {
-    installCancelHandler();
+namespace {
+
+/// Runs the harness and turns any escaping exception into a reported failure.
+///
+/// The engine is written in terms of std::filesystem, std::string and the
+/// standard containers, so an allocation failure, a length_error from an
+/// oversized path, or a std::bad_cast can in principle reach main.  Letting one
+/// of those reach the default handler prints "terminate called after throwing an
+/// instance of" and exits with a code that does not say what happened.  A tool
+/// that verifies other people's media should never exit that way: the whole
+/// point of this harness is that its output can be trusted in CI.
+int runHarness(const std::vector<std::string>& arguments) {
     Options options;
     std::string error;
-    if (!parseArguments(argc, argv, &options, &error)) {
+    if (!parseArguments(arguments, &options, &error)) {
         std::cerr << "error: " << error << "\n\n";
         printUsage();
         return 1;
@@ -784,4 +797,33 @@ int main(int argc, char** argv) {
     std::cerr << "error: unknown command: " << options.command << "\n\n";
     printUsage();
     return 1;
+}
+
+} // namespace
+
+int main(int argc, char** argv) {
+    installCancelHandler();
+
+#if defined(_WIN32)
+    // The harness prints UTF-8 - file names, JSON documents and FFmpeg's own
+    // messages - so a console left on cp1252 renders it as mojibake.  This affects
+    // only how the console draws the bytes: redirected output is unchanged, so a
+    // log file is still correct UTF-8 either way.
+    ::SetConsoleOutputCP(CP_UTF8);
+#endif
+
+    // argv is re-read as UTF-8 rather than used directly.  The C runtime has
+    // already decoded the command line from UTF-16 into the ANSI code page, which
+    // on this machine is cp1252: characters cp1252 cannot represent - including
+    // anything outside Latin-1 - have been permanently replaced with '?', and the
+    // survivors are bytes that are not valid UTF-8.  Passing one of those to
+    // std::filesystem raises filesystem_error("Illegal byte sequence") from
+    // inside argument handling, which is exactly how MonoSect used to greet a
+    // perfectly legal file name.
+    try {
+        return runHarness(utf8CommandLineArguments(argc, argv));
+    } catch (const std::exception& failure) {
+        std::cerr << "error: " << failure.what() << "\n";
+        return 3;
+    }
 }
