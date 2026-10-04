@@ -1,2 +1,55 @@
 #define IDI_MONOSECT_ICON 101
+
 IDI_MONOSECT_ICON ICON "Monosect.ico"
+
+/*
+ * GLFW asks for the window icon by *name*, not by id:
+ *
+ *   win32_window.c:  wc.hIcon = LoadImageW(GetModuleHandleW(NULL), L"GLFW_ICON", ...);
+ *                    if (!wc.hIcon)
+ *                        wc.hIcon = LoadIconW(NULL, IDI_APPLICATION);
+ *
+ * So an icon declared only as numeric id 101 is never found, GLFW silently falls
+ * back to IDI_APPLICATION, and the title bar and the taskbar show the stock Windows
+ * "unknown application" placeholder - which is exactly what happened.
+ *
+ * The id above is kept as well, because that is what Explorer and the shell use for
+ * the executable itself.  Note that windres needs the name quoted; an unquoted
+ * identifier there is a syntax error, not a name.
+ */
+"GLFW_ICON"     ICON "Monosect.ico"
+
+/*
+ * The version, generated from version.txt by CMake, so the file properties and the
+ * window title cannot disagree.  Without this block the executable reports 0.0.0.0 in
+ * Explorer, which is the first thing anyone checks when something misbehaves.
+ */
+#include "monosect_version.rc"
+
+1 VERSIONINFO
+FILEVERSION    MONOSECT_VER_MAJOR,MONOSECT_VER_MINOR,MONOSECT_VER_PATCH,0
+PRODUCTVERSION MONOSECT_VER_MAJOR,MONOSECT_VER_MINOR,MONOSECT_VER_PATCH,0
+FILEFLAGSMASK  0x3fL
+FILEFLAGS      0x0L
+FILEOS         0x40004L
+FILETYPE       0x1L
+FILESUBTYPE    0x0L
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904b0"
+        BEGIN
+            VALUE "CompanyName",      "MonoSect"
+            VALUE "FileDescription",  "MonoSect - split a file into parts that never exceed your limits"
+            VALUE "FileVersion",      MONOSECT_VER_STRING
+            VALUE "InternalName",     "Monosect"
+            VALUE "OriginalFilename", "Monosect.exe"
+            VALUE "ProductName",      "MonoSect"
+            VALUE "ProductVersion",   MONOSECT_VER_STRING
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 1200
+    END
+END

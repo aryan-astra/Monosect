@@ -83,6 +83,42 @@ bool loadBitmap32(const std::filesystem::path& path, ImageRgba& outImage) {
     return true;
 }
 
+/// Turns a decoded RGBA image into an OpenGL texture.
+///
+/// Shared by both loaders below so there is exactly one place that knows about
+/// texture parameters and the pixel store state they need.
+bool uploadRgba(const ImageRgba& image, TextureHandle& outTexture) {
+    GLuint texture = 0;
+    glGenTextures(1, &texture);
+    if (texture == 0) {
+        return false;
+    }
+
+    glBindTexture(GL_TEXTURE_2D, texture);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    constexpr GLint clampToEdge = 0x812F;
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, clampToEdge);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, clampToEdge);
+    // The images here are not all four-byte aligned in width, and an alignment of 4
+    // would make the driver read every row from the wrong offset.  Saved and restored:
+    // this is global GL state, and a loader that leaves it changed silently reinterprets
+    // the row alignment of every upload made after it - including by code that never
+    // touched this file.
+    GLint previousAlignment = 4;
+    glGetIntegerv(GL_UNPACK_ALIGNMENT, &previousAlignment);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, image.width, image.height, 0, GL_RGBA, GL_UNSIGNED_BYTE,
+                 image.pixels.data());
+    glPixelStorei(GL_UNPACK_ALIGNMENT, previousAlignment);
+    glBindTexture(GL_TEXTURE_2D, 0);
+
+    outTexture.id = texture;
+    outTexture.width = image.width;
+    outTexture.height = image.height;
+    return true;
+}
+
 } // namespace
 
 std::filesystem::path executableDirectory() {
@@ -99,27 +135,55 @@ bool loadPngAsTexture(const std::filesystem::path& path, TextureHandle& outTextu
     if (!loadBitmap32(path, image)) {
         return false;
     }
+    return uploadRgba(image, outTexture);
+}
 
-    GLuint texture = 0;
-    glGenTextures(1, &texture);
-    if (texture == 0) {
+bool loadMarkAsTexture(const std::filesystem::path& path, TextureHandle& outTexture, std::uint8_t red,
+                       std::uint8_t green, std::uint8_t blue) {
+    ImageRgba image;
+    if (!loadBitmap32(path, image)) {
         return false;
     }
 
-    glBindTexture(GL_TEXTURE_2D, texture);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-    constexpr GLint clampToEdge = 0x812F;
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, clampToEdge);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, clampToEdge);
-    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, image.width, image.height, 0, GL_RGBA, GL_UNSIGNED_BYTE, image.pixels.data());
-    glBindTexture(GL_TEXTURE_2D, 0);
+    // The logo files are a single ink colour on an opaque white page: both report
+    // 24bpp/32bpp with a corner alpha of 255, so they carry no transparency at all.
+    // Drawn straight onto a dark window the result is a white rectangle with two
+    // black bars on it, which reads as a rendering fault rather than as branding -
+    // and the only ways out are to recolour the asset or to put a light panel behind
+    // it, and both were visibly unwanted.
+    //
+    // So the mark is derived instead: how dark a pixel is becomes how opaque it is,
+    // and every opaque pixel is the same light tint.  The shape is exactly the
+    // authored shape - this is not a colour decision about the brand, it is the
+    // usual way a one-ink logo is reversed for a dark surface, and the white page it
+    // was drawn on simply becomes transparent.  Anti-aliased edges keep their partial
+    // coverage, so the rounded corners of the mark stay smooth.
+    //
+    // Luminance uses the Rec. 601 weights because that is what the eye applies to a
+    // greyscale judgement; a flat channel would misread the wordmark.
+    const std::size_t pixelCount = static_cast<std::size_t>(image.width) *
+                                   static_cast<std::size_t>(image.height);
+    for (std::size_t pixel = 0; pixel < pixelCount; ++pixel) {
+        std::uint8_t* rgba = image.pixels.data() + pixel * 4;
+        const int luminance = (static_cast<int>(rgba[0]) * 299 + static_cast<int>(rgba[1]) * 587 +
+                               static_cast<int>(rgba[2]) * 114) /
+                              1000;
+        // 255 - luminance: white paper becomes 0 (invisible), full ink becomes 255.
+        int ink = 255 - luminance;
+        if (ink < 0) {
+            ink = 0;
+        } else if (ink > 255) {
+            ink = 255;
+        }
+        // Respect any transparency the source did have, so an asset that is already
+        // cut out still works.
+        rgba[0] = red;
+        rgba[1] = green;
+        rgba[2] = blue;
+        rgba[3] = static_cast<std::uint8_t>((ink * static_cast<int>(rgba[3])) / 255);
+    }
 
-    outTexture.id = texture;
-    outTexture.width = image.width;
-    outTexture.height = image.height;
-    return true;
+    return uploadRgba(image, outTexture);
 }
 
 bool loadPngAsRgba(const std::filesystem::path& path, ImageRgba& outImage) {

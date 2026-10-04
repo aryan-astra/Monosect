@@ -1,9 +1,15 @@
 #include "monitor/SystemMonitor.hpp"
 
 #include <cstdio>
+#include <iterator>
+#include <string_view>
 
 #if defined(_WIN32)
 #include <windows.h>
+// IDXGIFactory1 / IDXGIAdapter1 / DXGI_ADAPTER_DESC1.  DXGI is how Windows itself
+// names every display adapter from every vendor, which is what replaced the
+// NVML-only enumeration.
+#include <dxgi.h>
 #include <pdh.h>
 #include <pdhmsg.h>
 #else
@@ -26,7 +32,7 @@ double ratio(double numerator, double denominator) {
 const char* metricSourceName(MetricSource source) noexcept {
     switch (source) {
         case MetricSource::OperatingSystemApi: return "operating system counters";
-        case MetricSource::Nvml: return "NVIDIA NVML";
+        case MetricSource::WindowsPerformanceCounters: return "Windows performance counters";
         case MetricSource::MonoSectItself: return "measured by MonoSect";
         case MetricSource::Unavailable: return "not available on this machine";
     }
@@ -58,7 +64,13 @@ SystemMonitor::SystemMonitor() {
                 const auto* entry = reinterpret_cast<const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*>(
                     buffer.data() + offset);
                 ++physicalCores_;
-                offset += entry->Size;
+                // Defensive only: the OS contract guarantees Size >= sizeof(...), but a zero
+    // would make this loop spin forever on a kernel that returned a record it had
+    // also said had no size.
+    if (entry->Size == 0) {
+        break;
+    }
+    offset += entry->Size;
             }
         }
     }
@@ -71,10 +83,22 @@ SystemMonitor::SystemMonitor() {
     physicalCores_ = logicalCores_;
 #endif
     availabilityNote_ = "CPU and memory from the operating system";
+    // The adapters in a machine do not change while it is running, so they are
+    // enumerated once here rather than on the first sample.  It matters for more than
+    // tidiness: the UI asks for the adapter *name* the moment the panel is drawn, and
+    // deferring this to the first sample made a machine with a GPU announce "no display
+    // adapter" for the first second.
+    discoverGpuAdapters();
 }
 
 SystemMonitor::~SystemMonitor() {
     shutdownGpuTelemetry();
+#if defined(_WIN32)
+    if (diskQuery_ != nullptr) {
+        PdhCloseQuery(reinterpret_cast<PDH_HQUERY>(diskQuery_));
+    }
+#endif
+    diskQuery_ = nullptr;
 }
 
 MeasuredValue SystemMonitor::cpuPercent() {
@@ -183,139 +207,315 @@ MeasuredValue SystemMonitor::memoryPercent() {
 #endif
 }
 
+void SystemMonitor::discoverGpuAdapters() {
+    // Guarded on "tried", not on a handle: the adapters in a machine do not change
+    // between two samples, so this is done once and the answer kept.  The previous
+    // NVML-based version guarded on the library handle, which stays null on every
+    // failure path, so on any machine without an NVIDIA card the search - and its
+    // sentence of explanation - repeated on every sample.
+    if (gpuAdaptersTried_) {
+        return;
+    }
+    gpuAdaptersTried_ = true;
+
+#if defined(_WIN32)
+    // DXGI, not a vendor SDK.  The old code asked NVML for a device, which is a
+    // reasonable thing to do on an NVIDIA machine and reports nothing whatsoever on
+    // every other vendor - so a laptop with an Intel integrated GPU was shown as
+    // having no GPU at all.  DXGI is the interface Windows itself uses and names
+    // every adapter from every vendor.
+    IDXGIFactory1* factory = nullptr;
+    if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory))) || factory == nullptr) {
+        gpuAdapterSummary_ = "DXGI is unavailable, so no adapter could be named";
+        return;
+    }
+
+    for (UINT index = 0;; ++index) {
+        IDXGIAdapter1* adapter = nullptr;
+        if (factory->EnumAdapters1(index, &adapter) == DXGI_ERROR_NOT_FOUND) {
+            break;
+        }
+        if (adapter == nullptr) {
+            continue;
+        }
+        DXGI_ADAPTER_DESC1 description{};
+        const HRESULT described = adapter->GetDesc1(&description);
+        adapter->Release();
+        if (FAILED(described)) {
+            continue;
+        }
+        // The software fallback adapter and the Microsoft Basic Display Adapter are
+        // what DXGI reports for "no real GPU"; listing them would put a fake card in
+        // front of the user and is exactly the kind of invented answer this file
+        // exists to avoid.
+        if ((description.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) != 0 ||
+            description.VendorId == 0x1414 /* Microsoft */) {
+            continue;
+        }
+
+        GpuAdapter entry;
+        entry.luidHigh = static_cast<std::uint32_t>(description.AdapterLuid.HighPart);
+        entry.luidLow = static_cast<std::uint32_t>(description.AdapterLuid.LowPart);
+        // No integrated/discrete label, because there is no way to get one that can be
+        // trusted: DedicatedVideoMemory is *not* the test.  Measured on an Intel UHD
+        // integrated part, DXGI reports 128 MiB of dedicated memory - a reserved BIOS
+        // region - and Windows would call the same card "discrete" on that number.
+        // IDXGIAdapter3::GetDesc3's GraphicsPreemptionGranularity is the documented
+        // discriminator and MinGW's DXGI headers stop at IDXGIAdapter2, so rather than
+        // guess in a panel whose whole purpose is not guessing, the panel states the
+        // name and nothing it cannot support.
+
+        // DXGI_ADAPTER_DESC1::Description is a WCHAR[128] that the documentation
+        // describes as NUL-padded rather than guaranteed NUL-terminated, so the
+        // length is bounded explicitly rather than by strlen, and the two-call size
+        // query means a name that somehow fills all 128 units still converts rather
+        // than degrading to "unnamed adapter".
+        {
+            constexpr int capacity = 128;
+            const int needed = WideCharToMultiByte(CP_UTF8, 0, description.Description, capacity, nullptr, 0,
+                                                   nullptr, nullptr);
+            if (needed > 0) {
+                std::string narrow(static_cast<std::size_t>(needed), '\0');
+                if (WideCharToMultiByte(CP_UTF8, 0, description.Description, capacity, narrow.data(),
+                                        needed, nullptr, nullptr) > 0) {
+                    while (!narrow.empty() && narrow.back() == '\0') {
+                        narrow.pop_back();
+                    }
+                    entry.name = narrow;
+                }
+            }
+        }
+        if (entry.name.empty()) {
+            entry.name = "unnamed adapter";
+        }
+
+        wchar_t token[64]{};
+        std::swprintf(token, std::size(token), L"luid_0x%08X_0x%08X", entry.luidHigh, entry.luidLow);
+        entry.luidToken = token;
+
+        gpuAdapters_.push_back(std::move(entry));
+        if (gpuAdapters_.size() == 8) {
+            // A machine with more than eight adapters is not a thing, and the
+            // enumeration below is unbounded.
+            break;
+        }
+    }
+    factory->Release();
+
+    if (gpuAdapters_.empty()) {
+        gpuAdapterSummary_ = "Windows reports no display adapter through DXGI";
+        return;
+    }
+
+    gpuAdapterSummary_ = gpuDescription();
+#else
+    gpuAdapterSummary_ = "display adapter enumeration is only implemented on Windows";
+#endif
+}
+
+std::string SystemMonitor::gpuDescription() const {
+    if (gpuAdapters_.empty()) {
+        return "no display adapter";
+    }
+    std::string text;
+    for (std::size_t index = 0; index < gpuAdapters_.size(); ++index) {
+        if (index != 0) {
+            text.append(", ");
+        }
+        text.append(gpuAdapters_[index].name);
+    }
+    return text;
+}
+
 void SystemMonitor::initGpuTelemetry() {
-    // `gpuTried_` and not `gpuLibrary_ != nullptr`.  Every failure path here returns
-    // without setting the library handle, so a guard on the handle never trips on a
-    // machine with no NVIDIA driver - and this ran again on every sample, appending
-    // its explanation to `availabilityNote_` each time.  The panel then showed the
-    // same sentence a dozen times, growing on its own.  The absence of a GPU is a
-    // permanent fact about the machine, so it is recorded once.
-    if (gpuTried_ || gpuLibrary_ != nullptr) {
+    discoverGpuAdapters();
+    if (gpuTried_) {
         return;
     }
     gpuTried_ = true;
 #if defined(_WIN32)
-    // NVML ships with the driver; it is loaded dynamically so MonoSect runs
-    // without an NVIDIA card, and its absence is not an error.
-    HMODULE library = LoadLibraryW(L"nvml.dll");
-    if (library == nullptr) {
-        availabilityNote_.append(". GPU telemetry: NVML not present (no NVIDIA driver found)");
+    if (gpuAdapters_.empty()) {
+        // Already explained by discoverGpuAdapters; gpuAdapterSummary_ says why.
         return;
     }
-    gpuLibrary_ = reinterpret_cast<void*>(library);
-    nvmlInit_ = reinterpret_cast<NvmlInitFn>(
-        reinterpret_cast<void*>(GetProcAddress(library, "nvmlInit_v2")));
-    nvmlShutdown_ = reinterpret_cast<NvmlShutdownFn>(
-        reinterpret_cast<void*>(GetProcAddress(library, "nvmlShutdown")));
-    nvmlHandle_ = reinterpret_cast<NvmlHandleFn>(
-        reinterpret_cast<void*>(GetProcAddress(library, "nvmlDeviceGetHandleByIndex_v2")));
-    nvmlUtil_ = reinterpret_cast<NvmlUtilFn>(
-        reinterpret_cast<void*>(GetProcAddress(library, "nvmlDeviceGetUtilizationRates")));
-    if (nvmlInit_ == nullptr || nvmlHandle_ == nullptr || nvmlUtil_ == nullptr) {
-        availabilityNote_.append(". GPU telemetry: the NVIDIA driver does not expose utilization");
-        FreeLibrary(library);
-        gpuLibrary_ = nullptr;
+    // "\GPU Engine(*)\Utilization Percentage" is published by Windows for every
+    // vendor and is what Task Manager itself reads; it is derived from the same
+    // vendor interfaces the vendor SDKs wrap.  That makes it the right source here,
+    // where the vendor SDK for one particular vendor was never going to be.
+    //
+    // PdhAddEnglishCounterW, not PdhAddCounterW: the literal English path does not
+    // exist on a localised Windows, and the disk counters further down this file
+    // already make this point.
+    PDH_HQUERY query = nullptr;
+    if (PdhOpenQueryW(nullptr, 0, &query) != ERROR_SUCCESS || query == nullptr) {
+        availabilityNote_.append(". GPU: the Windows GPU Engine counters are not present on this system");
         return;
     }
-    if (nvmlInit_() != 0) {
-        availabilityNote_.append(". GPU telemetry: NVML could not be initialised");
-        FreeLibrary(library);
-        gpuLibrary_ = nullptr;
+    gpuQuery_ = query;
+
+    // One *wildcard* counter, added once.  It re-expands on every collect, so engine
+    // instances that appear and disappear as processes come and go are picked up
+    // without any add/remove churn - which also means the handle set cannot drift out
+    // of step with reality, the way a hand-maintained list would.
+    PDH_HCOUNTER counter = nullptr;
+    if (PdhAddEnglishCounterW(query, L"\\GPU Engine(*)\\Utilization Percentage", 0,
+                              &counter) != ERROR_SUCCESS ||
+        counter == nullptr) {
+        PdhCloseQuery(query);
+        gpuQuery_ = nullptr;
+        availabilityNote_.append(". GPU: the Windows GPU Engine counter could not be opened");
         return;
     }
-    if (nvmlHandle_(0, &gpuDevice_) != 0) {
-        availabilityNote_.append(". GPU telemetry: no NVIDIA GPU found at index 0");
-        nvmlShutdown_();
-        FreeLibrary(library);
-        gpuLibrary_ = nullptr;
-        return;
-    }
-    gpuReady_ = true;
-    availabilityNote_.append(". GPU from NVIDIA NVML");
+    gpuCounter_ = counter;
+    availabilityNote_.append(". GPU: name and utilization from the Windows GPU Engine counters");
 #else
-    availabilityNote_.append(". GPU telemetry is only implemented for NVIDIA GPUs on Windows");
+    availabilityNote_.append(". GPU telemetry is only implemented on Windows");
 #endif
 }
 
 void SystemMonitor::shutdownGpuTelemetry() {
 #if defined(_WIN32)
-    if (gpuReady_ && nvmlShutdown_ != nullptr) {
-        nvmlShutdown_();
-    }
-    if (gpuLibrary_ != nullptr) {
-        FreeLibrary(reinterpret_cast<HMODULE>(gpuLibrary_));
+    if (gpuQuery_ != nullptr) {
+        // Closing the query closes its counters; gpuCounter_ must not be removed
+        // separately or it would be released twice.
+        PdhCloseQuery(reinterpret_cast<PDH_HQUERY>(gpuQuery_));
     }
 #endif
-    gpuReady_ = false;
-    gpuLibrary_ = nullptr;
-    gpuDevice_ = nullptr;
-    // Left true: a shutdown must not make the next sample start the whole NVML dance
-    // again.  The handle is released, so nothing is held open.
+    gpuCounter_ = nullptr;
+    gpuQuery_ = nullptr;
+    gpuTried_ = true;
+    // The adapter list is deliberately kept: the adapters in a machine are a
+    // permanent fact, and a shutdown must not make the next sample re-enumerate them.
 }
 
 MeasuredValue SystemMonitor::gpuPercent() {
     initGpuTelemetry();
-    if (!gpuReady_) {
-        return MeasuredValue::unknown("no GPU utilization interface available"
-                                      " (NVIDIA NVML is the only one implemented; AMD and Intel report n/a rather "
-                                      "than a guessed number)");
+    if (gpuAdapters_.empty()) {
+        return MeasuredValue::unknown(gpuAdapterSummary_.empty()
+                                          ? std::string("no display adapter was found on this machine")
+                                          : gpuAdapterSummary_);
     }
 #if defined(_WIN32)
-    NvmlUtilization utilization{};
-    if (nvmlUtil_(gpuDevice_, &utilization) != 0) {
-        return MeasuredValue::unknown("NVML refused the utilization query");
+    if (gpuQuery_ == nullptr || gpuCounter_ == nullptr) {
+        return MeasuredValue::unknown("Windows reports " + gpuDescription() +
+                                      ", but exposes no GPU Engine counter for it");
     }
-    return MeasuredValue::of(static_cast<double>(utilization.gpu));
+    auto* query = reinterpret_cast<PDH_HQUERY>(gpuQuery_);
+    auto* counter = reinterpret_cast<PDH_HCOUNTER>(gpuCounter_);
+    if (PdhCollectQueryData(query) != ERROR_SUCCESS) {
+        return MeasuredValue::unknown("the GPU Engine counters could not be sampled");
+    }
+
+    // The array comes back with an instance name per item, which is what makes the
+    // LUID filter below possible: the counter set is machine-wide, and only the
+    // instance name says which adapter an engine belongs to.
+    std::vector<PDH_FMT_COUNTERVALUE_ITEM_W> items(64);
+    DWORD bufferBytes = static_cast<DWORD>(items.size() * sizeof(PDH_FMT_COUNTERVALUE_ITEM_W));
+    DWORD itemCount = 0;
+    PDH_STATUS read = PdhGetFormattedCounterArrayW(counter, PDH_FMT_DOUBLE, &bufferBytes, &itemCount,
+                                                    items.data());
+    if (read == static_cast<PDH_STATUS>(PDH_MORE_DATA)) {
+        // The instance set grew between the collect and the read.  Sizing from the
+        // byte count PDH just reported and trying once more is enough; a machine
+        // growing the set again inside one sample is not a case worth looping on.
+        const std::size_t needed = bufferBytes / sizeof(PDH_FMT_COUNTERVALUE_ITEM_W) + 1;
+        items.resize(needed);
+        bufferBytes = static_cast<DWORD>(items.size() * sizeof(PDH_FMT_COUNTERVALUE_ITEM_W));
+        itemCount = 0;
+        read = PdhGetFormattedCounterArrayW(counter, PDH_FMT_DOUBLE, &bufferBytes, &itemCount,
+                                             items.data());
+    }
+    if (read != static_cast<PDH_STATUS>(ERROR_SUCCESS)) {
+        return MeasuredValue::unknown("the GPU Engine counters have no value yet");
+    }
+
+    // One adapter reports a separate percentage per engine (3D, video decode, video
+    // processing, copy, ...).  Windows' own headline figure is the busiest engine,
+    // and that is what is reported here: summing them can exceed 100 % and would be
+    // read as a measurement when it is really an overlap of several.
+    double busiest = 0.0;
+    bool sawOurs = false;
+    const std::size_t reported = itemCount < items.size() ? itemCount : items.size();
+    for (std::size_t index = 0; index < reported; ++index) {
+        const PDH_FMT_COUNTERVALUE_ITEM_W& item = items[index];
+        bool ours = false;
+        for (const GpuAdapter& adapter : gpuAdapters_) {
+            if (std::wstring_view(item.szName).find(adapter.luidToken) != std::wstring_view::npos) {
+                ours = true;
+                break;
+            }
+        }
+        if (!ours) {
+            continue;
+        }
+        sawOurs = true;
+        if (item.FmtValue.CStatus != PDH_CSTATUS_VALID_DATA || item.FmtValue.doubleValue < 0.0) {
+            continue;
+        }
+        if (item.FmtValue.doubleValue > busiest) {
+            busiest = item.FmtValue.doubleValue;
+        }
+    }
+    if (!sawOurs) {
+        return MeasuredValue::unknown("no process is currently using " + gpuDescription());
+    }
+    if (busiest > 100.0) {
+        busiest = 100.0;
+    }
+    return MeasuredValue::of(busiest);
 #else
     return MeasuredValue::unknown("GPU utilization is only implemented on Windows");
 #endif
 }
 
+void SystemMonitor::initDiskCounters() {
+#if defined(_WIN32)
+    if (diskQuery_ != nullptr || diskTried_) {
+        return;
+    }
+    diskTried_ = true;
+    PDH_HQUERY query = nullptr;
+    if (PdhOpenQueryW(nullptr, 0, &query) != ERROR_SUCCESS) {
+        return;
+    }
+    if (PdhAddEnglishCounterW(query, L"\\PhysicalDisk(_Total)\\Disk Read Bytes/sec", 0, &diskReadCounter_) !=
+            ERROR_SUCCESS ||
+        PdhAddEnglishCounterW(query, L"\\PhysicalDisk(_Total)\\Disk Write Bytes/sec", 0, &diskWriteCounter_) !=
+            ERROR_SUCCESS) {
+        PdhCloseQuery(query);
+        return;
+    }
+    diskQuery_ = query;
+#endif
+}
+
 MeasuredValue SystemMonitor::diskBytesPerSecond(bool read) {
 #if defined(_WIN32)
-    // PDH is queried through a single counter pair, sampled at least 1 s apart by
-    // the caller.  Querying PDH on every frame would be far more expensive than
-    // the graph is worth, so the sample rate is the UI's business and is 1 Hz.
-    static PDH_HQUERY query = nullptr;
-    static PDH_HCOUNTER readCounter = nullptr;
-    static PDH_HCOUNTER writeCounter = nullptr;
-    static bool initialized = false;
-    static PDH_FMT_COUNTERVALUE readValue{};
-    static PDH_FMT_COUNTERVALUE writeValue{};
-    if (!initialized) {
-        if (PdhOpenQueryW(nullptr, 0, &query) != ERROR_SUCCESS) {
-            return MeasuredValue::unknown("the performance counters could not be opened (PdhOpenQuery)");
-        }
-        if (PdhAddEnglishCounterW(query, L"\\PhysicalDisk(_Total)\\Disk Read Bytes/sec", 0, &readCounter) !=
-                ERROR_SUCCESS ||
-            PdhAddEnglishCounterW(query, L"\\PhysicalDisk(_Total)\\Disk Write Bytes/sec", 0, &writeCounter) !=
-                ERROR_SUCCESS) {
-            PdhCloseQuery(query);
-            query = nullptr;
-            return MeasuredValue::unknown("the disk throughput counters are not present on this system");
-        }
-        PdhCollectQueryData(query);
-        initialized = true;
-        return MeasuredValue::unknown("the first sample establishes the baseline");
+    initDiskCounters();
+    if (diskQuery_ == nullptr) {
+        return MeasuredValue::unknown("the disk throughput counters are not present on this system");
     }
-    if (PdhCollectQueryData(query) != ERROR_SUCCESS) {
-        return MeasuredValue::unknown("the disk counters could not be sampled");
-    }
-    if (PdhGetFormattedCounterValue(read ? readCounter : writeCounter, PDH_FMT_DOUBLE, nullptr,
-                                    read ? &readValue : &writeValue) != ERROR_SUCCESS) {
+    // PdhGetFormattedCounterValue can return ERROR_SUCCESS while the value it filled in
+    // carries CStatus PDH_CSTATUS_INVALID_DATA, which is exactly what the first sample
+    // after a query is opened produces.  doubleValue is undefined then, so it is not
+    // read - and a zero is never shown in its place, which would read as "idle disk".
+    PDH_FMT_COUNTERVALUE value{};
+    if (PdhGetFormattedCounterValue(read ? diskReadCounter_ : diskWriteCounter_, PDH_FMT_DOUBLE, nullptr,
+                                    &value) != ERROR_SUCCESS) {
         return MeasuredValue::unknown("the disk counter value is not available yet");
     }
-    const double value = read ? readValue.doubleValue : writeValue.doubleValue;
-    if (value < 0.0) {
+    if (value.CStatus != PDH_CSTATUS_VALID_DATA) {
+        return MeasuredValue::unknown("the first disk sample establishes the baseline");
+    }
+    if (value.doubleValue < 0.0) {
         return MeasuredValue::unknown("the disk counter reported a negative rate");
     }
-    return MeasuredValue::of(value);
+    return MeasuredValue::of(value.doubleValue);
 #else
     (void)read;
     return MeasuredValue::unknown("system-wide disk counters are not implemented on this platform");
 #endif
 }
-
 ResourceSample SystemMonitor::sample(std::int64_t mediaBytesWritten, double elapsedSeconds,
                                     double cpuSecondsUsedByJob) {
     (void)cpuSecondsUsedByJob;
@@ -323,6 +523,17 @@ ResourceSample SystemMonitor::sample(std::int64_t mediaBytesWritten, double elap
     sample.cpuPercent = cpuPercent();
     sample.memoryPercent = memoryPercent();
     sample.gpuPercent = gpuPercent();
+#if defined(_WIN32)
+    // One collection for both disk figures.  This used to call diskBytesPerSecond
+    // twice, and each call collected the query itself, so the read and write numbers
+    // were measured over two different windows a microsecond apart - they could not
+    // agree with each other or with a graph drawn from either.  Collecting once makes
+    // both describe the same interval and halves the PDH work per sample.
+    initDiskCounters();
+    if (diskQuery_ != nullptr) {
+        PdhCollectQueryData(diskQuery_);
+    }
+#endif
     sample.diskReadBytesPerSecond = diskBytesPerSecond(true);
     sample.diskWriteBytesPerSecond = diskBytesPerSecond(false);
     if (elapsedSeconds > 0.5 && mediaBytesWritten >= 0) {

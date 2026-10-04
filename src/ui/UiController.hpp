@@ -197,6 +197,15 @@ public:
     /// MonoSect has not asked yet is not a machine without a GPU.
     explicit UiController(UiEngine& engine, HardwareCapabilitySource* hardware = nullptr);
 
+    /// Stops and joins both workers.
+    ///
+    /// A std::thread that is still joinable when it is destroyed calls
+    /// std::terminate, so a controller that went out of scope with a merge in flight
+    /// took the whole process down with it.  MainWindow cancels and joins both workers
+    /// explicitly before it resets the controller; this is the backstop that makes the
+    /// same mistake impossible anywhere else, including in the tests.
+    ~UiController();
+
     // ---- the queue -------------------------------------------------------------------
     /// Adds a source and selects it.  Returns its queue id.
     int addSource(const std::string& path);
@@ -274,6 +283,13 @@ public:
     [[nodiscard]] const std::string& resourceAvailabilityNote() const noexcept {
         return monitor_.availabilityNote();
     }
+
+    /// The display adapters on this machine, e.g. "Intel(R) UHD Graphics".
+    ///
+    /// The name is available whatever the vendor, which is the point: the panel used
+    /// to be able to say only that there was "no GPU", on a machine with an Intel
+    /// integrated GPU plainly doing the compositing.
+    [[nodiscard]] std::string gpuAdapterDescription() const { return monitor_.gpuDescription(); }
     [[nodiscard]] ResourcePolicyInput resourceInput() const;
 
     // ---- hardware encoder capability ------------------------------------------------

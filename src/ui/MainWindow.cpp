@@ -18,7 +18,17 @@
 #include <windows.h>
 #include <commdlg.h>
 #include <shellapi.h>
+#include <objbase.h>
 #include <shlobj.h>
+
+// glfwGetWin32Window is the only way to get the real HWND, which the shell folder
+// dialogs need as their owner: GLFW focuses with SetForegroundWindow, so
+// GetActiveWindow() returns NULL and the dialog has no owner.  Declared after
+// windows.h deliberately - glfw3native.h would include it itself, and having the GL
+// headers see windows.h first is the arrangement that avoids the classic
+// wingdi/GL header clash.
+#define GLFW_EXPOSE_NATIVE_WIN32
+#include <GLFW/glfw3native.h>
 
 #include <algorithm>
 #include <functional>
@@ -165,25 +175,40 @@ std::string genericFilePathDialog(const wchar_t* title, bool save, const wchar_t
     return result;
 }
 
-std::string chooseFolderDialog(const wchar_t* title) {
+std::string chooseFolderDialog(const wchar_t* title, HWND owner) {
+    // SHBrowseForFolderW is a COM call and returns S_OK-less failure on a thread that
+    // never called CoInitializeEx - which is not an error the caller can distinguish
+    // from the user cancelling.  The folder pickers therefore did nothing at all, and
+    // silently, on a process that initialised COM nowhere.  COM is initialised once on
+    // the window thread in MainWindow::initialize() and released in its destructor;
+    // this only re-checks, because a dialog invoked before initialization would
+    // otherwise fail in exactly the same invisible way.
+    HRESULT com = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+    const bool mustUninitialize = SUCCEEDED(com);
+
     BROWSEINFOW info{};
-    info.hwndOwner = GetActiveWindow();
+    // GetActiveWindow() is nearly always NULL for a GLFW window - GLFW focuses with
+    // SetForegroundWindow, which does not make a window "active" in that sense - so
+    // the dialog had no owner and could open behind the application.  The real HWND
+    // is passed in instead.
+    info.hwndOwner = owner != nullptr ? owner : GetActiveWindow();
     info.lpszTitle = title;
     info.ulFlags = BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE;
     PIDLIST_ABSOLUTE items = SHBrowseForFolderW(&info);
-    if (items == nullptr) {
-        return {};
+
+    std::string result;
+    if (items != nullptr) {
+        // MAX_PATH is what SHGetPathFromIDListW documents; the deep-path limit is
+        // handled by asking the shell for the path instead.
+        std::vector<wchar_t> path(32768, L'\0');
+        if (SHGetPathFromIDListW(items, path.data()) == TRUE) {
+            result = utf8FromWide(path.data());
+        }
+        CoTaskMemFree(items);
     }
-    wchar_t path[MAX_PATH] = {};
-    const bool ok = SHGetPathFromIDListW(items, path) == TRUE;
-    CoTaskMemFree(items);
-    if (!ok) {
-        return {};
+    if (mustUninitialize) {
+        CoUninitialize();
     }
-    const int wideLength = static_cast<int>(std::wcslen(path));
-    const int utf8Length = WideCharToMultiByte(CP_UTF8, 0, path, wideLength, nullptr, 0, nullptr, nullptr);
-    std::string result(static_cast<std::size_t>(utf8Length), '\0');
-    WideCharToMultiByte(CP_UTF8, 0, path, wideLength, result.data(), utf8Length, nullptr, nullptr);
     return result;
 }
 
@@ -237,17 +262,37 @@ public:
     }
 
     ~MainWindow() {
+        // Every worker this object owns has to be stopped and joined *before* the
+        // members that hold them are destroyed.  A std::thread that is still joinable
+        // when its object is destroyed calls std::terminate, so a window closed during
+        // a merge - or while the hardware probe is still running - used to take the
+        // process down on the way out rather than closing.
         if (bootstrapThread_.joinable()) {
             bootstrapThread_.request_stop();
             bootstrapThread_.join();
         }
         if (controller_) {
+            controller_->requestMergeCancel();
+            controller_->waitForMerge();
             controller_->requestCancel();
             controller_->waitForJob();
         }
+        // Stopping the watch is what stops the watcher's thread from pushing into
+        // watchedFiles_, which is a member that would already be destroyed by then.
+        if (watchSource_) {
+            watchSource_->stopWatch();
+        }
+        // The probe outlives this body unless it is reaped here: its worker captures
+        // `this` and touches the mutex and result, and its thread object is a member.
+        hardware_.reset();
         controller_.reset();
         engine_.reset();
         prober_.reset();
+        if (logoTexture_.valid()) {
+            // Freed while the GL context is still alive, which is the only time a
+            // texture can actually be deleted.
+            vsm::releaseTexture(logoTexture_);
+        }
         if (imguiReady_) {
             ImGui_ImplOpenGL3_Shutdown();
             ImGui_ImplGlfw_Shutdown();
@@ -257,13 +302,89 @@ public:
             glfwDestroyWindow(window_);
         }
         glfwTerminate();
+        if (comInitialized_) {
+            CoUninitialize();
+            comInitialized_ = false;
+        }
         g_window = nullptr;
     }
 
+    /// Makes the process per-monitor DPI aware, before any window exists.
+    ///
+    /// DPI awareness is a process-wide property that can only be set before the first
+    /// window is created, and getting it wrong is invisible in code and obvious on
+    /// screen.  Without it the window is handed to MonoSect in virtualised 96 dpi units
+    /// while the pixels it actually receives are physical: on a 125 % display the
+    /// window MonoSect asked for as 1500x900 was really 1517x947, the framebuffer and
+    /// the window disagreed, and the columns were laid out across a surface wider than
+    /// the window.  The right-hand column - the machine readings and the job history -
+    /// was drawn past the right edge and could not be seen or reached at all.
+    ///
+    /// The newest API is tried first and the older ones are kept as fallbacks, so this
+    /// still works on a pre-1703 Windows 10.  Each is resolved dynamically rather than
+    /// linked, because SetProcessDpiAwarenessContext does not exist before Windows 10
+    /// 1703 and a static import would refuse to load there.
+    using SetContext = BOOL(WINAPI*)(HANDLE);
+    using SetAware = BOOL(WINAPI*)();
+
+    static void makeDpiAware() {
+        // GetProcAddress returns FARPROC, which is not the same type as the function
+        // pointer being cast to; casting between them directly is a warning under
+        // -Wcast-function-type and is exactly the kind of cast that is not guaranteed
+        // to work.  Copying the representation is the portable way to do it, and the
+        // sizes are asserted rather than assumed.
+        const auto resolve = [](HMODULE module, const char* name) -> void* {
+            if (module == nullptr) {
+                return nullptr;
+            }
+            FARPROC address = GetProcAddress(module, name);
+            void* callable = nullptr;
+            static_assert(sizeof(callable) == sizeof(address), "unexpected FARPROC size");
+            std::memcpy(&callable, &address, sizeof(callable));
+            return callable;
+        };
+
+        // Windows 10 1703+: per-monitor v2, which rescales when the window moves
+        // between monitors of different scale.
+        if (const auto perMonitorV2 = reinterpret_cast<SetContext>(
+                resolve(GetModuleHandleW(L"user32.dll"), "SetProcessDpiAwarenessContext"))) {
+            // DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 is the pseudo-handle -4.
+            if (perMonitorV2(reinterpret_cast<HANDLE>(-4))) {
+                return;
+            }
+        }
+        // Windows 8.1: system aware, which is enough to stop the virtualisation that
+        // puts the columns outside the window.
+        if (const auto systemAware =
+                reinterpret_cast<SetAware>(resolve(GetModuleHandleW(L"user32.dll"), "SetProcessDPIAware"))) {
+            if (systemAware()) {
+                return;
+            }
+        }
+    }
+
+    /// The native HWND behind the GLFW window, for the shell dialogs.
+    ///
+    /// GLFW focuses with SetForegroundWindow, so GetActiveWindow() returns NULL here
+    /// and an ownerless dialog can open behind the application.  Null before the
+    /// window exists, which the folder dialog handles.
+    HWND nativeWindow() const {
+        return window_ != nullptr ? glfwGetWin32Window(window_) : nullptr;
+    }
+
     bool initialize() {
+        // Before glfwInit: DPI awareness is set once per process and must be in place
+        // before a window exists, so it cannot be left to whoever creates one.
+        makeDpiAware();
         if (glfwInit() == 0) {
             return false;
         }
+        // The shell folder and file dialogs are COM clients, and a thread that has not
+        // initialised COM makes them fail in a way indistinguishable from the user
+        // cancelling.  Done here, on the one thread that owns the window, and undone in
+        // the destructor.  S_FALSE means COM was already up on this thread, which is
+        // also success and must not be undone here.
+        comInitialized_ = SUCCEEDED(CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE));
         glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
         glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
         glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
@@ -283,7 +404,41 @@ public:
         float xscale = 1.0f;
         float yscale = 1.0f;
         glfwGetWindowContentScale(window_, &xscale, &yscale);
-        if (io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\segoeui.ttf", std::round(16.0f * xscale)) == nullptr) {
+        // The glyph ranges are the point of this call being written out rather than
+        // left at AddFontFromFileTTF's default.
+        //
+        // The default is GetGlyphRangesDefault(): Basic Latin plus Latin Supplement.  This
+        // product's whole reason for a core/Utf8Path.hpp is that it handles filenames in
+        // any language - and the end-to-end suite proves it on filenames like
+        // "video été ???.mp4" - yet the font had no glyphs for a Cyrillic or Greek
+        // letter, so such a filename was displayed as "???" in the results table and the
+        // job history.  The tool was correct and the display was lying about it.
+        //
+        // Latin, Latin-1 Supplement, Latin Extended-A and Cyrillic, built explicitly.
+        // CJK is not included: it would multiply the atlas size by an order of magnitude
+        // for filenames that are rare here, and a missing glyph is a visible "?" rather
+        // than a crash or a wrong path.
+        static ImWchar glyphRanges[] = {
+            0x0020, 0x00FF,   // Basic Latin + Latin-1 Supplement
+            0x0100, 0x017F,   // Latin Extended-A
+            0x0400, 0x04FF,   // Cyrillic
+            0x2010, 0x2027,   // dashes and quotes used in filenames
+            0,
+        };
+        // Taken from the Windows directory rather than written as a literal absolute
+        // path: "C:\Windows\Fonts" is not the font directory on every installation,
+        // and on a relocated Windows the literal would silently fall through to the
+        // default font.
+        std::wstring windowsDir(32768, L'\0');
+        const DWORD windowsLength = GetWindowsDirectoryW(windowsDir.data(),
+                                                        static_cast<DWORD>(windowsDir.size()));
+        std::filesystem::path fontPath = L"segoeui.ttf";
+        if (windowsLength > 0 && windowsLength < windowsDir.size()) {
+            fontPath = std::filesystem::path(std::wstring(windowsDir.data(), windowsLength)) / L"Fonts" /
+                       L"segoeui.ttf";
+        }
+        if (io.Fonts->AddFontFromFileTTF(fontPath.string().c_str(), std::round(16.0f * xscale), nullptr,
+                                        glyphRanges) == nullptr) {
             io.Fonts->AddFontDefault();
         }
         ImGui_ImplGlfw_InitForOpenGL(window_, true);
@@ -304,13 +459,17 @@ public:
         });
 
         executableDirectory_ = vsm::executableDirectory();
+        // utf8FromPath, not path::string(): a wide path converted with .string() comes
+        // back in the ANSI code page, so a MonoSect installed under a folder with a
+        // non-ASCII character was handed its own path back unreadable - as the default
+        // output folder and as the job-history database path.
         std::snprintf(outputDirectoryBuffer_, sizeof(outputDirectoryBuffer_), "%s",
-                      (executableDirectory_ / "output").string().c_str());
+                      utf8FromPath(executableDirectory_ / "output").c_str());
         std::snprintf(namingBuffer_, sizeof(namingBuffer_), "%s", "{name} - part {index:03}");
         std::snprintf(sizeValueBuffer_, sizeof(sizeValueBuffer_), "%s", "700");
         std::snprintf(durationValueBuffer_, sizeof(durationValueBuffer_), "%s", "00:10:00");
         std::snprintf(databaseBuffer_, sizeof(databaseBuffer_), "%s",
-                      JobStore::defaultStore().path().string().c_str());
+                      utf8FromPath(JobStore::defaultStore().path()).c_str());
         startToolBootstrap();
         return true;
     }
@@ -373,13 +532,26 @@ private:
                                                     "an existing installation."));
                 return;
             }
-            ffmpegPath_ = (executableDirectory_ / "ffmpeg.exe").string();
-            ffprobePath_ = (executableDirectory_ / "ffprobe.exe").string();
+            // The lock is held across the assignment and the log line, not just around
+            // the log line.  These two strings are also written by the "Locate
+            // ffmpeg.exe..." button on the UI thread, and a std::string written from two
+            // threads at once can be left with a dangling pointer inside itself - a
+            // crash far away from here, or a filename built from freed memory.
             {
                 std::lock_guard<std::mutex> lock(bootstrapMutex_);
+                // Only if the user has not already pointed MonoSect somewhere else.  A
+                // download that finishes after an explicit choice must not silently
+                // replace the choice the user made.
+                if (ffmpegPath_.empty()) {
+                    ffmpegPath_ = utf8FromPath(executableDirectory_ / "ffmpeg.exe");
+                }
+                if (ffprobePath_.empty()) {
+                    ffprobePath_ = utf8FromPath(executableDirectory_ / "ffprobe.exe");
+                }
                 bootstrapLog_.push_back("FFmpeg ready: " + ffmpegPath_);
             }
             toolsReady_ = true;
+            bootstrapRunning_ = false;
         });
     }
 
@@ -389,9 +561,22 @@ private:
         if (controller_ || !toolsReady_) {
             return;
         }
-        prober_ = std::make_unique<FFprobeService>(windowsProcessRunner(), ffprobePath_);
-        engine_ = std::make_unique<EngineUiEngine>(*prober_, windowsProcessRunner(), ffmpegPath_);
-        hardware_ = std::make_unique<BackgroundHardwareProbe>(windowsProcessRunner(), ffmpegPath_);
+        // Copied under the lock rather than read straight: toolsReady_ being true means
+        // the writer published the paths before the flag, but reading them without the
+        // lock still races the write of the std::string itself.
+        std::string ffmpeg;
+        std::string ffprobe;
+        {
+            std::lock_guard<std::mutex> lock(bootstrapMutex_);
+            ffmpeg = ffmpegPath_;
+            ffprobe = ffprobePath_;
+        }
+        if (ffmpeg.empty() || ffprobe.empty()) {
+            return;   // flagged ready with nothing to run; nothing sensible to build
+        }
+        prober_ = std::make_unique<FFprobeService>(windowsProcessRunner(), ffprobe);
+        engine_ = std::make_unique<EngineUiEngine>(*prober_, windowsProcessRunner(), ffmpeg);
+        hardware_ = std::make_unique<BackgroundHardwareProbe>(windowsProcessRunner(), ffmpeg);
         watcher_ = std::make_unique<WatchFolder>();
         watchSource_ = std::make_unique<EngineWatchFolder>(*watcher_, watchQueueMutex_, watchedFiles_);
         controller_ = std::make_unique<UiController>(*engine_, hardware_.get());
@@ -474,6 +659,14 @@ private:
                 }
                 return Rational{static_cast<std::int64_t>(seconds * 1000.0 + 0.5), 1000};
             }
+            hours = 0;
+        }
+        // A negative field is rejected here rather than left to be clamped downstream.
+        // "-5:00" parses perfectly well through the "%d:%lf" arm - minutes is simply
+        // -5 - and a limit of -5 minutes is not a limit, so the field that would produce
+        // one is refused at the boundary the text comes in through.
+        if (hours < 0 || minutes < 0 || !(seconds >= 0.0)) {
+            return Rational{0, 1};
         }
         const std::int64_t milliseconds =
             static_cast<std::int64_t>((hours * 3600.0 + minutes * 60.0 + seconds) * 1000.0 + 0.5);
@@ -524,7 +717,7 @@ private:
                     addSourceFromDialog();
                 }
                 if (ImGui::MenuItem("Choose output folder...")) {
-                    const std::string folder = chooseFolderDialog(L"Output folder for the parts");
+                    const std::string folder = chooseFolderDialog(L"Output folder for the parts", nativeWindow());
                     if (!folder.empty()) {
                         std::snprintf(outputDirectoryBuffer_, sizeof(outputDirectoryBuffer_), "%s", folder.c_str());
                         if (controller_) {
@@ -584,23 +777,46 @@ private:
         }
     }
 
-    /// Loads the logo, once, after the GL context exists.
+    /// Loads the branding, once, after the GL context exists.
     ///
-    /// The file is copied next to the executable by the build, so the path is
+    /// The files are copied next to the executable by the build, so the paths are
     /// derived from where the program is rather than from the working directory -
     /// which is not the executable's directory when the user starts it from a
     /// shortcut or a file manager, and a logo that only appears when launched from a
     /// terminal is worse than none.
     ///
-    /// A missing or unreadable file is not an error: the window draws without it.
-    /// Branding should never be the reason the product does not start.
+    /// A missing or unreadable file is not an error: the window draws without it and
+    /// the window icon falls back to whatever the system provides.  Branding should
+    /// never be the reason the product does not start.
     void loadLogo() {
-        const std::filesystem::path path = vsm::executableDirectory() / "Monosect-full-logo.png";
-        if (!std::filesystem::exists(path)) {
+        const std::filesystem::path here = vsm::executableDirectory();
+
+        // The title bar and the taskbar.  GLFW's own path to these is
+        // LoadImageW(hInstance, L"GLFW_ICON") (win32_window.c), which now resolves
+        // because resources/Monosect.rc declares the icon under that name as well as
+        // under a numeric id.  Setting it explicitly as well is deliberate: it does
+        // not depend on the resource script staying in step with GLFW's internals,
+        // and glfwSetWindowIcon is the documented way to change a window's icon.
+        const std::filesystem::path square = here / "Monosect-icon-square.png";
+        if (std::filesystem::exists(square)) {
+            vsm::ImageRgba squareImage;
+            if (vsm::loadPngAsRgba(square, squareImage) && window_ != nullptr) {
+                GLFWimage icon{};
+                icon.width = squareImage.width;
+                icon.height = squareImage.height;
+                icon.pixels = squareImage.pixels.data();
+                glfwSetWindowIcon(window_, 1, &icon);
+            }
+        }
+
+        // The mark in the left column.  Reversed to a light mark on transparency, so
+        // it sits on the dark theme without a white plate behind it.
+        const std::filesystem::path logo = here / "Monosect-full-logo.png";
+        if (!std::filesystem::exists(logo)) {
             return;
         }
-        if (!vsm::loadPngAsTexture(path, logoTexture_)) {
-            return;
+        if (!vsm::loadMarkAsTexture(logo, logoTexture_, 0xEC, 0xEC, 0xEF)) {
+            logoTexture_ = vsm::TextureHandle{};
         }
     }
 
@@ -608,38 +824,67 @@ private:
         if (!logoTexture_.valid()) {
             return;
         }
-        const float padding = 14.0f;
-        const float available = 380.0f;
+        const float available = ImGui::GetContentRegionAvail().x;
+        if (available <= 1.0f) {
+            // A column the user has dragged to almost nothing.  Drawing here would
+            // compute a size from a near-zero width and produce a degenerate quad.
+            return;
+        }
+        // Fitted to the column rather than to a fixed 380 px, because the column is
+        // now resizable: a fixed size would overflow a narrow column and waste space
+        // in a wide one.
         float width = available;
-        float height = width * static_cast<float>(logoTexture_.height) /
-                        static_cast<float>(logoTexture_.width == 0 ? 1 : logoTexture_.width);
+        float height =
+            width * static_cast<float>(logoTexture_.height) / static_cast<float>(logoTexture_.width);
         // Never taller than a quarter of the window: a very wide logo file would
         // otherwise push every panel below it off the screen.
         const float maxHeight = ImGui::GetIO().DisplaySize.y * 0.25f;
         if (height > maxHeight) {
             height = maxHeight;
             width = height * static_cast<float>(logoTexture_.width) /
-                    static_cast<float>(logoTexture_.height == 0 ? 1 : logoTexture_.height);
+                    static_cast<float>(logoTexture_.height);
         }
+        // Re-clamped to the column.  A wide logo file on a short window makes the
+        // height-first branch produce a width *wider* than the column, which is the
+        // overflow the fit-to-width branch above exists to prevent - it just needed a
+        // second trigger.
+        if (width > available) {
+            width = available;
+            height = width * static_cast<float>(logoTexture_.height) /
+                     static_cast<float>(logoTexture_.width);
+        }
+        ImGui::SetCursorPosX((available - width) * 0.5f);
+        ImGui::Image(static_cast<ImTextureID>(static_cast<intptr_t>(logoTexture_.id)), ImVec2(width, height));
+        ImGui::Spacing();
+    }
 
-        const ImVec2 outer(width + padding * 2.0f, height + padding * 2.0f);
-        const ImVec2 origin((ImGui::GetContentRegionAvail().x - outer.x) * 0.5f,
-                            ImGui::GetCursorPosY());
-        ImGui::SetCursorPos(origin);
+    /// A drag handle between two columns, drawn as a real widget so it can be hit.
+    ///
+    /// Returns the horizontal movement the user has made since the previous frame
+    /// while the handle is held, or 0.  A fixed one-pixel line would be pixel-perfect
+    /// to grab; a 7 px band is grabbable, and the cursor changes so it reads as a
+    /// handle before the user tries.
+    static float drawColumnSplitter(const char* id) {
+        ImGui::SameLine(0.0f, 0.0f);
+        ImGui::InvisibleButton(id, ImVec2(kSplitterWidth, ImGui::GetContentRegionAvail().y));
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
+        }
+        if (!ImGui::IsItemActive() || !ImGui::IsMouseDragging(ImGuiMouseButton_Left, 0.0f)) {
+            return 0.0f;
+        }
+        return ImGui::GetIO().MouseDelta.x;
+    }
 
-        // The logo is a dark mark on an opaque white background - a brand asset made
-        // for a light page.  Drawn raw it is a white rectangle in the middle of a
-        // dark window, which reads as a rendering failure rather than as branding.
-        // Recolouring somebody's logo to suit our theme would be the wrong call, so
-        // it is presented as a deliberate card instead: the mark is shown exactly as
-        // authored, on the surface it was drawn for.
-        ImDrawList* draw = ImGui::GetWindowDrawList();
-        draw->AddRectFilled(origin, ImVec2(origin.x + outer.x, origin.y + outer.y),
-                            ImGui::GetColorU32(ImVec4(1.0f, 1.0f, 1.0f, 1.0f)), 8.0f);
-        ImGui::SetCursorPos(ImVec2(origin.x + padding, origin.y + padding));
-        ImGui::Image(static_cast<ImTextureID>(static_cast<intptr_t>(logoTexture_.id)),
-                     ImVec2(width, height));
-        ImGui::SetCursorPosY(origin.y + outer.y);
+    /// Resizes a column while its splitter is dragged, and clamps it.
+    ///
+    /// `maximum` is what keeps the other columns usable; it is passed in rather than
+    /// assumed so the two columns can have different ceilings.
+    static void applySplitterDrag(float& width, float movement, float minimum, float maximum) {
+        if (movement == 0.0f) {
+            return;
+        }
+        width = std::clamp(width + movement, minimum, std::max(minimum, maximum));
     }
 
     void drawDockspace() {
@@ -651,8 +896,6 @@ private:
                      ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
                          ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoBringToFrontOnFocus |
                          ImGuiWindowFlags_NoScrollbar);
-        const float leftWidth = 420.0f;
-        const float rightWidth = showResources_ || showHistory_ ? 340.0f : 0.0f;
 
         // Split and merge are separate panels rather than one panel with a mode
         // switch.  They share almost nothing: a split is bounded by a size or
@@ -660,8 +903,33 @@ private:
         // is verified as one output.  Merging them behind a toggle would mean
         // showing a constraint editor that cannot apply to what the user picked.
         const bool merging = controller_ != nullptr && controller_->mergeVisible();
+        const bool rightColumn = showResources_ || showHistory_;
 
-        ImGui::BeginChild("##left", ImVec2(leftWidth, 0.0f), ImGuiChildFlags_Border);
+        // Widths are resolved before anything is drawn, from the width actually
+        // available this frame, so a window that has been shrunk cannot produce a
+        // negative middle column.  ImGui does not treat a negative size as an error:
+        // CalcItemSize turns it into ImMax(4, avail + size), which silently became a
+        // 4-pixel sliver for the middle panel while the right panel collapsed to its
+        // minimum - a layout that was already reachable at 420 + 340 + 8 = 768 px and
+        // became trivial to reach once the columns were draggable.
+        const float total = ImGui::GetContentRegionAvail().x;
+        const float handles = rightColumn ? kSplitterWidth * 2.0f : kSplitterWidth;
+        const float roomForColumns = std::max(0.0f, total - handles);
+
+        leftWidth_ = std::clamp(leftWidth_, kMinLeftWidth, std::max(kMinLeftWidth, roomForColumns * 0.6f));
+        rightWidth_ = std::clamp(rightWidth_, kMinRightWidth,
+                                 std::max(kMinRightWidth, roomForColumns * 0.6f));
+        // The middle column is where the work happens, so it is the last thing
+        // squeezed: the side columns give up width before it does.
+        if (roomForColumns - leftWidth_ - rightWidth_ < kMinMiddleWidth) {
+            const float wanted = roomForColumns - leftWidth_ - kMinMiddleWidth;
+            rightWidth_ = std::min(rightWidth_, std::max(0.0f, wanted));
+        }
+
+        const float middleWidth =
+            std::max(0.0f, roomForColumns - leftWidth_ - (rightColumn ? rightWidth_ : 0.0f));
+
+        ImGui::BeginChild("##left", ImVec2(leftWidth_, 0.0f), ImGuiChildFlags_Border);
         if (!merging) {
             drawLogo();
             drawFirstRunPanel();
@@ -670,9 +938,15 @@ private:
         }
         ImGui::EndChild();
 
-        ImGui::SameLine();
-        ImGui::BeginChild("##middle", ImVec2(ImGui::GetContentRegionAvail().x - rightWidth - 8.0f, 0.0f),
-                          ImGuiChildFlags_Border);
+        applySplitterDrag(leftWidth_, drawColumnSplitter("##splitterLeft"), kMinLeftWidth,
+                          roomForColumns * 0.6f);
+
+        // SameLine(0, 0) and not SameLine(): the default carries ItemSpacing.x (8 px),
+        // which on top of the 7 px handle made the row 8 px wider than the width the
+        // arithmetic above had budgeted - so the right-hand column was pushed off the
+        // edge of the window and simply was not there.  The handle is the gap.
+        ImGui::SameLine(0.0f, 0.0f);
+        ImGui::BeginChild("##middle", ImVec2(middleWidth, 0.0f), ImGuiChildFlags_Border);
         if (merging) {
             drawMergePanel();
         } else {
@@ -685,9 +959,14 @@ private:
         }
         ImGui::EndChild();
 
-        if (rightWidth > 0.0f) {
-            ImGui::SameLine();
-            ImGui::BeginChild("##right", ImVec2(0.0f, 0.0f), ImGuiChildFlags_Border);
+        if (rightColumn) {
+            // The right column is pinned to the window edge, so dragging its splitter
+            // right makes it narrower.
+            applySplitterDrag(rightWidth_, -drawColumnSplitter("##splitterRight"), kMinRightWidth,
+                              roomForColumns * 0.6f);
+
+            ImGui::SameLine(0.0f, 0.0f);
+            ImGui::BeginChild("##right", ImVec2(rightWidth_, 0.0f), ImGuiChildFlags_Border);
             if (showResources_) {
                 drawResourcesPanel();
             }
@@ -746,10 +1025,18 @@ private:
                 const std::string path = genericFilePathDialog(L"Select ffmpeg.exe", false,
                                                                L"ffmpeg\0ffmpeg.exe\0All files\0*.*\0");
                 if (!path.empty()) {
+                    // Under the lock, because the bootstrap thread writes these same
+                    // two strings; see startToolBootstrap().
+                    std::lock_guard<std::mutex> lock(bootstrapMutex_);
                     ffmpegPath_ = path;
-                    const std::filesystem::path folder = std::filesystem::path(path).parent_path();
-                    ffprobePath_ = (folder / "ffprobe.exe").string();
+                    const std::filesystem::path folder = std::filesystem::path(wideFromUtf8(path)).parent_path();
+                    ffprobePath_ = utf8FromPath(folder / "ffprobe.exe");
                     toolsReady_ = true;
+                    // The explicit choice ends the "still working" state, which
+                    // otherwise only the failure path ever cleared - leaving a progress
+                    // bar animating forever next to a working toolchain.
+                    bootstrapRunning_ = false;
+                    bootstrapError_.clear();
                 }
             }
         }
@@ -894,7 +1181,7 @@ private:
                          ImGuiInputTextFlags_ReadOnly);
         ImGui::SameLine();
         if (ImGui::Button("...##outdir")) {
-            const std::string folder = chooseFolderDialog(L"Output folder for the parts");
+            const std::string folder = chooseFolderDialog(L"Output folder for the parts", nativeWindow());
             if (!folder.empty()) {
                 std::snprintf(outputDirectoryBuffer_, sizeof(outputDirectoryBuffer_), "%s", folder.c_str());
                 controller_->setOutputDirectory(folder);
@@ -1059,7 +1346,12 @@ private:
                 ImGui::TableSetColumnIndex(0);
                 ImGui::Text("%d", part.index);
                 ImGui::TableSetColumnIndex(1);
-                ImGui::TextUnformatted(std::filesystem::path(part.path).filename().string().c_str());
+                // Through wideFromUtf8 rather than path(const std::string&), which
+                // decodes UTF-8 bytes as the ANSI code page and hands back mojibake -
+                // so a part written as "video été.mp4" was listed here under a name
+                // that did not exist, while the file on disk was correct.
+                ImGui::TextUnformatted(
+                    utf8FromPath(std::filesystem::path(wideFromUtf8(part.path)).filename()).c_str());
                 ImGui::TableSetColumnIndex(2);
                 const std::string range =
                     formatDuration(part.startSeconds) + " - " + formatDuration(part.endSeconds);
@@ -1164,10 +1456,15 @@ public:
     ~BackgroundHardwareProbe() override { join(); }
 
     void startProbe() override {
-        std::lock_guard<std::mutex> guard(mutex_);
-        if (worker_.joinable() || !workerFinished_.load()) {
-            return;   // already running: a second probe would answer the same question
+        {
+            std::lock_guard<std::mutex> guard(mutex_);
+            if (worker_.joinable() || !workerFinished_.load()) {
+                return;   // already running: a second probe would answer the same question
+            }
         }
+        // Outside the lock.  Joining while holding it is not a deadlock today only
+        // because the worker publishes its result before it sets workerFinished_, and
+        // that ordering is one careless edit away from being one.
         join();
         workerFinished_ = false;
         worker_ = std::thread([this] {
@@ -1198,10 +1495,19 @@ public:
     }
 
 private:
-    /// Joins a finished worker.  Called with no lock held, and never blocks on a
-    /// probe that is still running.
+    /// Joins the worker if there is one, and blocks until the probe is finished.
+    ///
+    /// This used to return immediately when a probe was still running, on the
+    /// reasoning that blocking would freeze the window.  But then a probe that was
+    /// still running at destruction time left a joinable std::thread behind, and
+    /// destroying that calls std::terminate - so closing the window during the
+    /// several seconds the probe can take killed the process instead of closing it.
+    ///
+    /// The UI thread therefore never calls this while a probe is in flight (startProbe
+    /// returns early in that case); only destruction does, where blocking is the
+    /// correct and unavoidable trade.
     void join() {
-        if (worker_.joinable() && workerFinished_.load()) {
+        if (worker_.joinable()) {
             worker_.join();
         }
     }
@@ -1237,10 +1543,28 @@ private:
         }
 
         ImGui::TextDisabled("Files are joined in this order, without re-encoding.");
-        for (std::size_t i = 0; i < merge.inputs.size(); ++i) {
+
+        // The ids are copied before the loop.  removeMergeInput erases from the very
+        // vector this loop was iterating, so clicking "remove" on row 0 of three
+        // invalidated the iterator and shifted every later index - the loop then
+        // visited the row that had been third and skipped the one that had been second.
+        // Indexing by position into a list that the loop itself edits is the whole bug;
+        // iterating a snapshot of the identities is the fix.
+        const std::vector<std::string> orderedIds = merge.inputs;
+        for (std::size_t i = 0; i < orderedIds.size(); ++i) {
             ImGui::PushID(static_cast<int>(i));
-            ImGui::TextUnformatted(merge.inputs[i].c_str());
-            ImGui::SameLine(ImGui::GetContentRegionAvail().x - 150.0f);
+            ImGui::TextUnformatted(orderedIds[i].c_str());
+            // The offset goes negative once the column is narrower than the buttons
+            // need, and ImGui treats a negative SameLine offset as a real position, so
+            // the buttons were drawn to the *left* of the name and outside the panel.
+            // The column is now draggable, which makes that trivial to reach.
+            const float buttons = 150.0f;
+            if (ImGui::GetContentRegionAvail().x > buttons) {
+                ImGui::SameLine(ImGui::GetContentRegionAvail().x - buttons);
+            } else {
+                ImGui::SameLine();
+                ImGui::NewLine();
+            }
             if (ImGui::SmallButton("up") && i > 0) {
                 controller_->moveMergeInput(i, -1);
             }
@@ -1269,16 +1593,26 @@ private:
         ImGui::SeparatorText("Output");
         ImGui::TextUnformatted("Folder:");
         ImGui::SetNextItemWidth(-1.0f);
-        ImGui::InputText("##mergeout", mergeOutputBuffer_, sizeof(mergeOutputBuffer_));
-        merge.outputDirectory = mergeOutputBuffer_;
+        // Written back only when the field actually changed, or when the folder button
+        // below chose one.  Writing every frame meant the buffer was the single source
+        // of truth and silently undid any other code path that set these values - and
+        // the "Choose a folder..." result, assigned to the buffer here, did not reach
+        // the controller until the next frame drew.
+        const bool typedFolder = ImGui::InputText("##mergeout", mergeOutputBuffer_, sizeof(mergeOutputBuffer_));
         ImGui::TextUnformatted("File name:");
         ImGui::SetNextItemWidth(-1.0f);
-        ImGui::InputText("##mergename", mergeNameBuffer_, sizeof(mergeNameBuffer_));
-        merge.outputName = mergeNameBuffer_;
+        const bool typedName = ImGui::InputText("##mergename", mergeNameBuffer_, sizeof(mergeOutputBuffer_));
+        if (typedFolder || typedName) {
+            merge.outputDirectory = mergeOutputBuffer_;
+            merge.outputName = mergeNameBuffer_;
+        }
         if (ImGui::Button("Choose a folder...")) {
-            const std::string folder = chooseFolderDialog(L"Write the merged file here");
+            const std::string folder = chooseFolderDialog(L"Write the merged file here", nativeWindow());
             if (!folder.empty()) {
                 std::snprintf(mergeOutputBuffer_, sizeof(mergeOutputBuffer_), "%s", folder.c_str());
+                // Pushed immediately rather than waiting for the next frame's typedFolder,
+                // which would never be true for a value the user did not type.
+                merge.outputDirectory = mergeOutputBuffer_;
             }
         }
 
@@ -1311,10 +1645,15 @@ private:
             if (merge.succeeded && !merge.path.empty()) {
                 ImGui::Text("Verified: %s", merge.verified ? "yes" : "no");
                 if (ImGui::Button("Open the output folder")) {
-                    const std::filesystem::path folder = std::filesystem::path(merge.path).parent_path();
+                    // Built from the UTF-8 bytes, not through path(const std::string&),
+                    // which would decode them as the ANSI code page and mangle any path
+                    // outside ASCII - the very filenames this product guarantees to
+                    // handle.
+                    const std::filesystem::path folder =
+                        std::filesystem::path(wideFromUtf8(merge.path)).parent_path();
                     if (!folder.empty()) {
-                        ::ShellExecuteW(nullptr, L"open", wideFromUtf8(utf8FromPath(folder)).c_str(), nullptr,
-                                        nullptr, SW_SHOWNORMAL);
+                        ::ShellExecuteW(nullptr, L"open", folder.wstring().c_str(), nullptr, nullptr,
+                                        SW_SHOWNORMAL);
                     }
                 }
             }
@@ -1338,9 +1677,13 @@ private:
         helpMarker(HelpContent::find(HelpTopicId::WatchFolder), [this](HelpTopicId id) { controller_->showHelp(id); });
 
         if (ImGui::Button("Choose a folder to watch...")) {
-            const std::string folder = chooseFolderDialog(L"Watch this folder for media files");
+            const std::string folder = chooseFolderDialog(L"Watch this folder for media files", nativeWindow());
             if (!folder.empty()) {
                 watchFolder_ = folder;
+                // The buffer is the widget's own storage, so the visible field has to be
+                // updated here or the next frame's write-back would overwrite the choice
+                // with the old text.
+                std::snprintf(watchFolderBuffer_, sizeof(watchFolderBuffer_), "%s", folder.c_str());
                 if (watchEnabled_) {
                     applyWatchSettings();
                 }
@@ -1348,11 +1691,20 @@ private:
         }
         ImGui::SameLine();
         ImGui::SetNextItemWidth(-1.0f);
-        ImGui::InputText("##watchfolder", watchFolderBuffer_, sizeof(watchFolderBuffer_));
-        // The edit field is a char buffer because that is what ImGui wants; the
-        // watcher takes a std::string, so the conversion is explicit and happens
-        // here rather than through a cast somewhere less visible.
-        watchFolder_ = watchFolderBuffer_;
+        // Written back only when the field changed, for the same reason as the merge
+        // panel's fields: a buffer written every frame overrides anything else that
+        // sets this value, and a folder chosen with the button on the next line would
+        // otherwise take a frame to arrive.
+        const bool typedWatchFolder = ImGui::InputText("##watchfolder", watchFolderBuffer_, sizeof(watchFolderBuffer_));
+        if (typedWatchFolder) {
+            // The edit field is a char buffer because that is what ImGui wants; the
+            // watcher takes a std::string, so the conversion is explicit and happens
+            // here rather than through a cast somewhere less visible.
+            watchFolder_ = watchFolderBuffer_;
+            if (watchEnabled_) {
+                applyWatchSettings();
+            }
+        }
 
         if (ImGui::Checkbox("Watch this folder and split what appears", &watchEnabled_)) {
             applyWatchSettings();
@@ -1490,7 +1842,35 @@ private:
             ImGui::PopTextWrapPos();
             ImGui::EndTooltip();
         }
-        ImGui::TextWrapped("%s", controller_->hardwareSummary().c_str());
+        // The list, then a verdict, then - only if asked - the full paragraph.
+        //
+        // The verdict is on one line because that is the only part anyone acts on: the
+        // panel used to end in describe(), which is a paragraph naming every encoder
+        // that failed and why, in full, unprompted, above two checkboxes.  The detail
+        // is not deleted - it is one click away, and each encoder's own failure reason
+        // was always a hover away.
+        std::size_t usable = 0;
+        std::string usableNames;
+        for (const EncoderProbe& encoder : controller_->hardwareEncoders()) {
+            if (!encoder.usable) {
+                continue;
+            }
+            ++usable;
+            if (!usableNames.empty()) {
+                usableNames.append(", ");
+            }
+            usableNames.append(encoder.encoder);
+        }
+        const std::size_t tested = controller_->hardwareEncoders().size();
+        if (usable == 0) {
+            ImGui::TextDisabled("%zu tested - none work on this machine", tested);
+        } else {
+            ImGui::Text("%zu of %zu usable: %s", usable, tested, usableNames.c_str());
+        }
+
+        if (ImGui::CollapsingHeader("Why")) {
+            ImGui::TextWrapped("%s", controller_->hardwareSummary().c_str());
+        }
         helpMarker(HelpContent::find(HelpTopicId::GpuEncoders), [this](HelpTopicId id) { controller_->showHelp(id); });
 
         if (ImGui::Checkbox("Use a hardware encoder when a boundary must be re-encoded", &gpuEnabled_)) {
@@ -1533,11 +1913,35 @@ private:
         };
         meter("CPU", sample.cpuPercent, cpuHistory_, "%");
         meter("Memory", sample.memoryPercent, memoryHistory_, "%");
-        meter("GPU", sample.gpuPercent, gpuHistory_, "%");
+
+        // The GPU gets the adapter's name on the same line as the figure, because the
+        // question this panel gets asked is "what GPU has this machine got" and the
+        // answer used to be "none" on a machine that had one.  When the percentage
+        // cannot be read the name still stands, and the reason is on hover - an
+        // unmeasurable figure and an absent device are different facts.
+        {
+            const std::string gpuName = controller_->gpuAdapterDescription();
+            const std::string gpuValue = sample.gpuPercent.known
+                                             ? UiModel::meterText(sample.gpuPercent, "%", 0)
+                                             : std::string("n/a");
+            ImGui::Text("GPU: %s - %s", gpuName.c_str(), gpuValue.c_str());
+            if (!sample.gpuPercent.known && ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
+                ImGui::SetTooltip("%s", sample.gpuPercent.unavailableReason.c_str());
+            }
+            if (!gpuHistory_.empty()) {
+                ImGui::PlotLines("##GPU", gpuHistory_.data(), static_cast<int>(gpuHistory_.size()), 0,
+                                 nullptr, 0.0f, 100.0f, ImVec2(-1.0f, 42.0f));
+            }
+        }
+
         ImGui::Text("Disk read: %s", bytesPerSecondText(sample.diskReadBytesPerSecond).c_str());
         ImGui::Text("Disk write: %s", bytesPerSecondText(sample.diskWriteBytesPerSecond).c_str());
         ImGui::Text("Media written: %s", bytesPerSecondText(sample.mediaThroughputBytesPerSecond).c_str());
-        ImGui::TextWrapped("%s", sample.sourceDescription.c_str());
+        // Closed by default.  It is two sentences of provenance, which is worth having
+        // and is not worth two lines of panel for something nobody reads while working.
+        if (ImGui::CollapsingHeader("Where these numbers come from")) {
+            ImGui::TextWrapped("%s", sample.sourceDescription.c_str());
+        }
         ImGui::Separator();
 
         drawWatchPanel();
@@ -1548,8 +1952,13 @@ private:
         ImGui::Separator();
         ResourcePolicyInput input = controller_->resourceInput();
         const ResourcePolicy policy = deriveResourcePolicy(input);
-        ImGui::TextWrapped("%s", UiModel::resourcePolicySummary(policy).c_str());
         helpMarker(HelpContent::find(HelpTopicId::ResourceModes), [this](HelpTopicId id) { controller_->showHelp(id); });
+        // Same reasoning as the provenance paragraph above: this is a paragraph, and a
+        // paragraph in a 380 px column is a wall.  It describes a policy the user chose
+        // two controls below, so it belongs behind a disclosure rather than above them.
+        if (ImGui::CollapsingHeader("What this schedule does")) {
+            ImGui::TextWrapped("%s", UiModel::resourcePolicySummary(policy).c_str());
+        }
         if (ImGui::Checkbox("Low priority", &lowPriority_)) {
             applySettingsToController();
         }
@@ -1582,12 +1991,33 @@ private:
             ImGui::TextColored(toneColor(StatusTone::Warning), "%s", controller_->historyProblem().c_str());
         }
         const std::string filter = historyFilter_;
-        if (ImGui::BeginTable("##history", 4, ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerV |
-                                                    ImGuiTableFlags_SizingStretchProp)) {
-            ImGui::TableSetupColumn("finished");
-            ImGui::TableSetupColumn("source");
-            ImGui::TableSetupColumn("parts");
-            ImGui::TableSetupColumn("state");
+
+        // Proportional columns, and a header that says so.
+        //
+        // SizingStretchProp with four unweighted columns gave every column a quarter of
+        // the width: a 19-character timestamp got the same space as a filename, and the
+        // filename - the only column with information in it - was the one that ran out.
+        // That is what "disconnected" looked like on screen: the source names were cut
+        // mid-word while half the row sat empty.
+        //
+        // Weights are 3.2 for the name against 1.6 and 1.2 for the rest, so the name
+        // gets the room.  SizingStretchSame would share the surplus evenly, which
+        // reproduces the original problem in a narrower column.
+        //
+        // ScrollY needs a bounded height.  An unbounded ScrollY table takes everything
+        // left in the column, which would push the "Stored at" footer off the bottom and
+        // make the panel scroll as a whole - the panel is a child, and a child that
+        // scrolls as a whole is the thing that was already annoying.
+        const float footerHeight = ImGui::GetTextLineHeightWithSpacing();
+        const float tableHeight = std::max(120.0f, ImGui::GetContentRegionAvail().y - footerHeight);
+        if (ImGui::BeginTable("##history", 4,
+                              ImGuiTableFlags_RowBg | ImGuiTableFlags_Borders | ImGuiTableFlags_ScrollY |
+                                  ImGuiTableFlags_SizingStretchProp,
+                              ImVec2(0.0f, tableHeight))) {
+            ImGui::TableSetupColumn("finished", ImGuiTableColumnFlags_WidthStretch, 1.6f);
+            ImGui::TableSetupColumn("source", ImGuiTableColumnFlags_WidthStretch, 3.2f);
+            ImGui::TableSetupColumn("parts", ImGuiTableColumnFlags_WidthStretch, 0.8f);
+            ImGui::TableSetupColumn("state", ImGuiTableColumnFlags_WidthStretch, 1.2f);
             ImGui::TableHeadersRow();
             for (const JobRecord& record : controller_->history()) {
                 if (!filter.empty()) {
@@ -1601,12 +2031,19 @@ private:
                 ImGui::TableSetColumnIndex(0);
                 ImGui::TextUnformatted(record.finishedAt.c_str());
                 ImGui::TableSetColumnIndex(1);
-                ImGui::TextUnformatted(std::filesystem::path(record.sourcePath).filename().string().c_str());
+                // Wide char -> path -> narrow char on a UTF-8 std::string: the path
+                // constructor decodes those bytes as the ANSI code page, so a filename
+                // with anything outside ASCII came back as mojibake in this column.
+                // Utf8Path is the project's boundary for exactly this, and the row's
+                // tooltip has always had the correct full path underneath.
+                const std::string name =
+                    utf8FromPath(std::filesystem::path(wideFromUtf8(record.sourcePath)).filename());
+                ImGui::TextUnformatted(name.c_str());
                 if (ImGui::IsItemHovered()) {
                     ImGui::SetTooltip("%s", record.sourcePath.c_str());
                 }
                 ImGui::TableSetColumnIndex(2);
-                ImGui::Text("%zu", record.parts.size());
+                ImGui::TextUnformatted(std::to_string(record.parts.size()).c_str());
                 ImGui::TableSetColumnIndex(3);
                 const bool good = record.finalState == "Completed";
                 ImGui::TextColored(toneColor(good ? StatusTone::Good : StatusTone::Warning), "%s",
@@ -1659,7 +2096,13 @@ private:
                                                     : controller_->helpResults().size());
             ImGui::Separator();
             ImGui::BeginChild("##topics", ImVec2(260.0f, 0.0f), ImGuiChildFlags_Border);
-            const std::vector<const HelpTopic*>& results =
+            // Copied, not referenced.  helpResults() hands back a reference into the
+            // controller, and showHelp() - called from inside this very loop - clears
+            // that vector.  The stored end iterator then pointed into a vector that had
+            // just been emptied, and the user-visible consequence was that clicking a
+            // search result wiped the result list while the search box still showed the
+            // query: a list that disappeared because it had been used.
+            const std::vector<const HelpTopic*> results =
                 helpQueryBuffer_[0] == '\0' ? allTopics() : controller_->helpResults();
             for (const HelpTopic* topic : results) {
                 if (topic == nullptr) {
@@ -1724,8 +2167,7 @@ private:
             return;
         }
         ImGui::SetNextWindowSize(ImVec2(560.0f, 320.0f), ImGuiCond_FirstUseEver);
-        if (ImGui::Begin("About MonoSect", &showAbout_)) {
-            ImGui::Text("MonoSect %s", version_.c_str());
+        if (ImGui::Begin("About MonoSect", &showAbout_)) {            ImGui::Text("MonoSect %s", version_.c_str());
             ImGui::TextDisabled("Precision media segmentation for Windows 10 and 11.");
             ImGui::Separator();
             ImGui::TextWrapped(
@@ -1733,8 +2175,18 @@ private:
                 "a part is never published above the size in bytes or the duration you asked for, and every written "
                 "part is verified before it is reported as finished.");
             ImGui::Separator();
-            ImGui::Text("FFmpeg: %s", ffmpegPath_.empty() ? "not ready" : ffmpegPath_.c_str());
-            ImGui::Text("FFprobe: %s", ffprobePath_.empty() ? "not ready" : ffprobePath_.c_str());
+            // Copied under the lock: these are written by the bootstrap thread and by
+            // the manual locate handler, and an About panel is exactly the place a user
+            // opens while the download is still running.
+            std::string ffmpegShown;
+            std::string ffprobeShown;
+            {
+                std::lock_guard<std::mutex> lock(bootstrapMutex_);
+                ffmpegShown = ffmpegPath_;
+                ffprobeShown = ffprobePath_;
+            }
+            ImGui::Text("FFmpeg: %s", ffmpegShown.empty() ? "not ready" : ffmpegShown.c_str());
+            ImGui::Text("FFprobe: %s", ffprobeShown.empty() ? "not ready" : ffprobeShown.c_str());
             ImGui::TextDisabled("The tools are identified before they run: a pinned release SHA-256 when this build "
                                 "defines one, and the recorded hash of the download otherwise. Their versions are "
                                 "recorded in every job record.");
@@ -1769,6 +2221,20 @@ private:
     // ---- state ----------------------------------------------------------------------
 
     GLFWwindow* window_ = nullptr;
+    bool comInitialized_ = false;
+
+    // --- column widths -----------------------------------------------------------------
+    // Draggable, so a user whose constraints panel is wider than 420 px - or whose job
+    // history needs more than 340 px - can make the column they need without resizing
+    // the whole window.  Held on the window rather than baked into the layout because
+    // ImGui offers no split view here: the three columns are sibling children, and a
+    // child cannot be resized by dragging its own edge.
+    static constexpr float kSplitterWidth = 7.0f;
+    static constexpr float kMinLeftWidth = 220.0f;
+    static constexpr float kMinRightWidth = 260.0f;
+    static constexpr float kMinMiddleWidth = 180.0f;
+    float leftWidth_ = 420.0f;
+    float rightWidth_ = 380.0f;
     bool imguiReady_ = false;
     std::string version_;
     std::filesystem::path executableDirectory_;
@@ -1808,14 +2274,23 @@ private:
     std::string ffprobePath_;
     std::vector<std::string> logLines_;
 
-    char outputDirectoryBuffer_[512] = {};
+    // Paths are held in 32768-byte buffers, not 512.  A 512-byte buffer is enough for
+    // MAX_PATH and the folder dialog will happily fill it - but every one of these is
+    // written with snprintf whose return value nobody checked, so a deeper path was
+    // silently truncated and the truncated string was then handed to setOutputDirectory
+    // as a folder that does not exist.  The failure showed up much later, as parts that
+    // could not be written, with the path in the message a prefix of the real one.
+    // 32768 is what the Win32 extended-length limit allows and what executableDirectory()
+    // already uses for the same reason.
+    static constexpr std::size_t kPathBufferSize = 32768;
+    char outputDirectoryBuffer_[kPathBufferSize] = {};
     char namingBuffer_[256] = {};
     char sizeValueBuffer_[64] = {};
     char durationValueBuffer_[64] = {};
-    char databaseBuffer_[512] = {};
+    char databaseBuffer_[kPathBufferSize] = {};
     // Long enough for MAX_PATH, which is what the folder dialog fills it with.
-    char watchFolderBuffer_[512] = {};
-    char mergeOutputBuffer_[512] = {};
+    char watchFolderBuffer_[kPathBufferSize] = {};
+    char mergeOutputBuffer_[kPathBufferSize] = {};
     char mergeNameBuffer_[256] = {};
     char historyFilter_[64] = {};
     char helpQueryBuffer_[128] = {};

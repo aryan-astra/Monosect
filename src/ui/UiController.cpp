@@ -1101,6 +1101,20 @@ void UiController::startMerge() {
     });
 }
 
+UiController::~UiController() {
+    // Both workers own a std::thread, and destroying a joinable one calls
+    // std::terminate.  Cancelling first is what makes the join return promptly; the
+    // join is unconditional because a destructor has no safe alternative.
+    requestMergeCancel();
+    if (mergeWorker_.joinable()) {
+        mergeWorker_.join();
+    }
+    requestCancel();
+    if (worker_.joinable()) {
+        worker_.join();
+    }
+}
+
 void UiController::waitForMerge() {
     // Joins a finished merge worker.  Never blocks on one that is still running,
     // which is the same rule the split worker follows: a test and a shutdown path
