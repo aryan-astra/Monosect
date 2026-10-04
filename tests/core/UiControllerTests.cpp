@@ -732,3 +732,141 @@ MONOSECT_TEST(a_controller_without_a_hardware_source_reports_it_rather_than_pret
     const ResourcePolicyInput input = controller.resourceInput();
     CHECK(input.topology.logicalCores >= 1);
 }
+namespace {
+
+/// A merge engine with scripted answers, so the merge session can be tested without
+/// touching a disk or a video codec.
+struct FakeMergeEngine final : UiEngine {
+    Result<ProbedSource> probe(const std::string&) override { return Error{ErrorCode::UnsupportedOperation, "no", {}, {}}; }
+    Result<SplitPlan> plan(const JobRequest&, const JobEvents&) override { return Error{ErrorCode::UnsupportedOperation, "no", {}, {}}; }
+    Result<JobOutcome> run(const JobRequest&, const JobEvents&) override { return Error{ErrorCode::UnsupportedOperation, "no", {}, {}}; }
+
+    Result<MergePlan> planMerge(const MergeJobRequest& request, const JobEvents&) override {
+        ++planCalls;
+        lastInputs = request.inputs;
+        if (planFails) {
+            return Error{ErrorCode::UnsupportedOperation,
+                         "stream 0 is hevc and stream 0 of the second file is h264", {}, {}};
+        }
+        MergePlan plan;
+        plan.planned = true;
+        plan.containerFormat = "mp4";
+        return plan;
+    }
+
+    Result<MergeOutcome> runMerge(const MergeJobRequest& request, const JobEvents&) override {
+        ++runCalls;
+        lastInputs = request.inputs;
+        MergeOutcome outcome;
+        outcome.succeeded = true;
+        outcome.verified = true;
+        outcome.path = request.outputDirectory + "/" + request.outputFileName;
+        outcome.fileSizeBytes = 4096;
+        outcome.duration = Rational{10, 1};
+        outcome.durationMeasured = true;
+        outcome.message = "joined 2 file(s)";
+        return outcome;
+    }
+
+    bool planFails = false;
+    int planCalls = 0;
+    int runCalls = 0;
+    std::vector<std::string> lastInputs;
+};
+
+} // namespace
+
+MONOSECT_TEST(a_merge_needs_two_files_and_says_so_rather_than_asking_the_engine) {
+    FakeMergeEngine engine;
+    UiController controller(engine);
+    controller.showMerge();
+    CHECK(controller.mergeVisible());
+
+    controller.previewMerge("C:/out", "joined.mp4");
+    CHECK(!controller.merge().planned);
+    CHECK(controller.merge().planProblem.find("at least two") != std::string::npos);
+    CHECK_EQ(0, engine.planCalls);   // the controller refused before asking
+
+    controller.addMergeInput("C:/media/a.mp4");
+    controller.previewMerge("C:/out", "joined.mp4");
+    CHECK(!controller.merge().planned);
+    CHECK(controller.merge().planProblem.find("at least two") != std::string::npos);
+    CHECK_EQ(0, engine.planCalls);
+}
+
+MONOSECT_TEST(the_order_of_the_inputs_is_the_join_order_and_editing_it_makes_the_plan_stale) {
+    FakeMergeEngine engine;
+    UiController controller(engine);
+    controller.showMerge();
+    controller.addMergeInput("C:/media/a.mp4");
+    controller.addMergeInput("C:/media/b.mp4");
+    controller.addMergeInput("C:/media/c.mp4");
+    controller.previewMerge("C:/out", "joined.mp4");
+    CHECK(controller.merge().planned);
+
+    // "down" on the first input must not wrap it round to the end.  Computed in
+    // signed arithmetic, because index + delta with an unsigned index and a
+    // negative delta wraps and would silently reverse the list.
+    controller.moveMergeInput(0, -1);
+    CHECK_EQ(std::string("C:/media/a.mp4"), controller.merge().inputs.front());
+    CHECK(controller.merge().planned);
+
+    controller.moveMergeInput(0, 1);
+    CHECK_EQ(std::string("C:/media/b.mp4"), controller.merge().inputs.front());
+    CHECK(!controller.merge().planned);   // the plan described the old order
+
+    controller.previewMerge("C:/out", "joined.mp4");
+    CHECK(controller.merge().planned);
+    CHECK_EQ(std::size_t(3u), engine.lastInputs.size());
+    CHECK_EQ(std::string("C:/media/b.mp4"), engine.lastInputs.front());
+}
+
+MONOSECT_TEST(a_merge_that_cannot_be_planned_shows_the_actual_reason) {
+    // "These two files have different codecs" is the answer the user needs; a bare
+    // "planning failed" is not, and the difference is the whole reason the plan
+    // exists.
+    FakeMergeEngine engine;
+    engine.planFails = true;
+    UiController controller(engine);
+    controller.showMerge();
+    controller.addMergeInput("C:/media/a.mkv");
+    controller.addMergeInput("C:/media/b.mp4");
+    controller.previewMerge("C:/out", "joined.mkv");
+
+    CHECK(!controller.merge().planned);
+    CHECK(controller.merge().planProblem.find("hevc") != std::string::npos);
+    CHECK(controller.merge().planProblem.find("h264") != std::string::npos);
+}
+
+MONOSECT_TEST(a_merge_cannot_be_started_before_it_has_been_planned) {
+    FakeMergeEngine engine;
+    UiController controller(engine);
+    controller.showMerge();
+    controller.addMergeInput("C:/media/a.mp4");
+    controller.addMergeInput("C:/media/b.mp4");
+
+    controller.startMerge();
+    CHECK_EQ(0, engine.runCalls);
+    CHECK(controller.merge().message.find("Preview") != std::string::npos);
+    CHECK(!controller.merge().succeeded);
+}
+
+MONOSECT_TEST(the_merge_panel_cannot_be_closed_while_a_merge_is_running) {
+    // Closing the panel while a worker is writing would leave a file being made that
+    // the user cannot see or account for.
+    FakeMergeEngine engine;
+    UiController controller(engine);
+    controller.showMerge();
+    controller.addMergeInput("C:/media/a.mp4");
+    controller.addMergeInput("C:/media/b.mp4");
+    controller.previewMerge("C:/out", "joined.mp4");
+    controller.startMerge();
+    controller.waitForMerge();
+
+    CHECK(controller.merge().succeeded);
+    CHECK_EQ(1, engine.runCalls);
+    CHECK_EQ(std::string("joined 2 file(s)"), controller.merge().message);
+    CHECK(controller.merge().verified);
+    controller.hideMerge();
+    CHECK(!controller.mergeVisible());
+}

@@ -598,20 +598,33 @@ private:
         const float leftWidth = 420.0f;
         const float rightWidth = showResources_ || showHistory_ ? 340.0f : 0.0f;
 
+        // Split and merge are separate panels rather than one panel with a mode
+        // switch.  They share almost nothing: a split is bounded by a size or
+        // duration limit and verified part by part, a merge has no limit at all and
+        // is verified as one output.  Merging them behind a toggle would mean
+        // showing a constraint editor that cannot apply to what the user picked.
+        const bool merging = controller_ != nullptr && controller_->mergeVisible();
+
         ImGui::BeginChild("##left", ImVec2(leftWidth, 0.0f), ImGuiChildFlags_Border);
-        drawFirstRunPanel();
-        drawSourcePanel();
-        drawConstraintPanel();
+        if (!merging) {
+            drawFirstRunPanel();
+            drawSourcePanel();
+            drawConstraintPanel();
+        }
         ImGui::EndChild();
 
         ImGui::SameLine();
         ImGui::BeginChild("##middle", ImVec2(ImGui::GetContentRegionAvail().x - rightWidth - 8.0f, 0.0f),
                           ImGuiChildFlags_Border);
-        drawRunPanel();
-        drawPlanPanel();
-        drawResultsPanel();
-        if (showLog_) {
-            drawLogPanel();
+        if (merging) {
+            drawMergePanel();
+        } else {
+            drawRunPanel();
+            drawPlanPanel();
+            drawResultsPanel();
+            if (showLog_) {
+                drawLogPanel();
+            }
         }
         ImGui::EndChild();
 
@@ -851,6 +864,17 @@ private:
             ImGui::TextDisabled("Waiting for the toolchain.");
             return;
         }
+        if (ImGui::Button("Merge files instead...")) {
+            controller_->showMerge();
+            // Seed the output folder from the split one: the user is almost always
+            // splitting and re-joining into the same place, and an empty field that
+            // must be filled before the button does anything is a needless step.
+            if (mergeOutputBuffer_[0] == '\0') {
+                std::snprintf(mergeOutputBuffer_, sizeof(mergeOutputBuffer_), "%s",
+                              controller_->outputDirectory().c_str());
+            }
+        }
+        helpMarker(HelpContent::find(HelpTopicId::Merge), [this](HelpTopicId id) { controller_->showHelp(id); });
         const bool running = controller_->jobRunning();
         const ConstraintReport report = controller_->validate();
         const bool canStart = report.valid && !running && controller_->selected() != nullptr;
@@ -1133,7 +1157,117 @@ private:
     std::atomic<bool> workerFinished_{true};
 };
 
-/// Watch a folder and ingest whatever lands in it.
+/// Join several files into one, without re-encoding.
+    ///
+    /// The order of the list is the join order and is not cosmetic - a
+    /// concatenation plays in the order given - so it is editable here rather than
+    /// left to a file dialog that always returns alphabetical order.
+    ///
+    /// The panel refuses to start a merge before it has planned one, for the same
+    /// reason the split panel does: a merge of files whose codecs differ fails
+    /// seconds later, and a plan states that up front with the actual difference.
+    void drawMergePanel() {
+        MergeSession& merge = controller_->merge();
+
+        ImGui::SeparatorText("Merge");
+        if (ImGui::Button("Back to splitting")) {
+            controller_->hideMerge();
+        }
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
+            ImGui::BeginTooltip();
+            ImGui::TextUnformatted("Switches back to the split panel. Nothing is lost.");
+            ImGui::EndTooltip();
+        }
+
+        ImGui::TextDisabled("Files are joined in this order, without re-encoding.");
+        for (std::size_t i = 0; i < merge.inputs.size(); ++i) {
+            ImGui::PushID(static_cast<int>(i));
+            ImGui::TextUnformatted(merge.inputs[i].c_str());
+            ImGui::SameLine(ImGui::GetContentRegionAvail().x - 150.0f);
+            if (ImGui::SmallButton("up") && i > 0) {
+                controller_->moveMergeInput(i, -1);
+            }
+            if (ImGui::SmallButton("down")) {
+                controller_->moveMergeInput(i, 1);
+            }
+            if (ImGui::SmallButton("remove")) {
+                controller_->removeMergeInput(i);
+            }
+            ImGui::PopID();
+        }
+        if (merge.inputs.size() < 2) {
+            ImGui::TextDisabled("A merge needs at least two files.");
+        }
+
+        if (ImGui::Button("Add files...")) {
+            for (const std::string& path : openFileDialogMulti(L"Choose files to merge")) {
+                controller_->addMergeInput(path);
+            }
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Clear") && !controller_->mergeRunning()) {
+            controller_->clearMergeInputs();
+        }
+
+        ImGui::SeparatorText("Output");
+        ImGui::TextUnformatted("Folder:");
+        ImGui::SetNextItemWidth(-1.0f);
+        ImGui::InputText("##mergeout", mergeOutputBuffer_, sizeof(mergeOutputBuffer_));
+        merge.outputDirectory = mergeOutputBuffer_;
+        ImGui::TextUnformatted("File name:");
+        ImGui::SetNextItemWidth(-1.0f);
+        ImGui::InputText("##mergename", mergeNameBuffer_, sizeof(mergeNameBuffer_));
+        merge.outputName = mergeNameBuffer_;
+        if (ImGui::Button("Choose a folder...")) {
+            const std::string folder = chooseFolderDialog(L"Write the merged file here");
+            if (!folder.empty()) {
+                std::snprintf(mergeOutputBuffer_, sizeof(mergeOutputBuffer_), "%s", folder.c_str());
+            }
+        }
+
+        if (!merge.planProblem.empty()) {
+            ImGui::TextColored(toneColor(StatusTone::Warning), "%s", merge.planProblem.c_str());
+        }
+        if (merge.planned && !merge.planSummary.empty()) {
+            ImGui::SeparatorText("Plan");
+            ImGui::TextWrapped("%s", merge.planSummary.c_str());
+        }
+
+        if (controller_->mergeRunning()) {
+            ImGui::ProgressBar(0.0f, ImVec2(-1.0f, 0.0f), merge.headline.c_str());
+            if (ImGui::Button("Cancel the merge")) {
+                controller_->requestMergeCancel();
+            }
+        } else {
+            if (ImGui::Button("Preview")) {
+                controller_->previewMerge(mergeOutputBuffer_, mergeNameBuffer_);
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Join the files") && !controller_->jobRunning()) {
+                controller_->startMerge();
+            }
+        }
+
+        if (!merge.message.empty()) {
+            ImGui::SeparatorText("Result");
+            ImGui::TextWrapped("%s", merge.message.c_str());
+            if (merge.succeeded && !merge.path.empty()) {
+                ImGui::Text("Verified: %s", merge.verified ? "yes" : "no");
+                if (ImGui::Button("Open the output folder")) {
+                    const std::filesystem::path folder = std::filesystem::path(merge.path).parent_path();
+                    if (!folder.empty()) {
+                        ::ShellExecuteW(nullptr, L"open", wideFromUtf8(utf8FromPath(folder)).c_str(), nullptr,
+                                        nullptr, SW_SHOWNORMAL);
+                    }
+                }
+            }
+        }
+        for (const std::string& warning : merge.warnings) {
+            ImGui::TextColored(toneColor(StatusTone::Warning), "%s", warning.c_str());
+        }
+    }
+
+    /// Watch a folder and ingest whatever lands in it.
     ///
     /// Two things this panel is careful not to do.  It does not claim a file is
     /// being watched before the watcher is running, and it never shows a file as
@@ -1621,6 +1755,8 @@ private:
     char databaseBuffer_[512] = {};
     // Long enough for MAX_PATH, which is what the folder dialog fills it with.
     char watchFolderBuffer_[512] = {};
+    char mergeOutputBuffer_[512] = {};
+    char mergeNameBuffer_[256] = {};
     char historyFilter_[64] = {};
     char helpQueryBuffer_[128] = {};
     int sizeUnitIndex_ = 1;

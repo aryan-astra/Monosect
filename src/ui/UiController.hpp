@@ -18,11 +18,13 @@
 
 #include "core/Constraints.hpp"
 #include "core/MediaModel.hpp"
+#include "core/MergePlanner.hpp"
 #include "core/PacketIndex.hpp"
 #include "core/SplitPlan.hpp"
 #include "core/Verification.hpp"
 #include "engine/JobRunner.hpp"
 #include "engine/JobStore.hpp"
+#include "engine/MergeRunner.hpp"
 #include "monitor/HardwareCapabilities.hpp"
 #include "monitor/SystemMonitor.hpp"
 #include "ui/HelpContent.hpp"
@@ -45,6 +47,36 @@ struct ProbedSource {
     PacketIndex index;
 };
 
+/// A merge: two or more inputs joined into one file without re-encoding.
+///
+/// Kept apart from the split session rather than folded into it, because the two
+/// answer different questions.  A split is constrained by a hard limit and is
+/// verified part by part; a merge has no limit at all - the inputs either match or
+/// they do not - and is verified as one output.  Sharing one state machine between
+/// them produced a session where a merge could leave a stale split plan on screen.
+struct MergeSession {
+    bool active = false;
+    std::vector<std::string> inputs;      // in the order they will be joined
+    std::string outputDirectory;
+    std::string outputName;
+    bool planned = false;
+    std::string planSummary;             // what the plan says, in a sentence
+    std::string planProblem;             // why it cannot be planned, when it cannot
+    bool running = false;
+    bool succeeded = false;
+    bool canceled = false;
+    std::string headline;                // what the status line says
+    std::string message;                 // the outcome, in full
+    std::string path;                    // where the merged file is
+    ByteCount fileSizeBytes = 0;
+    Rational duration;
+    bool durationKnown = false;
+    bool verified = false;
+    std::vector<std::string> findings;
+    std::vector<std::string> warnings;
+    std::string jobId;
+};
+
 /// What the window needs from the engine.  Implemented by `EngineUiEngine` in the
 /// application and by a scripted fake in the tests.
 class UiEngine {
@@ -56,6 +88,14 @@ public:
     virtual Result<SplitPlan> plan(const JobRequest& request, const JobEvents& events) = 0;
     /// Execute.  Runs on the worker thread the controller starts.
     virtual Result<JobOutcome> run(const JobRequest& request, const JobEvents& events) = 0;
+    /// Merges.  `run` runs on a worker thread; these do too, so the window stays
+    /// responsive.  A window with no merge panel never calls them.
+    virtual Result<MergePlan> planMerge(const MergeJobRequest&, const JobEvents&) {
+        return Error{ErrorCode::UnsupportedOperation, "This build cannot merge files.", {}, {}};
+    }
+    virtual Result<MergeOutcome> runMerge(const MergeJobRequest&, const JobEvents&) {
+        return Error{ErrorCode::UnsupportedOperation, "This build cannot merge files.", {}, {}};
+    }
     /// Version strings recorded in the job history.  May be empty.
     virtual std::string ffmpegVersion() { return {}; }
     virtual std::string ffprobeVersion() { return {}; }
@@ -68,6 +108,8 @@ public:
     Result<ProbedSource> probe(const std::string& path) override;
     Result<SplitPlan> plan(const JobRequest& request, const JobEvents& events) override;
     Result<JobOutcome> run(const JobRequest& request, const JobEvents& events) override;
+    Result<MergePlan> planMerge(const MergeJobRequest& request, const JobEvents& events) override;
+    Result<MergeOutcome> runMerge(const MergeJobRequest& request, const JobEvents& events) override;
     std::string ffmpegVersion() override;
     std::string ffprobeVersion() override;
 
@@ -235,6 +277,39 @@ public:
     /// The encoders as the machine answered, for the panel's detail listing.
     [[nodiscard]] std::vector<EncoderProbe> hardwareEncoders() const;
 
+    // ---- merging ---------------------------------------------------------------------
+    /// Opens the merge panel and puts it in front of the split panel.  The two are
+    /// separate sessions on purpose: a merge has no size or duration limit to edit,
+    /// so sharing the constraint panel would show controls that cannot mean anything.
+    void showMerge();
+    void hideMerge();
+    [[nodiscard]] bool mergeVisible() const noexcept { return merge_.active; }
+    [[nodiscard]] MergeSession& merge() noexcept { return merge_; }
+    [[nodiscard]] const MergeSession& merge() const noexcept { return merge_; }
+
+    /// Adds a file to the merge, at the end.  Probes nothing: the merge plan needs
+    /// every input's codec parameters, and it reads them itself, so a file that
+    /// cannot be read is reported by the plan rather than here.
+    void addMergeInput(const std::string& path);
+    void removeMergeInput(std::size_t index);
+    void clearMergeInputs();
+    /// Moves an input up or down.  The order is the join order and is not cosmetic:
+    /// a concatenation plays in the order given.
+    void moveMergeInput(std::size_t index, int delta);
+    /// Plans the merge without writing.  Refuses (and says why) with fewer than two
+    /// inputs, or while a split job is running.
+    void previewMerge(const std::string& outputDirectory, const std::string& outputName);
+    /// Runs the merge on a worker thread.  Refuses (and says why) when there is no
+    /// valid plan, or a job of either kind is already running.
+    void startMerge();
+    void requestMergeCancel();
+    [[nodiscard]] bool mergeRunning() const noexcept {
+        return mergeWorker_.joinable() && !mergeWorkerFinished_.load();
+    }
+    /// Waits for a running merge to finish and joins its worker.  Used on shutdown
+    /// and by the tests.
+    void waitForMerge();
+
     // ---- job history -----------------------------------------------------------------
     void setDatabasePath(const std::string& path);
     void refreshHistory();
@@ -297,8 +372,11 @@ private:
     /// Joins the worker thread when it has already finished.  Never blocks on a
     /// running job.
     void reapFinishedWorker();
+    /// Joins a finished merge worker.  Never blocks on a running one.
+    void reapFinishedMergeWorker();
     void invalidatePreview();
     [[nodiscard]] JobRequest makeRequest() const;
+    [[nodiscard]] MergeJobRequest makeMergeRequest() const;
     [[nodiscard]] JobEvents makeEvents();
 
     UiEngine& engine_;
@@ -333,6 +411,17 @@ private:
     bool workerVerified_ = false;
     bool workerCanceled_ = false;
     std::mutex workerMutex_;
+
+    /// The merge session and its worker.  Separate from the split's because the two
+    /// cannot overlap: a user who starts a merge while a split is running has asked
+    /// for two jobs writing to the same output folder, and neither would finish
+    /// cleanly.  `mergeBusy_` is what enforces that on both sides.
+    MergeSession merge_;
+    std::mutex mergeMutex_;
+    std::thread mergeWorker_;
+    std::atomic<bool> mergeWorkerFinished_{true};
+    std::atomic<bool> mergeCancelRequested_{false};
+    std::atomic<bool> mergeBusy_{false};
 
     ResourceSample lastSample_;
     std::string databasePath_;

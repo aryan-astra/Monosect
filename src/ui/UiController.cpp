@@ -36,6 +36,19 @@ Result<JobOutcome> EngineUiEngine::run(const JobRequest& request, const JobEvent
     return runner.run(request, events);
 }
 
+Result<MergePlan> EngineUiEngine::planMerge(const MergeJobRequest& request, const JobEvents& events) {
+    // The runner is constructed per call rather than held: it owns no state that
+    // outlives a job, and the split path already does the same, so there is one
+    // answer to "what does a job need" rather than two.
+    MergeRunner runner(prober_, runner_, ffmpegPath_);
+    return runner.planOnly(request, events);
+}
+
+Result<MergeOutcome> EngineUiEngine::runMerge(const MergeJobRequest& request, const JobEvents& events) {
+    MergeRunner runner(prober_, runner_, ffmpegPath_);
+    return runner.run(request, events);
+}
+
 std::string EngineUiEngine::ffmpegVersion() {
     // Recorded in the job history.  A missing version is empty, never invented.
     return {};
@@ -907,5 +920,210 @@ JobStatusLine UiController::verificationLine() const {
                      " written part(s) verified";
     return UiModel::verificationLine(result);
 }
+
+
+
+void UiController::showMerge() {
+    merge_.active = true;
+}
+
+void UiController::hideMerge() {
+    // A running merge is not abandoned by closing the panel: the worker would keep
+    // writing with nothing watching it, and a file the user cannot see being made is
+    // worse than a panel that will not close.  A finished one closes freely.
+    if (mergeRunning()) {
+        merge_.headline = "A merge is still running. Cancel it before closing the panel.";
+        return;
+    }
+    merge_.active = false;
+}
+
+void UiController::addMergeInput(const std::string& path) {
+    if (path.empty()) {
+        return;
+    }
+    merge_.inputs.push_back(path);
+    // The plan was made for the inputs as they were, so it is now stale.  Saying so
+    // is better than leaving a summary that describes a different set of files.
+    merge_.planned = false;
+    merge_.planSummary.clear();
+}
+
+void UiController::removeMergeInput(std::size_t index) {
+    if (index >= merge_.inputs.size()) {
+        return;
+    }
+    merge_.inputs.erase(merge_.inputs.begin() + static_cast<std::ptrdiff_t>(index));
+    merge_.planned = false;
+    merge_.planSummary.clear();
+}
+
+void UiController::clearMergeInputs() {
+    merge_.inputs.clear();
+    merge_.planned = false;
+    merge_.planSummary.clear();
+    merge_.planProblem.clear();
+}
+
+void UiController::moveMergeInput(std::size_t index, int delta) {
+    const std::size_t count = merge_.inputs.size();
+    if (index >= count) {
+        return;
+    }
+    // Computed in signed arithmetic: `index + delta` with unsigned index and a
+    // negative delta wraps, which would move an input from the top of the list to
+    // the bottom instead of doing nothing.
+    const long target = static_cast<long>(index) + delta;
+    if (target < 0 || target >= static_cast<long>(count)) {
+        return;
+    }
+    const auto to = static_cast<std::size_t>(target);
+    std::swap(merge_.inputs[index], merge_.inputs[to]);
+    // The order is the join order, so it is part of what the plan describes.
+    merge_.planned = false;
+    merge_.planSummary.clear();
+}
+
+void UiController::previewMerge(const std::string& outputDirectory, const std::string& outputName) {
+    merge_.outputDirectory = outputDirectory;
+    merge_.outputName = outputName;
+    merge_.planned = false;
+    merge_.planSummary.clear();
+    merge_.planProblem.clear();
+
+    if (merge_.inputs.size() < 2) {
+        merge_.planProblem = "A merge needs at least two files.";
+        return;
+    }
+    if (jobRunning() || mergeRunning()) {
+        merge_.planProblem = "Another job is running. Wait for it to finish.";
+        return;
+    }
+    if (outputDirectory.empty()) {
+        merge_.planProblem = "Choose the folder the merged file is written to.";
+        return;
+    }
+
+    MergeJobRequest request = makeMergeRequest();
+    const JobEvents events = makeEvents();
+    const Result<MergePlan> plan = engine_.planMerge(request, events);
+    if (!plan.has_value()) {
+        // The refusal is shown as the plan's own problem rather than thrown away:
+        // "these two files have different codecs" is the answer the user needs.
+        merge_.planProblem = plan.error().toString();
+        return;
+    }
+    merge_.planned = true;
+    merge_.planSummary = plan.value().describe();
+    for (const std::string& warning : plan.value().warnings) {
+        merge_.warnings.push_back(warning);
+    }
+}
+
+MergeJobRequest UiController::makeMergeRequest() const {
+    MergeJobRequest request;
+    request.inputs = merge_.inputs;
+    request.outputDirectory = merge_.outputDirectory;
+    request.outputFileName = merge_.outputName;
+    request.overwriteExisting = false;
+    request.lowPriority = lowPriority_;
+    request.threads = ffmpegThreads_;
+    request.databasePath = databasePath_;
+    request.recordHistory = true;
+    request.jobTag = "merge";
+#ifdef MONOSECT_VERSION_STR
+    request.appVersion = MONOSECT_VERSION_STR;
+#else
+    request.appVersion = "0.0.0";
+#endif
+    request.ffmpegVersion = engine_.ffmpegVersion();
+    request.ffprobeVersion = engine_.ffprobeVersion();
+    return request;
+}
+
+void UiController::startMerge() {
+    if (mergeRunning()) {
+        return;
+    }
+    if (!merge_.planned) {
+        merge_.message = "Preview the merge before starting it.";
+        return;
+    }
+    // One job at a time, in either direction.  Two jobs writing into the same output
+    // folder would collide on names and leave both job records claiming work the
+    // other overwrote.
+    if (jobRunning()) {
+        merge_.message = "A split job is running. Wait for it to finish.";
+        return;
+    }
+
+    mergeCancelRequested_ = false;
+    mergeWorkerFinished_ = false;
+    mergeBusy_ = true;
+    merge_.running = true;
+    merge_.succeeded = false;
+    merge_.verified = false;
+    merge_.findings.clear();
+    merge_.warnings.clear();
+    merge_.message.clear();
+    merge_.headline = "Joining " + std::to_string(merge_.inputs.size()) + " files...";
+    merge_.fileSizeBytes = 0;
+    merge_.durationKnown = false;
+
+    const MergeJobRequest request = makeMergeRequest();
+    mergeWorker_ = std::thread([this, request]() {
+        JobEvents events = makeEvents();
+        events.shouldCancel = [this] { return mergeCancelRequested_.load(); };
+        const Result<MergeOutcome> result = engine_.runMerge(request, events);
+        {
+            std::lock_guard<std::mutex> lock(mergeMutex_);
+            if (result.has_value()) {
+                const MergeOutcome& outcome = result.value();
+                merge_.succeeded = outcome.succeeded && !outcome.canceled;
+                merge_.canceled = outcome.canceled;
+                merge_.message = outcome.message;
+                merge_.path = outcome.path;
+                merge_.fileSizeBytes = outcome.fileSizeBytes;
+                merge_.duration = outcome.duration;
+                merge_.durationKnown = outcome.durationMeasured;
+                merge_.verified = outcome.verified;
+                merge_.findings = outcome.findings;
+                merge_.warnings = outcome.warnings;
+                merge_.jobId = outcome.jobId;
+            } else {
+                merge_.succeeded = false;
+                merge_.message = result.error().toString();
+            }
+        }
+        merge_.running = false;
+        mergeBusy_ = false;
+        mergeWorkerFinished_ = true;
+    });
+}
+
+void UiController::waitForMerge() {
+    // Joins a finished merge worker.  Never blocks on one that is still running,
+    // which is the same rule the split worker follows: a test and a shutdown path
+    // both need "wait until it is done" without turning it into "wait forever".
+    reapFinishedMergeWorker();
+    if (mergeWorker_.joinable()) {
+        mergeWorker_.join();
+    }
+}
+
+void UiController::reapFinishedMergeWorker() {
+    if (mergeWorker_.joinable() && mergeWorkerFinished_.load()) {
+        mergeWorker_.join();
+    }
+}
+
+void UiController::requestMergeCancel() {
+    if (!mergeRunning()) {
+        return;
+    }
+    mergeCancelRequested_ = true;
+    merge_.headline = "Cancelling...";
+}
+
 
 } // namespace monosect::core
