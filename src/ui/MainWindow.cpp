@@ -5,6 +5,7 @@
 #include "core/Utf8Path.hpp"
 #include "engine/FFmpegBootstrap.hpp"
 #include "engine/ProcessRunners.hpp"
+#include "engine/WatchFolder.hpp"
 #include "ui/Branding.hpp"
 #include "ui/UiController.hpp"
 
@@ -390,6 +391,8 @@ private:
         prober_ = std::make_unique<FFprobeService>(windowsProcessRunner(), ffprobePath_);
         engine_ = std::make_unique<EngineUiEngine>(*prober_, windowsProcessRunner(), ffmpegPath_);
         hardware_ = std::make_unique<BackgroundHardwareProbe>(windowsProcessRunner(), ffmpegPath_);
+        watcher_ = std::make_unique<WatchFolder>();
+        watchSource_ = std::make_unique<EngineWatchFolder>(*watcher_, watchQueueMutex_, watchedFiles_);
         controller_ = std::make_unique<UiController>(*engine_, hardware_.get());
         // Started once the window exists, not here: the probe runs real FFmpeg
         // processes - one `ffmpeg -encoders` plus one encode per listed candidate -
@@ -659,6 +662,7 @@ private:
     void drawFirstRunPanel() {
         createControllerIfReady();
         if (controller_) {
+            drainWatchedFiles();
             return;
         }
         ImGui::SeparatorText("First run");
@@ -1008,7 +1012,61 @@ private:
         }
     }
 
-    /// Runs HardwareCapabilityProbe on a worker thread and publishes the answer.
+    /// Starts watching a folder and feeds whatever it finds into the normal pipeline.
+///
+/// The point of the abstraction is that the folder watcher is platform code with
+/// real Win32 in it, while the window must be testable.  The application implements
+/// this with engine/WatchFolder.hpp, which already handles the two things that make
+/// this hard: a notification buffer that can overflow (so a periodic rescan covers
+/// what was missed) and a synchronous system call that would otherwise hang
+/// shutdown.  Neither the controller nor this file knows how any of that works.
+class WatchFolderSource {
+public:
+    virtual ~WatchFolderSource() = default;
+    /// Starts watching.  Returns a message saying why it could not, or empty on
+    /// success.  Safe to call while already watching: the previous watch is
+    /// replaced.
+    [[nodiscard]] virtual std::string startWatch(const std::string& folder, double settlingSeconds) = 0;
+    virtual void stopWatch() = 0;
+    [[nodiscard]] virtual bool watching() const = 0;
+    /// Files seen and not yet accepted, each with the reason it is waiting.  This
+    /// is what makes the watcher explainable: a user who asks why their file has
+    /// not been picked up gets the actual reason, not silence.
+    [[nodiscard]] virtual std::vector<std::pair<std::string, std::string>> pending() const = 0;
+};
+
+/// Drives engine/WatchFolder for the window.
+///
+/// The callback runs on the watcher's thread, so it does the least possible: push
+/// the path and return.  Probing or running a job there would block the watcher
+/// from noticing the next arrival for as long as the job takes, which is exactly
+/// the case a watch folder exists to handle - a folder being filled faster than
+/// the work can be done.  The UI thread drains the queue each frame, which also
+/// means a burst of arrivals stays visible instead of being silently absorbed.
+class EngineWatchFolder final : public WatchFolderSource {
+public:
+    EngineWatchFolder(WatchFolder& watcher, std::mutex& queueMutex, std::vector<std::string>& accepted)
+        : watcher_(watcher), queueMutex_(queueMutex), accepted_(accepted) {}
+
+    std::string startWatch(const std::string& folder, double settlingSeconds) override {
+        watcher_.setSettlingSeconds(settlingSeconds);
+        return watcher_.start(folder, [this](const std::filesystem::path& file) {
+            std::lock_guard<std::mutex> guard(queueMutex_);
+            accepted_.push_back(utf8FromPath(file));
+        });
+    }
+
+    void stopWatch() override { watcher_.stop(); }
+    bool watching() const override { return watcher_.running(); }
+    std::vector<std::pair<std::string, std::string>> pending() const override { return watcher_.pending(); }
+
+private:
+    WatchFolder& watcher_;
+    std::mutex& queueMutex_;
+    std::vector<std::string>& accepted_;
+};
+
+/// Runs HardwareCapabilityProbe on a worker thread and publishes the answer.
 ///
 /// The probe is real work: `ffmpeg -encoders` plus one single-frame encode per
 /// listed hardware encoder, each with its own deadline.  A machine with a slow or
@@ -1075,7 +1133,127 @@ private:
     std::atomic<bool> workerFinished_{true};
 };
 
-/// What this machine can actually encode on, and why.
+/// Watch a folder and ingest whatever lands in it.
+    ///
+    /// Two things this panel is careful not to do.  It does not claim a file is
+    /// being watched before the watcher is running, and it never shows a file as
+    /// "waiting" without saying why - the readiness rules can hold a file for a
+    /// long time, and silence there reads as a broken product.
+    ///
+    /// Files are queued by the watcher thread and drained here, so a folder being
+    /// filled faster than the work can be done stays visible instead of stalling.
+    void drawWatchPanel() {
+        ImGui::TextUnformatted("Watch a folder");
+        helpMarker(HelpContent::find(HelpTopicId::WatchFolder), [this](HelpTopicId id) { controller_->showHelp(id); });
+
+        if (ImGui::Button("Choose a folder to watch...")) {
+            const std::string folder = chooseFolderDialog(L"Watch this folder for media files");
+            if (!folder.empty()) {
+                watchFolder_ = folder;
+                if (watchEnabled_) {
+                    applyWatchSettings();
+                }
+            }
+        }
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(-1.0f);
+        ImGui::InputText("##watchfolder", watchFolderBuffer_, sizeof(watchFolderBuffer_));
+        // The edit field is a char buffer because that is what ImGui wants; the
+        // watcher takes a std::string, so the conversion is explicit and happens
+        // here rather than through a cast somewhere less visible.
+        watchFolder_ = watchFolderBuffer_;
+
+        if (ImGui::Checkbox("Watch this folder and split what appears", &watchEnabled_)) {
+            applyWatchSettings();
+        }
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
+            ImGui::BeginTooltip();
+            ImGui::PushTextWrapPos(ImGui::GetFontSize() * 34.0f);
+            ImGui::TextUnformatted(
+                "Each file is added to the queue once it is finished being written. MonoSect decides that from "
+                "three independent signals - the file can be opened exclusively, its size has stopped changing, "
+                "and its first bytes are readable - so a slow copy is waited for rather than split in half.");
+            ImGui::PopTextWrapPos();
+            ImGui::EndTooltip();
+        }
+
+        if (ImGui::Checkbox("Wait longer before accepting a file", &watchSettling_)) {
+            applyWatchSettings();
+        }
+        if (watchSettling_) {
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(90.0f);
+            if (ImGui::SliderFloat("##settling", &watchSettlingSlider_, 0.5f, 30.0f, "%.1f s")) {
+                watchSettlingSeconds_ = watchSettlingSlider_;
+                applyWatchSettings();
+            }
+        }
+
+        if (!watchProblem_.empty()) {
+            ImGui::TextColored(toneColor(StatusTone::Warning), "%s", watchProblem_.c_str());
+        }
+        if (watchSource_ == nullptr || !watchSource_->watching()) {
+            if (!watchProblem_.empty() || !watchFolder_.empty()) {
+                ImGui::TextDisabled("Not watching.");
+            }
+            return;
+        }
+
+        ImGui::Text("Watching %s", watchFolder_.c_str());
+        // The pending list is the answer to "why has my file not been picked up
+        // yet", so it is shown rather than summarised away.
+        const std::vector<std::pair<std::string, std::string>> pending = watchSource_->pending();
+        if (pending.empty()) {
+            ImGui::TextDisabled("Nothing waiting.");
+        }
+        for (const auto& [name, reason] : pending) {
+            ImGui::Text("%s", name.c_str());
+            ImGui::SameLine();
+            ImGui::TextDisabled("%s", reason.c_str());
+        }
+    }
+
+    /// Starts or stops the watcher to match the panel's settings.
+    ///
+    /// Applied through one function because the settings are interdependent: turning
+    /// the folder off must stop the watch, and changing the settling interval while
+    /// watching must take effect immediately rather than at the next restart.
+    void applyWatchSettings() {
+        if (watchSource_ == nullptr) {
+            return;
+        }
+        if (!watchEnabled_ || watchFolder_[0] == '\0') {
+            watchSource_->stopWatch();
+            watchProblem_.clear();
+            return;
+        }
+        watchProblem_ = watchSource_->startWatch(watchFolder_, watchSettlingSeconds_);
+    }
+
+    /// Moves files the watcher accepted into the queue, on the UI thread.
+    ///
+    /// Called once per frame.  The swap under the lock is what keeps the watcher's
+    /// callback short: it only ever appends, and this takes the whole list at once.
+    void drainWatchedFiles() {
+        std::vector<std::string> arrived;
+        {
+            std::lock_guard<std::mutex> guard(watchQueueMutex_);
+            arrived.swap(watchedFiles_);
+        }
+        for (const std::string& path : arrived) {
+            // A job already running must not be pre-empted by a watched file: the
+            // user asked for one job, and silently starting another would leave the
+            // first one's parts in an unknown state.  The file stays queued, so it is
+            // picked up when the user starts the next one.
+            if (controller_->jobRunning()) {
+                controller_->addSource(path);
+                continue;
+            }
+            controller_->addSource(path);
+        }
+    }
+
+    /// What this machine can actually encode on, and why.
     ///
     /// The distinction this panel exists to make is between an encoder FFmpeg
     /// *lists* and one that *works*.  A static FFmpeg build lists h264_nvenc,
@@ -1169,6 +1347,9 @@ private:
         ImGui::Text("Disk write: %s", bytesPerSecondText(sample.diskWriteBytesPerSecond).c_str());
         ImGui::Text("Media written: %s", bytesPerSecondText(sample.mediaThroughputBytesPerSecond).c_str());
         ImGui::TextWrapped("%s", sample.sourceDescription.c_str());
+        ImGui::Separator();
+
+        drawWatchPanel();
         ImGui::Separator();
 
         drawHardwarePanel();
@@ -1405,6 +1586,23 @@ private:
     std::unique_ptr<EngineUiEngine> engine_;
     std::unique_ptr<UiController> controller_;
     std::unique_ptr<BackgroundHardwareProbe> hardware_;
+    std::unique_ptr<WatchFolder> watcher_;
+    std::unique_ptr<WatchFolderSource> watchSource_;
+    /// Written on the watcher's thread, read on the UI thread.
+    std::mutex watchQueueMutex_;
+    std::vector<std::string> watchedFiles_;
+    /// The watched folder as UTF-8, which is what the watcher takes.  The buffer
+    /// beside it is what ImGui edits, so the conversion is explicit rather than
+    /// implicit in a cast.
+    std::string watchFolder_;
+    bool watchEnabled_ = false;
+    bool watchSettling_ = false;
+    double watchSettlingSeconds_ = 2.0;
+    // ImGui's float slider needs a float; the watcher takes a double.  They are kept
+    // as two members rather than casting at the call site so the value the user is
+    // dragging and the value the watcher is given cannot drift apart.
+    float watchSettlingSlider_ = 2.0f;
+    std::string watchProblem_;
 
     std::jthread bootstrapThread_;
     std::atomic<bool> toolsReady_{false};
@@ -1421,6 +1619,8 @@ private:
     char sizeValueBuffer_[64] = {};
     char durationValueBuffer_[64] = {};
     char databaseBuffer_[512] = {};
+    // Long enough for MAX_PATH, which is what the folder dialog fills it with.
+    char watchFolderBuffer_[512] = {};
     char historyFilter_[64] = {};
     char helpQueryBuffer_[128] = {};
     int sizeUnitIndex_ = 1;
