@@ -380,6 +380,78 @@ Result<JobRunner::RenderResult> JobRunner::renderCopy(const SplitPlan& plan, con
     return rendered;
 }
 
+void JobRunner::describeSourceVideo(SegmentRenderRequest* render) const {
+    // A re-encoded stream has to be describable with the *source's* own parameters,
+    // not with FFmpeg's defaults, and the reason is not cosmetic: the smart cut
+    // concatenates a re-encoded head onto a copied body, and the verifier compares
+    // the finished part's signature against the source's.  A default x264 encode of
+    // a Constrained Baseline source comes out as High, so the part is rejected -
+    //
+    //   stream 0 changed profile from Constrained Baseline to High
+    //
+    // - and every smart cut and every full re-encode of a baseline source fails.  The
+    // parameters have to be copied across before the encoder is invoked.
+    const StreamModel* video = source_.container.videoStream();
+    if (video == nullptr) {
+        return;
+    }
+    if (!video->pixelFormat.empty()) {
+        render->pixelFormat = video->pixelFormat;
+    }
+    if (!video->profile.empty()) {
+        render->profile = video->profile;
+    }
+    // ffprobe spells profiles in words ("Constrained Baseline", "High"); the
+    // encoders want short names.  A profile the encoder does not recognise is worse
+    // than none - it fails the encode outright - so only the known names are mapped
+    // and anything else is dropped, which lets the encoder choose.
+    //
+    // "Constrained Baseline" maps to plain "baseline" on purpose.  Measured on this
+    // machine with libx264:
+    //
+    //   -profile:v baseline              -> the result reports Constrained Baseline
+    //   -profile:v constrained_baseline  -> invalid profile, encode fails with -22
+    //   -profile:v cavlc                 -> invalid profile
+    //
+    // so "baseline" is both the accepted spelling and the one that reproduces the
+    // source, because x264's baseline profile omits the CABAC entropy coding and
+    // B-frames that separate Constrained Baseline from Baseline.
+    if (!render->profile.empty()) {
+        static const std::vector<std::pair<std::string, std::string>> known{
+            {"Constrained Baseline", "baseline"},
+            {"Baseline", "baseline"},
+            {"Main", "main"},
+            {"High", "high"},
+            {"High 10", "high10"},
+            {"High 10 Intra", "high10"},
+            {"High 4:2:2", "high422"},
+            {"High 4:2:2 Intra", "high422"},
+            {"High 4:4:4 Predictive", "high444"},
+            {"High 4:4:4", "high444"},
+            {"High 4:4:4 Intra", "high444"},
+        };
+        bool recognised = false;
+        for (const auto& entry : known) {
+            if (render->profile == entry.first) {
+                render->profile = entry.second;
+                recognised = true;
+                break;
+            }
+        }
+        if (!recognised) {
+            render->profile.clear();
+        }
+    }
+    // The frame rate is the base rate rather than the average: a variable-frame-rate
+    // source's average depends on how long the file happens to be, so pinning the
+    // encoder to it would re-time the source's frames.
+    const Rational& frameRate = video->baseFrameRate.isValid() ? video->baseFrameRate : video->averageFrameRate;
+    if (frameRate.isValid() && frameRate.numerator > 0 && frameRate.denominator > 0) {
+        render->frameRateNumerator = frameRate.numerator;
+        render->frameRateDenominator = frameRate.denominator;
+    }
+}
+
 Result<JobRunner::RenderResult> JobRunner::renderSmartCut(const SplitPlan& plan, const SegmentPlan& segment,
                                                           const std::filesystem::path& temporaryPath,
                                                           const JobRequest& request, const JobEvents& events) {
@@ -403,6 +475,7 @@ Result<JobRunner::RenderResult> JobRunner::renderSmartCut(const SplitPlan& plan,
     headRender.threads = request.ffmpegThreads;
     headRender.lowPriority = request.lowPriority;
     headRender.copyMetadata = false;
+    describeSourceVideo(&headRender);
     for (std::size_t i = 0; i < segment.reencodedStreamIndexes.size(); ++i) {
         SegmentRenderRequest::ReencodedStream stream;
         stream.index = segment.reencodedStreamIndexes[i];
@@ -519,6 +592,7 @@ Result<JobRunner::RenderResult> JobRunner::renderReencode(const SplitPlan& plan,
     render.threads = request.ffmpegThreads;
     render.lowPriority = request.lowPriority;
     render.startIsKeyframe = false;
+    describeSourceVideo(&render);
     for (std::size_t i = 0; i < segment.reencodedStreamIndexes.size(); ++i) {
         SegmentRenderRequest::ReencodedStream stream;
         stream.index = segment.reencodedStreamIndexes[i];

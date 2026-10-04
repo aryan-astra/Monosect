@@ -16,6 +16,7 @@
 #include "core/JobState.hpp"
 #include "core/SplitPlanner.hpp"
 #include "engine/FFprobeService.hpp"
+#include "engine/FfmpegArgs.hpp"
 #include "engine/OutputCommitter.hpp"
 #include "engine/ProcessRunner.hpp"
 #include "engine/VerificationEngine.hpp"
@@ -138,6 +139,19 @@ private:
 
     /// Packet counts of one range per stream, taken from the probed index.
     [[nodiscard]] std::int64_t packetCountInRange(int streamIndex, Rational start, Rational end) const;
+
+    /// Fills a render request with the source video stream's own pixel format,
+    /// H.264 profile and frame rate, so a re-encoded stream is described the way the
+    /// source is rather than the way FFmpeg's encoder defaults are.
+    ///
+    /// Without this, encoding a Constrained Baseline source with default x264
+    /// settings produces a High profile, the finished part no longer matches the
+    /// source's signature, and the verifier discards it - so every smart cut and
+    /// every full re-encode of a baseline source failed.  Profiles are translated
+    /// from ffprobe's spelling ("Constrained Baseline") to the encoder's
+    /// ("constrained_baseline"); a profile the encoder would not recognise is
+    /// dropped rather than passed on, since an unknown value is worse than none.
+    void describeSourceVideo(SegmentRenderRequest* render) const;
 
     [[nodiscard]] Result<RenderResult> renderCopy(const SplitPlan& plan, const SegmentPlan& segment,
                                                   const std::filesystem::path& temporaryPath,
