@@ -183,6 +183,13 @@ def generate(name: str, target: Path, work: Path, fixtures_dir: Path) -> None:
                 "-f", "lavfi", "-i", "testsrc2=size=160x120:rate=30:duration=4",
                 "-filter_complex", "[0:v][1:v]concat=n=2:v=1:a=0[v]", "-map", "[v]",
                 "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
+                # A keyframe every second.  Without this the fixture has exactly
+                # ONE keyframe: libx264's default GOP is 250 frames, longer than the
+                # whole clip, so there is nowhere to cut and the fixture tests "a file
+                # with no boundaries" rather than variable frame rate.  With -g 24 the
+                # two halves still have different frame intervals - which is what makes
+                # it VFR - and the planner has keyframes to work from.
+                "-g", "24",
                 "-fps_mode", "vfr", "-an", str(target),
             ]
         )
