@@ -221,9 +221,24 @@ Result<std::filesystem::path> JobRunner::copyRange(const SplitPlan& plan, const 
         // ffmpeg 7.0.2, `-i in -ss 2` on an H.264 stream skipped twice the seek
         // distance and kept the timestamps of the requested position, which is a
         // silent content shift.  See FfmpegArgs.hpp.
+        //
+        // Every start is converted to FFmpeg's timeline first.  The plan works in
+        // absolute presentation time - what ffprobe reports as pts_time - while
+        // `-ss` is measured from the container's start_time, and the two differ
+        // whenever a file does not begin at zero.  Measured on this machine with
+        // the MPEG-TS fixture, whose start_time is 1.400000:
+        //
+        //   part 3 starts at absolute 5.423222, the last video packet is at 7.383
+        //   -ss 5.423222  (absolute, as passed before)  -> 0 packets, the part is empty
+        //   -ss 4.023222  (5.423222 - 1.4)             -> 50 packets, correct
+        //
+        // so passing the absolute time silently loses the tail of the file rather
+        // than failing loudly.  Fixtures with start_time 0 - most files - are
+        // unaffected, which is why this went unnoticed.
+        const Rational seekStart = seekTime(start);
         if (trim.kind == StreamKind::Video && startIsKeyframe) {
             trimRequest.seekMode = StreamTrimRequest::SeekMode::InputKeyframe;
-            trimRequest.start = start;
+            trimRequest.start = seekStart;
         } else if (trim.kind == StreamKind::Video) {
             return Error{ErrorCode::SmartCutUnavailable,
                          "A video stream can only be copied when the part starts at one of its keyframes.",
@@ -231,7 +246,7 @@ Result<std::filesystem::path> JobRunner::copyRange(const SplitPlan& plan, const 
                          "Use a mode that can re-encode the boundary, or choose keyframe-aligned copying."};
         } else {
             trimRequest.seekMode = StreamTrimRequest::SeekMode::OutputPrecise;
-            trimRequest.start = start;
+            trimRequest.start = seekStart;
         }
 
         ProcessSpec spec;
@@ -380,6 +395,20 @@ Result<JobRunner::RenderResult> JobRunner::renderCopy(const SplitPlan& plan, con
     return rendered;
 }
 
+Rational JobRunner::seekTime(Rational absoluteSeconds) const {
+    // FFmpeg's -ss and -to are measured from the container's start_time; the plan
+    // works in the absolute presentation timestamps ffprobe reports.  Where they
+    // differ - a transport stream that begins at 1.4 s, a file whose first frame is
+    // at 5 s, audio that starts before zero - the two timelines have to be bridged
+    // here or the seek lands somewhere else entirely.  See copyRange, where the
+    // measurement is recorded.
+    if (!sourceValid_ || !source_.container.startTime.isValid() ||
+        source_.container.startTime.denominator == 0) {
+        return absoluteSeconds;
+    }
+    return subtractRational(absoluteSeconds, source_.container.startTime).value_or(absoluteSeconds);
+}
+
 void JobRunner::describeSourceVideo(SegmentRenderRequest* render) const {
     // A re-encoded stream has to be describable with the *source's* own parameters,
     // not with FFmpeg's defaults, and the reason is not cosmetic: the smart cut
@@ -469,7 +498,7 @@ Result<JobRunner::RenderResult> JobRunner::renderSmartCut(const SplitPlan& plan,
     SegmentRenderRequest headRender;
     headRender.input = plan.sourcePath;
     headRender.output = headPath.string();
-    headRender.start = head.startSeconds;
+    headRender.start = seekTime(head.startSeconds);
     headRender.end = head.endSeconds;
     headRender.containerFormat = containerNameForExtension(plan.outputExtension);
     headRender.threads = request.ffmpegThreads;
@@ -523,7 +552,7 @@ Result<JobRunner::RenderResult> JobRunner::renderSmartCut(const SplitPlan& plan,
     SegmentRenderRequest bodyRender;
     bodyRender.input = plan.sourcePath;
     bodyRender.output = bodyPath.string();
-    bodyRender.start = head.endSeconds;
+    bodyRender.start = seekTime(head.endSeconds);
     bodyRender.end = segment.endSeconds;
     bodyRender.copiedStreams = segment.copiedStreamIndexes;
     bodyRender.containerFormat = containerNameForExtension(plan.outputExtension);
@@ -585,7 +614,7 @@ Result<JobRunner::RenderResult> JobRunner::renderReencode(const SplitPlan& plan,
     SegmentRenderRequest render;
     render.input = plan.sourcePath;
     render.output = temporaryPath.string();
-    render.start = segment.startSeconds;
+    render.start = seekTime(segment.startSeconds);
     render.end = segment.endSeconds;
     render.copiedStreams = segment.copiedStreamIndexes;
     render.containerFormat = containerNameForExtension(plan.outputExtension);

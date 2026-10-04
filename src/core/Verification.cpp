@@ -236,27 +236,51 @@ VerificationResult evaluateSequence(const SplitPlan& plan, const std::vector<Seg
             }
         }
     }
-    if (plan.sourceDurationKnown && plan.sourceDurationExact) {
-        const Rational difference = subtractRational(total, plan.sourceDuration).value_or(Rational{0, 1});
+    // The expectation is the span of media the plan set out to cover - the first
+    // segment's start to the last segment's end - and not the container's own
+    // duration.  The two are the same number only when a file starts at zero, and for
+    // a file that does not they are not comparable at all.  Measured on this machine
+    // with a fixture whose first frame is at 5 s: the container reports duration
+    // 11.000 because that is its *end timestamp*, the parts cover 5.000-11.000 (six
+    // seconds of media, all 150 packets), and comparing their total duration against
+    // 11.000 reported five seconds of the source as missing - on a split that had lost
+    // nothing.  Reporting a defect that is not there is as wrong as hiding one.
+    Rational expectedCoverage{0, 1};
+    bool coverageKnown = false;
+    if (!plan.segments.empty()) {
+        const Result<Rational> span =
+            subtractRational(plan.segments.back().endSeconds, plan.segments.front().startSeconds);
+        if (span.has_value() && compareRational(span.value(), Rational{0, 1}) > 0) {
+            expectedCoverage = span.value();
+            coverageKnown = true;
+        }
+    }
+    if (!coverageKnown) {
+        coverageKnown = plan.sourceDurationKnown && plan.sourceDurationExact;
+        expectedCoverage = plan.sourceDuration;
+    }
+
+    if (coverageKnown) {
+        const Rational difference = subtractRational(total, expectedCoverage).value_or(Rational{0, 1});
         const bool tooShort = compareRational(difference, Rational{-policy.coverageTolerance.numerator,
-                                                                  policy.coverageTolerance.denominator}) < 0;
+                                                                    policy.coverageTolerance.denominator}) < 0;
         const bool tooLong = compareRational(difference, policy.coverageTolerance) > 0;
         if (tooShort) {
             result.add(FindingSeverity::Error, "total_shorter_than_source",
-                       "The parts add up to " + formatDuration(total) + " but the source is " +
-                           formatDuration(plan.sourceDuration) + "; about " +
+                       "The parts add up to " + formatDuration(total) + " but the source covers " +
+                           formatDuration(expectedCoverage) + "; about " +
                            formatDuration(Rational{-difference.numerator, difference.denominator}) +
                            " of the source is missing.",
                        "the job is not reported as a success; re-run it or split the missing range again");
         } else if (tooLong) {
             result.add(FindingSeverity::Warning, "total_longer_than_source",
-                       "The parts add up to " + formatDuration(total) + " but the source is " +
-                           formatDuration(plan.sourceDuration) + "; " + formatDuration(difference) +
+                       "The parts add up to " + formatDuration(total) + " but the source covers " +
+                           formatDuration(expectedCoverage) + "; " + formatDuration(difference) +
                            " is repeated at the boundaries.",
                        "this comes from keyframe alignment and is reported, not hidden");
         } else {
             result.add(FindingSeverity::Info, "total_matches_source",
-                       "the parts add up to " + formatDuration(total) + ", which matches the source duration",
+                       "the parts add up to " + formatDuration(total) + ", which covers the source",
                        {});
         }
     } else {

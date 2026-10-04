@@ -153,6 +153,17 @@ private:
     /// dropped rather than passed on, since an unknown value is worse than none.
     void describeSourceVideo(SegmentRenderRequest* render) const;
 
+    /// Converts an absolute presentation time (what ffprobe reports and what the
+    /// plan works in) into FFmpeg's own timeline, which measures `-ss` and `-to`
+    /// from the container's start_time.
+    ///
+    /// The two timelines coincide for most files - a start_time of zero - which is
+    /// why this is not obvious until a transport stream or a file that starts at
+    /// 5 s is split.  Passing an absolute time where a relative one is expected
+    /// does not fail: the seek lands late, the part comes out short or empty, and
+    /// the file's tail is silently lost.
+    [[nodiscard]] Rational seekTime(Rational absoluteSeconds) const;
+
     [[nodiscard]] Result<RenderResult> renderCopy(const SplitPlan& plan, const SegmentPlan& segment,
                                                   const std::filesystem::path& temporaryPath,
                                                   const JobRequest& request, const JobEvents& events);
