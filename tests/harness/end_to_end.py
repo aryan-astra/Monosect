@@ -755,7 +755,22 @@ def main(argv: list[str]) -> int:
     section_history(cli, main_fixture, fixtures, work)
     section_cancel(cli, fixtures, work)
 
-    print(f"\n{REPORT.passed} passed, {REPORT.failed} failed, {REPORT.skipped} skipped")
+    verdict = f"{REPORT.passed} passed, {REPORT.failed} failed, {REPORT.skipped} skipped"
+    print(f"\n{verdict}")
+    # The verdict is also written into the work directory.  A CI log is the first
+    # thing to be truncated and the last thing anybody reads, and a run whose only
+    # record is "exit 1" sends the next person hunting through a thousand lines of
+    # FFmpeg output.  The file names the failures directly.
+    try:
+        summary = work / "e2e.log"
+        summary.write_text(
+            f"{verdict}\n\n"
+            + "\n".join(f"failed: {name}" for name in REPORT.failed_names)
+            + ("\n" if REPORT.failed_names else ""),
+            encoding="utf-8",
+        )
+    except OSError as error:   # a full disk must not turn a passing run into a failing one
+        print(f"could not write the summary ({error}); the verdict above still stands", file=sys.stderr)
     if REPORT.failed:
         for name in REPORT.failed_names:
             print(f"  failed: {name}")
