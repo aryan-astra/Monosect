@@ -858,33 +858,62 @@ private:
         ImGui::Spacing();
     }
 
-    /// A drag handle between two columns, drawn as a real widget so it can be hit.
+    /// A drag handle between two column boundaries.
     ///
-    /// Returns the horizontal movement the user has made since the previous frame
-    /// while the handle is held, or 0.  A fixed one-pixel line would be pixel-perfect
-    /// to grab; a 7 px band is grabbable, and the cursor changes so it reads as a
-    /// handle before the user tries.
-    static float drawColumnSplitter(const char* id) {
+    /// `width` is the column this handle's left edge controls; it is modified in place
+    /// while the handle is dragged and clamped by the caller afterwards.
+    ///
+    /// Two decisions worth stating.  First, the handle is *drawn*: there is a dimmed
+    /// line in the gutter that brightens under the cursor and turns the cursor into a
+    /// resize cursor.  A divider you cannot see is a divider you never find, and there
+    /// was nothing at all on screen to say these columns could move.
+    ///
+    /// Second, the drag is tracked from the global mouse state rather than from the
+    /// item's own active/id-considered state.  Grabbing on press anywhere in the
+    /// gutter and then following the cursor until release is both what a divider is
+    /// expected to do - the drag does not stop the instant the cursor leaves a 7 px
+    /// strip - and independent of the per-item activation rules, which is what the
+    /// previous item-active version depended on and which did not fire here.
+    void dragColumnSplitter(const char* id, float& width) {
         ImGui::SameLine(0.0f, 0.0f);
-        ImGui::InvisibleButton(id, ImVec2(kSplitterWidth, ImGui::GetContentRegionAvail().y));
-        if (ImGui::IsItemHovered()) {
+        const float height = ImGui::GetContentRegionAvail().y;
+        ImGui::InvisibleButton(id, ImVec2(kSplitterWidth, height), ImGuiButtonFlags_MouseButtonLeft);
+        const bool hovered = ImGui::IsItemHovered();
+        if (hovered) {
             ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
         }
-        if (!ImGui::IsItemActive() || !ImGui::IsMouseDragging(ImGuiMouseButton_Left, 0.0f)) {
-            return 0.0f;
-        }
-        return ImGui::GetIO().MouseDelta.x;
-    }
 
-    /// Resizes a column while its splitter is dragged, and clamps it.
-    ///
-    /// `maximum` is what keeps the other columns usable; it is passed in rather than
-    /// assumed so the two columns can have different ceilings.
-    static void applySplitterDrag(float& width, float movement, float minimum, float maximum) {
-        if (movement == 0.0f) {
+        // The grip, drawn last so it is not covered by anything the sibling columns
+        // emit afterwards.
+        const ImVec2 min = ImGui::GetItemRectMin();
+        const ImVec2 max = ImGui::GetItemRectMax();
+        const bool active = splitterDragging_ || hovered;
+        const ImU32 colour = ImGui::GetColorU32(active ? ImVec4(0.55f, 0.62f, 0.72f, 1.0f)
+                                                        : ImVec4(0.24f, 0.26f, 0.30f, 1.0f));
+        const float centre = (min.x + max.x) * 0.5f;
+        const float thickness = active ? 3.0f : 1.0f;
+        const float top = min.y + ImGui::GetTextLineHeight();
+        const float bottom = max.y - ImGui::GetTextLineHeight();
+        ImGui::GetWindowDrawList()->AddRectFilled(ImVec2(centre - thickness * 0.5f, top),
+                                                  ImVec2(centre + thickness * 0.5f, bottom), colour);
+
+        if (!splitterDragging_) {
+            // IsMouseClicked is the press transition in this ImGui version - "went from
+            // !Down to Down" - which is what starts a press-and-hold drag.  (There is
+            // no IsMousePressed in this version; on older ones IsMouseClicked means a
+            // completed click and the start of a drag needs the transition test.)
+            if (hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+                splitterDragging_ = true;
+                splitterStartX_ = ImGui::GetIO().MousePos.x;
+                splitterStartWidth_ = width;
+            }
             return;
         }
-        width = std::clamp(width + movement, minimum, std::max(minimum, maximum));
+        if (!ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+            splitterDragging_ = false;
+            return;
+        }
+        width = splitterStartWidth_ + (ImGui::GetIO().MousePos.x - splitterStartX_);
     }
 
     void drawDockspace() {
@@ -938,8 +967,11 @@ private:
         }
         ImGui::EndChild();
 
-        applySplitterDrag(leftWidth_, drawColumnSplitter("##splitterLeft"), kMinLeftWidth,
-                          roomForColumns * 0.6f);
+        // The left column was drawn at the width this frame resolved, which is the
+        // width before this frame's drag - the drag therefore takes effect on the next
+        // frame.  A one-frame lag on a 60 Hz redraw is not perceptible, and resolving
+        // widths before drawing is what keeps a negative middle column impossible.
+        dragColumnSplitter("##splitterLeft", leftWidth_);
 
         // SameLine(0, 0) and not SameLine(): the default carries ItemSpacing.x (8 px),
         // which on top of the 7 px handle made the row 8 px wider than the width the
@@ -960,10 +992,9 @@ private:
         ImGui::EndChild();
 
         if (rightColumn) {
-            // The right column is pinned to the window edge, so dragging its splitter
-            // right makes it narrower.
-            applySplitterDrag(rightWidth_, -drawColumnSplitter("##splitterRight"), kMinRightWidth,
-                              roomForColumns * 0.6f);
+            // The right column is pinned to the window edge, so the handle that
+            // controls its left edge grows the column as it moves left.
+            dragColumnSplitter("##splitterRight", rightWidth_);
 
             ImGui::SameLine(0.0f, 0.0f);
             ImGui::BeginChild("##right", ImVec2(rightWidth_, 0.0f), ImGuiChildFlags_Border);
@@ -1975,6 +2006,27 @@ private:
         }
     }
 
+    /// "2026-10-04T09:18:32" -> "10-04 09:18".
+    ///
+    /// The stored form is a full ISO timestamp and the right-hand column has four of
+    /// them competing for width, where every character spent on the year and the
+    /// seconds is a character not spent on the filename - which is the column the user
+    /// is actually reading.  A job history is a list of recent jobs, so the year is
+    /// the part that carries the least; it stays in the tooltip and in the record.
+    /// Anything that does not match the ISO shape is passed through untouched rather
+    /// than mangled.
+    static std::string compactTimestamp(const std::string& stamp) {
+        if (stamp.size() < 16 || stamp[4] != '-' || stamp[7] != '-' || stamp[10] != 'T') {
+            return stamp;
+        }
+        std::string out;
+        out.reserve(11);
+        out.append(stamp, 5, 5);   // MM-DD
+        out.push_back(' ');
+        out.append(stamp, 11, 5);  // HH:MM
+        return out;
+    }
+
     void drawHistoryPanel() {
         ImGui::SeparatorText("Job history");
         if (!controller_) {
@@ -2010,14 +2062,19 @@ private:
         // scrolls as a whole is the thing that was already annoying.
         const float footerHeight = ImGui::GetTextLineHeightWithSpacing();
         const float tableHeight = std::max(120.0f, ImGui::GetContentRegionAvail().y - footerHeight);
+        // Weights are chosen so each column is wide enough for its own content at the
+        // column's default width, because a stretch layout distributes slack
+        // proportionally and will happily leave a column one character short:
+        // "10-04 13:18" needs about 72 px, "Completed" about 70, the part count about
+        // 46, and the filename - the column being read - takes everything left over.
         if (ImGui::BeginTable("##history", 4,
                               ImGuiTableFlags_RowBg | ImGuiTableFlags_Borders | ImGuiTableFlags_ScrollY |
                                   ImGuiTableFlags_SizingStretchProp,
                               ImVec2(0.0f, tableHeight))) {
-            ImGui::TableSetupColumn("finished", ImGuiTableColumnFlags_WidthStretch, 1.6f);
-            ImGui::TableSetupColumn("source", ImGuiTableColumnFlags_WidthStretch, 3.2f);
-            ImGui::TableSetupColumn("parts", ImGuiTableColumnFlags_WidthStretch, 0.8f);
-            ImGui::TableSetupColumn("state", ImGuiTableColumnFlags_WidthStretch, 1.2f);
+            ImGui::TableSetupColumn("finished", ImGuiTableColumnFlags_WidthStretch, 1.4f);
+            ImGui::TableSetupColumn("source", ImGuiTableColumnFlags_WidthStretch, 3.6f);
+            ImGui::TableSetupColumn("parts", ImGuiTableColumnFlags_WidthStretch, 0.9f);
+            ImGui::TableSetupColumn("state", ImGuiTableColumnFlags_WidthStretch, 1.4f);
             ImGui::TableHeadersRow();
             for (const JobRecord& record : controller_->history()) {
                 if (!filter.empty()) {
@@ -2029,7 +2086,11 @@ private:
                 }
                 ImGui::TableNextRow();
                 ImGui::TableSetColumnIndex(0);
-                ImGui::TextUnformatted(record.finishedAt.c_str());
+                const std::string when = compactTimestamp(record.finishedAt);
+                ImGui::TextUnformatted(when.c_str());
+                if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
+                    ImGui::SetTooltip("%s", record.finishedAt.c_str());
+                }
                 ImGui::TableSetColumnIndex(1);
                 // Wide char -> path -> narrow char on a UTF-8 std::string: the path
                 // constructor decodes those bytes as the ANSI code page, so a filename
@@ -2235,6 +2296,13 @@ private:
     static constexpr float kMinMiddleWidth = 180.0f;
     float leftWidth_ = 420.0f;
     float rightWidth_ = 380.0f;
+
+    // Drag state for the two handles.  Tracked per window rather than per handle
+    // because only one handle can be held at a time, and because the drag has to
+    // survive the cursor leaving the gutter between the press and the release.
+    bool splitterDragging_ = false;
+    float splitterStartX_ = 0.0f;
+    float splitterStartWidth_ = 0.0f;
     bool imguiReady_ = false;
     std::string version_;
     std::filesystem::path executableDirectory_;
