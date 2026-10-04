@@ -105,30 +105,36 @@ ctest --test-dir build --output-on-failure
 * `monosect-tests` — the rules that must never regress: exact byte arithmetic,
   rational time arithmetic, packet indexing, planning against a packet index,
   size and duration limits, naming, verification and the UI's wording.
-* `end-to-end` (`tests/harness/end_to_end.sh`) — drives the real FFmpeg tools
+* `end-to-end` (`tests/harness/end_to_end.py`) — drives the real FFmpeg tools
   through `monosect-cli` and checks the written files with an **independent**
   Python checker (`tests/harness/check_parts.py`) that parses the parts rather
-  than trusting MonoSect's own report.
+  than trusting MonoSect's own report. It is pure Python, so the same suite runs
+  on Windows, macOS and Linux, against a digest-checked pinned FFmpeg.
 
-Checks that need Windows (the GUI, the job-object process runner, the pinned
-toolchain download, NVML/PDH telemetry, hardware encoders) are listed in
-[`docs/RESEARCH.md`](docs/RESEARCH.md) and in the release notes.
+Checks that need Windows — the GUI, the job-object process runner, the pinned
+toolchain download, DXGI and PDH telemetry, and the hardware encoder probe —
+cannot be covered by the portable suites and are exercised by hand on a Windows
+machine.
 
 ## Repository layout
 
 ```
 src/core/      platform-neutral rules: bytes, rational time, media model,
-               packet index, constraints, planning, verification, job state
+               packet index, constraints, planning, verification, job state,
+               UTF-8 path handling
 src/engine/    process runners (POSIX/Windows), ffprobe front end, argument
-               construction, output commit, job runner, merge, tool bootstrap
+               construction, output commit, job runner, merge, folder watch,
+               tool bootstrap
 src/ui/        UiController (tested state machine), UiModel (all wording),
-               HelpContent, MainWindow (Windows drawing only)
+               HelpContent, Branding (window icon and the mark), MainWindow
+               (Windows drawing only)
 src/monitor/   measured resource telemetry (n/a rather than zero when unknown)
 tests/         unit tests, the CLI harness and the end-to-end suite
-docs/          research basis and design notes
 ```
 
 ## Licence and credits
 
-MonoSect drives FFmpeg rather than linking it; see
-[`docs/RESEARCH.md`](docs/RESEARCH.md) for the pinned versions and the reasoning.
+MonoSect drives FFmpeg rather than linking it. The core, the command line harness
+and the unit tests build and run on Linux and macOS as well as Windows; the GUI,
+the process runner and the telemetry are Windows-only and are isolated behind
+the interfaces that let the rest stay portable.
