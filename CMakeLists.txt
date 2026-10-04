@@ -136,11 +136,21 @@ set(MONOSECT_FFMPEG_SHA256 "a885f564dee2b60f69ab866c6c89b96ae531fc2ee1f24ff8b5b1
 # The two executables are separate files with separate digests, so they need their
 # own pins; one archive hash cannot match both.  They are defence in depth on top
 # of the archive pin, and they matter because extraction on Windows shells out to
-# PowerShell.  Both are produced by extracting the pinned archive once and hashing
-# the results - the digest command above does the archive, and
-# `tools/pin-ffmpeg-hashes.ps1` does the executables.
-set(MONOSECT_FFMPEG_EXE_SHA256 "" CACHE STRING "SHA-256 of ffmpeg.exe inside the pinned archive")
-set(MONOSECT_FFPROBE_EXE_SHA256 "" CACHE STRING "SHA-256 of ffprobe.exe inside the pinned archive")
+# PowerShell.
+#
+# All three digests below were taken from the artefact itself and are reproducible:
+# download the archive named in MONOSECT_FFMPEG_URL, check it against
+# MONOSECT_FFMPEG_SHA256, then hash the two files in its bin/ folder.  The archive
+# digest is also published by GitHub as the asset's `digest`, which is how it was
+# cross-checked here without trusting the download alone.
+#
+#   ffmpeg.exe   168 868 352 bytes
+#   ffprobe.exe  168 657 408 bytes
+#   version      N-127142-g12b7b9891b-20261003
+set(MONOSECT_FFMPEG_EXE_SHA256 "6de576f371de489d091a59e2b6906c8e14611d85627869100ee6fc12cdc47e33"
+    CACHE STRING "SHA-256 of ffmpeg.exe inside the pinned archive")
+set(MONOSECT_FFPROBE_EXE_SHA256 "3844bf66836cb7668742bfd4cc29b9fc9a5eebcbd198e212938448d1373cb532"
+    CACHE STRING "SHA-256 of ffprobe.exe inside the pinned archive")
 foreach (variable MONOSECT_FFMPEG_URL MONOSECT_FFMPEG_VERSION MONOSECT_FFMPEG_SHA256
                  MONOSECT_FFMPEG_EXE_SHA256 MONOSECT_FFPROBE_EXE_SHA256)
     if (NOT DEFINED ${variable})

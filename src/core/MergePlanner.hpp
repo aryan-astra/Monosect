@@ -7,11 +7,11 @@
 // not the case the merge is refused with the difference spelled out, instead of
 // producing a file whose second half does not decode.
 //
-// Research notes (docs/RESEARCH.md):
-//  * FFmpeg, "concat demuxer" (ffmpeg-formats): the demuxer reads a list of
-//    `file` directives; `-safe 0` is required for absolute paths and the list
-//    should carry the `ffconcat version 1.0` header; a single quote inside a path
-//    has to be escaped as `'\''`.
+// Research basis:
+//  * FFmpeg, "concat demuxer" (ffmpeg-formats documentation): the demuxer reads a
+//    list of `file` directives; `-safe 0` is required for absolute paths and the
+//    list should carry the `ffconcat version 1.0` header; a single quote inside a
+//    path has to be escaped as `'\''`.
 //  * FFmpeg, "concat" protocol vs demuxer: the demuxer joins at the container
 //    level and requires identical stream parameters, which is exactly the
 //    condition checked here.

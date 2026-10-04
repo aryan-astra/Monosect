@@ -12,7 +12,7 @@
 // Win32 common dialogs.  It is built only by the `MonoSect` target, which the
 // CMake configuration refuses to configure on a compiler that is not MinGW-w64
 // g++ or MSVC.  It cannot be compiled or tested in a Linux environment; see
-// docs/RESEARCH.md ("Windows-only components") and the final report.
+// the Windows build, which is the only configuration that compiles it.
 #pragma once
 
 #include <string>

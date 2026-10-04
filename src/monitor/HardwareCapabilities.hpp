@@ -27,11 +27,13 @@
 // deadline that cancels the process, and the encoder is reported as "not usable:
 // the probe did not finish".  A timeout is a result, not a silence.
 //
-// Research basis (docs/RESEARCH.md section 2): FFmpeg's encoder documentation
-// states that an encoder's presence in `-encoders` says nothing about whether the
-// corresponding device or driver can run it; the vendor APIs (NVML, Intel Media
-// SDK, AMF) are the only authority, and their own failure modes are exactly what
-// a live encode surfaces.
+// Research basis: FFmpeg's encoder documentation states that an encoder's
+// presence in `-encoders` says nothing about whether the corresponding device or
+// driver can run it; the vendor APIs (NVML, the Intel Media SDK, AMF) are the
+// only authority on that, and their own failure modes - a driver version that
+// predates the encoder, a card that is present but not the one indexed 0, a
+// session limit - are exactly what a live encode surfaces and a listing does
+// not.
 #pragma once
 
 #include "core/ResourcePolicy.hpp"

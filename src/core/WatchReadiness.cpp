@@ -26,12 +26,6 @@ std::string lowerExtension(std::string_view path) {
     return extension;
 }
 
-std::string formatReason(const std::string& text) {
-    std::ostringstream out;
-    out << text;
-    return out.str();
-}
-
 } // namespace
 
 const std::vector<std::string>& watchableMediaExtensions() {

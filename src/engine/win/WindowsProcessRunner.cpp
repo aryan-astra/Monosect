@@ -1,18 +1,20 @@
 // MonoSect — Windows process runner.
 //
-// Rules this file follows, from the Windows documentation (see
-// docs/RESEARCH.md for the exact pages):
+// Rules this file follows, each traceable to the Microsoft documentation named
+// beside it:
 //
-//  * CreateProcessW is used directly, never `cmd.exe /c`.  A file name with a
-//    quotation mark, a percent sign or an ampersand is data, never syntax.
+//  * CreateProcessW (Win32 Process Creation) is used directly, never
+//    `cmd.exe /c`.  A file name with a quotation mark, a percent sign or an
+//    ampersand is data, never syntax.
 //  * The argument string is built with the quoting rules documented for
 //    CommandLineToArgvW (backslashes are only special in front of a quote), so
 //    what the child parses is exactly the vector the caller passed.
 //  * The child is created suspended, assigned to a Job Object, and only then
-//    resumed.  The job object has JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, so when
-//    MonoSect exits - normally or by crashing - every FFmpeg process it started
-//    is terminated by the kernel.  This is why the runner can promise that a
-//    cancelled or crashed job never leaves an encoder writing in the background.
+//    resumed.  The job object has JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE (Job Objects
+//    documentation), so when MonoSect exits - normally or by crashing - every
+//    FFmpeg process it started is terminated by the kernel.  This is why the
+//    runner can promise that a cancelled or crashed job never leaves an encoder
+//    writing in the background.
 //  * Cancelling terminates the *job* (TerminateJobObject), which kills the
 //    whole tree - FFmpeg alone does not always kill its own children.
 //  * stdout/stderr are read with ReadFile on anonymous pipes from dedicated
@@ -21,11 +23,15 @@
 //    CreateProcess with pipes).
 //  * Low priority is set with SetPriorityClass(BELOW_NORMAL_PRIORITY_CLASS) on
 //    the child, which is the documented way to run a child below normal.
+//  * stdin is NUL rather than an inherited handle, so FFmpeg can never try to
+//    read from the console MonoSect was started from.  Every caller also passes
+//    -nostdin.
 //
-// Windows-only verification: this translation unit cannot be compiled on the
-// Linux development machine (no Windows headers, no mingw-w64 available), so it
-// is flagged in docs/LIMITATIONS.md.  The logic is written against the
-// documented API and must be compiled and exercised on Windows.
+// Windows-only verification: this translation unit is compiled and exercised only
+// by the Windows build, which is where the product runs and where the end-to-end
+// suite executes.  A POSIX build compiles PosixProcessRunner.cpp instead, and the
+// two implement the same interface, so the engine above them is identical code on
+// both platforms.
 #if defined(_WIN32)
 
 #include "engine/ProcessRunner.hpp"

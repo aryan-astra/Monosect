@@ -5,7 +5,7 @@
 // ffprobe output ("N/A", "30000/1001", "0/0") is handled explicitly: a value that
 // cannot be interpreted becomes "unknown" and is reported, never guessed.
 //
-// Research notes (docs/RESEARCH.md):
+// Research basis:
 //  * ffprobe(1) documents `-show_format`, `-show_streams`, `-show_chapters`,
 //    `-show_packets` and `-show_entries`; values such as duration, bit_rate and
 //    nb_frames are reported as strings and may be "N/A".

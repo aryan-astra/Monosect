@@ -4,8 +4,9 @@
 // no shell is involved, so no path or file name can be interpreted as a command.
 // The functions here are pure, which makes them unit-testable without FFmpeg.
 //
-// Measured behaviour that these arguments rely on (see docs/RESEARCH.md and
-// tests/harness/README.md):
+// Measured behaviour that these arguments rely on.  Each measurement was taken
+// with a real FFmpeg and a real fixture, and is reproduced by
+// tests/harness/end_to_end.py; the numbers quoted below are from that suite.
 //  * With `-ss` *before* `-i` and `-c copy`, FFmpeg seeks to the keyframe at or
 //    before the requested position and keeps everything from there.  A boundary
 //    that is exactly a keyframe therefore produces a part that starts exactly at
@@ -101,8 +102,9 @@ struct SegmentRenderRequest {
 // ---------------------------------------------------------------------------
 // Exact copying.
 //
-// Measured with ffmpeg 7.0.2 (tests/harness/README.md records every command and
-// number):
+// Measured against real FFmpeg builds on real fixtures.  Every number below is
+// re-measured by tests/harness/end_to_end.py, so a future FFmpeg that changes any
+// of these rules makes that suite fail rather than making MonoSect quietly wrong:
 //
 //  * `-ss` *before* `-i` with `-c copy` does not start where it was asked to.
 //    It starts at the demuxer's seek point, which for audio can be well before

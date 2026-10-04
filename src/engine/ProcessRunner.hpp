@@ -64,7 +64,7 @@ public:
 };
 
 /// Command line for logs and error messages.  Quoting follows the rules of the
-/// platform that is running (documented in docs/RESEARCH.md).
+/// platform that is running, so a log line can be pasted into a shell on that platform.
 [[nodiscard]] std::string formatCommandLineForDisplay(const ProcessSpec& spec);
 
 /// Runs `program` with `arguments`, discards its stdout and returns true when it

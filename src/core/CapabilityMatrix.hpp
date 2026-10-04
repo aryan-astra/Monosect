@@ -3,7 +3,8 @@
 // The matrix is intentionally conservative and *verifiable*: every row carries
 // the evidence level it was established at. Nothing is advertised as supported
 // because "FFmpeg probably handles it" - a row is only `Verified` when the
-// automated fixture suite in tests/e2e covers it (see docs/FORMATS.md).
+// automated fixture suite (tests/harness/end_to_end.py) covers it, and the row's
+// own `notes` field says what the coverage does not include.
 #pragma once
 
 #include <optional>

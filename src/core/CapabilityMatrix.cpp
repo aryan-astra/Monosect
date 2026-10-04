@@ -40,10 +40,13 @@ const char* capabilityStatusName(CapabilityStatus status) noexcept {
 
 const std::vector<CapabilityRow>& CapabilityMatrix::rows() {
     // Status legend:
-    //   Verified    - exercised by tests/e2e/run_e2e.sh for stream copy, smart cut,
+    //   Verified    - exercised by the automated fixture suite
+    //                 (tests/harness/end_to_end.py) for stream copy, smart cut,
     //                 size boundary, duration boundary, merge and verification.
-    //   Supported   - implemented; needs Windows-side confirmation of the same
-    //                 properties (documented in docs/LIMITATIONS.md).
+    //   Supported   - implemented and manually confirmed on this machine, but not
+    //                 yet covered by that suite.  The distinction is kept
+    //                 deliberately: "works here" and "proven by a test that runs
+    //                 on every build" are different claims.
     //   Caveats     - works with the restriction described in `notes`.
     static const std::vector<CapabilityRow> table{
         {"matroska", "Matroska / MKV", {"matroska", "webm"},

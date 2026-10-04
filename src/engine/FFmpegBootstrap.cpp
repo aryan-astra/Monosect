@@ -225,7 +225,7 @@ bool downloadFile(const std::wstring& host, const std::wstring& path,
 // native inflate would be a few hundred lines of new parsing code on the
 // installation path - a much larger risk than the dependency it removes - so the
 // documented, shipped implementation (`Expand-Archive`) is used.  The decision is
-// recorded in docs/RESEARCH.md so it is not re-litigated without new information.
+// recorded here so it is not re-litigated without new information.
 //
 // What is fixed relative to the previous implementation, and why it matters:
 //   * the wait result is checked.  `WaitForSingleObject` returning WAIT_TIMEOUT
