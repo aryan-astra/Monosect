@@ -108,7 +108,12 @@ VerificationResult evaluateSegment(const SplitPlan& plan, const SegmentPlan& seg
 
     // 3. Stream signatures.
     if (policy.checkStreamSignatures) {
-        const std::vector<StreamSignature>& expected = plan.sourceSignatures;
+        // The expectation is what this part should carry, which is not always the
+        // source's whole stream list: a stream with no packet inside the part's
+        // range cannot be in the part.  Falling back to the source list keeps plans
+        // that do not name their streams comparable.
+        const std::vector<StreamSignature>& expected =
+            segment.expectedSignatures.empty() ? plan.sourceSignatures : segment.expectedSignatures;
         const std::vector<std::string> differences = compareSignatureSets(expected, measurement.signatures);
         for (const std::string& difference : differences) {
             result.add(FindingSeverity::Error, "stream_mismatch",

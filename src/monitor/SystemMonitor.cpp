@@ -6,7 +6,6 @@
 #include <windows.h>
 #include <pdh.h>
 #include <pdhmsg.h>
-#pragma comment(lib, "pdh.lib")
 #else
 #include <fstream>
 #include <sstream>

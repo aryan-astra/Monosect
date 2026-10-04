@@ -121,13 +121,20 @@ private:
     /// seek form that is exact for that stream and stopped by an exact packet
     /// count, followed by a mux that joins the trimmed streams.  See
     /// FfmpegArgs.hpp for the measurements that make each part of it necessary.
+    ///
+    /// `packetlessStreams` are the source's stream indexes that carry no
+    /// time-dependent data - attachments and data streams.  They cannot be trimmed,
+    /// because there is no range of them to trim, so they are mapped from the
+    /// source in the mux step instead of being dropped.  See
+    /// MuxStreamsRequest::packetlessStreams.
     [[nodiscard]] Result<std::filesystem::path> copyRange(const SplitPlan& plan,
                                                          const std::filesystem::path& outputPath,
                                                          Rational start, Rational end,
                                                          const std::vector<StreamTrimSpec>& trims,
                                                          const JobRequest& request, const JobEvents& events,
                                                          bool startIsKeyframe,
-                                                         std::vector<std::string>* notes);
+                                                         std::vector<std::string>* notes,
+                                                         const std::vector<int>& packetlessStreams = {});
 
     /// Packet counts of one range per stream, taken from the probed index.
     [[nodiscard]] std::int64_t packetCountInRange(int streamIndex, Rational start, Rational end) const;

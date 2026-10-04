@@ -182,7 +182,8 @@ Result<std::filesystem::path> JobRunner::copyRange(const SplitPlan& plan, const 
                                                    Rational start, Rational end,
                                                    const std::vector<StreamTrimSpec>& trims,
                                                    const JobRequest& request, const JobEvents& events,
-                                                   bool startIsKeyframe, std::vector<std::string>* notes) {
+                                                   bool startIsKeyframe, std::vector<std::string>* notes,
+                                                   const std::vector<int>& packetlessStreams) {
     const std::filesystem::path workDirectory = outputPath.parent_path();
     const std::string stem = outputPath.filename().string();
     const std::string containerFormat = containerNameForExtension(plan.outputExtension);
@@ -271,7 +272,13 @@ Result<std::filesystem::path> JobRunner::copyRange(const SplitPlan& plan, const 
     // but the container the user asked for and the extension they see would both
     // be wrong, and a later merge would have to guess.  A one-stream remux is
     // cheap, so it always happens unless the containers already agree.
-    const bool singleStreamInPlannedContainer = trimmedFiles.size() == 1 && containerFormat == "matroska";
+    // A part that also carries a packetless stream cannot be satisfied by renaming a
+    // single trimmed intermediate into place: the rename would publish one stream
+    // and drop the attachment.  So the mux runs whenever there is anything the
+    // rename cannot carry, and the rename remains the cheap path for the ordinary
+    // single-stream MKV part.
+    const bool singleStreamInPlannedContainer =
+        trimmedFiles.size() == 1 && containerFormat == "matroska" && packetlessStreams.empty();
     if (singleStreamInPlannedContainer) {
         std::error_code renameError;
         std::filesystem::rename(trimmedFiles.front(), resultPath, renameError);
@@ -287,6 +294,7 @@ Result<std::filesystem::path> JobRunner::copyRange(const SplitPlan& plan, const 
             mux.inputs.push_back(file.string());
         }
         mux.metadataSource = plan.sourcePath;
+        mux.packetlessStreams = packetlessStreams;
         mux.containerFormat = containerFormat;
         // Every trimmed stream is expressed relative to the same origin (the
         // start of this part), so the muxer must not re-base them one by one:
@@ -326,11 +334,24 @@ Result<JobRunner::RenderResult> JobRunner::renderCopy(const SplitPlan& plan, con
                                                       const std::filesystem::path& temporaryPath,
                                                       const JobRequest& request, const JobEvents& events) {
     std::vector<StreamTrimSpec> trims;
+    std::vector<int> packetless;
     for (const int streamIndex : segment.copiedStreamIndexes) {
         StreamTrimSpec trim;
         trim.streamIndex = streamIndex;
         if (const StreamModel* stream = source_.container.stream(streamIndex); stream != nullptr) {
             trim.kind = stream->kind;
+        }
+        // An attachment or a data stream has no timeline: in Matroska an
+        // attachment is a whole file embedded in the container, not a timed
+        // stream, so there is no range of it to trim and no packet count to
+        // compute.  Asking for the count anyway returns 0 for every part, which
+        // would silently drop the stream from every part - and the verifier then
+        // correctly refuses the part, so the job fails on a source MonoSect had
+        // promised to preserve.  These are carried straight from the source in
+        // the mux step instead.  See MuxStreamsRequest::packetlessStreams.
+        if (trim.kind == StreamKind::Attachment || trim.kind == StreamKind::Data) {
+            packetless.push_back(streamIndex);
+            continue;
         }
         trim.packetCount = packetCountInRange(streamIndex, segment.startSeconds, segment.endSeconds);
         if (trim.packetCount < 0) {
@@ -344,7 +365,7 @@ Result<JobRunner::RenderResult> JobRunner::renderCopy(const SplitPlan& plan, con
     }
 
     auto copied = copyRange(plan, temporaryPath, segment.startSeconds, segment.endSeconds, trims, request, events,
-                            segment.isCopy(), nullptr);
+                            segment.isCopy(), nullptr, packetless);
     if (!copied.has_value()) {
         return failure<RenderResult>(copied.error());
     }

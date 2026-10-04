@@ -200,6 +200,22 @@ struct MuxStreamsRequest {
     /// Optional extra input used only as the source of container metadata
     /// (the original file).  It contributes no streams.
     std::string metadataSource;
+    /// Stream indexes in `metadataSource` that carry no time-dependent data -
+    /// attachments and data streams - and must therefore be mapped straight from
+    /// the source rather than from a trimmed intermediate.
+    ///
+    /// These cannot go through a trimmed intermediate at all.  A trim writes one
+    /// file per stream with an exact packet count, and these streams have no
+    /// packets, so the pass produces an empty file; worse, an MKV attachment is a
+    /// whole file embedded in the container rather than a timed stream, so
+    /// extracting it into a stream-only Matroska writes a file FFmpeg cannot read
+    /// back ("File ended prematurely").  Since the mux step already opens the
+    /// source, mapping these from there is both correct and free of media work.
+    ///
+    /// They are listed separately from `inputs` so that the decision stays visible:
+    /// an attachment is carried because it has no timeline, not because it was
+    /// copied, and a reviewer should be able to see that at the call site.
+    std::vector<int> packetlessStreams;
     std::string containerFormat;
     /// Keep every input's own timestamps instead of letting the muxer shift each
     /// input so that it starts at zero.

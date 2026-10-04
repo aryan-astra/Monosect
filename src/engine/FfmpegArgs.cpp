@@ -372,6 +372,42 @@ std::vector<std::string> copyWindowArgs(const CopyWindowRequest& request) {
 
 std::vector<std::string> trimStreamArgs(const StreamTrimRequest& request) {
     std::vector<std::string> arguments{"-hide_banner", "-nostdin", "-loglevel", "error", "-nostats"};
+    // -avoid_negative_ts is a muxer option, so it belongs with the other output
+    // options below rather than before -i.
+    //
+    // It is here for a concrete failure.  A stream-copy pass that starts at a
+    // seek position produces, in addition to the packets, one packet carrying the
+    // "skip this much pre-roll" hint - and that packet carries *no timestamp at
+    // all*.  The muxer of this first pass accepts it, so the trimmed intermediate
+    // looks fine and the problem is invisible.  The second pass then re-reads that
+    // intermediate and muxes it into the real output, where Matroska refuses a
+    // packet with an unknown timestamp:
+    //
+    //   [matroska] Can't write packet with unknown timestamp
+    //   Error muxing a packet ... Task finished with error code: -22 (Invalid argument)
+    //
+    // and the job stops on its last part - the part that has no successor to fall
+    // back on.  FFmpeg says so itself when the option is absent: "failed to avoid
+    // negative pts -40 in stream 0. Try -avoid_negative_ts 1 as a possible
+    // workaround."
+    //
+    // Measured on this machine with a real HEVC fixture, the part boundary at
+    // 0:04.000 and 50 intended packets:
+    //
+    //   without   50 packets, 1 with no timestamp, re-mux fails with -22
+    //   with      50 packets, 0 with no timestamp, re-mux succeeds
+    //
+    // make_zero is the right variant rather than make_non_negative or 1 because the
+    // trimmed intermediate is an internal artefact that is re-muxed into a part
+    // starting at zero anyway: shifting its first packet to zero is exactly what
+    // the next pass needs, and no information is lost because the packet index
+    // MonoSect verified is derived from the plan, not from the intermediate's
+    // timestamps.
+    //
+    // It is appended *after* the seek arguments on purpose.  FFmpeg classifies an
+    // option by where it appears, so an option placed before -i is an input option
+    // and is rejected here: measured, `-avoid_negative_ts` before -i fails with
+    // "you are trying to apply an input option to an output file or vice versa".
     if (request.seekMode == StreamTrimRequest::SeekMode::InputKeyframe) {
         // Input seek: FFmpeg starts at the keyframe at or before the position.
         // Exact because the planner only puts copy boundaries on keyframes.
@@ -402,6 +438,8 @@ std::vector<std::string> trimStreamArgs(const StreamTrimRequest& request) {
     arguments.push_back("0");
     arguments.push_back("-map_chapters");
     arguments.push_back("-1");
+    arguments.push_back("-avoid_negative_ts");
+    arguments.push_back("make_zero");
     arguments.push_back("-f");
     arguments.push_back(request.containerFormat);
     arguments.push_back("-y");
@@ -461,14 +499,24 @@ std::vector<std::string> muxStreamsArgs(const MuxStreamsRequest& request) {
     }
     const bool haveMetadataSource = !request.metadataSource.empty();
     if (haveMetadataSource) {
-        // The original file is opened for its metadata only: no stream of it is
-        // mapped, so none of its media is read or written again.
+        // The original file is opened for its metadata, and additionally as the
+        // source of any packetless stream: no timed media of it is read, because
+        // an attachment or data stream has no timeline to read a range of.
         arguments.push_back("-i");
         arguments.push_back(request.metadataSource);
     }
     for (std::size_t index = 0; index < request.inputs.size(); ++index) {
         arguments.push_back("-map");
         arguments.push_back(numberText(static_cast<std::int64_t>(index)));
+    }
+    // The packetless streams are addressed as `<source input>:<stream>`, so the
+    // mapping has to name the stream rather than the whole input the way the timed
+    // ones above do.  See MuxStreamsRequest::packetlessStreams for why they cannot
+    // be carried by a trimmed intermediate.
+    for (const int streamIndex : request.packetlessStreams) {
+        arguments.push_back("-map");
+        arguments.push_back(numberText(static_cast<std::int64_t>(request.inputs.size())) + ":" +
+                            numberText(streamIndex));
     }
     if (haveMetadataSource) {
         arguments.push_back("-map_metadata");
@@ -481,6 +529,22 @@ std::vector<std::string> muxStreamsArgs(const MuxStreamsRequest& request) {
     arguments.push_back("-1");
     arguments.push_back("-c");
     arguments.push_back("copy");
+    // The per-stream intermediates are joined with -copyts above so that a stream
+    // whose first packet is not exactly on the origin - audio, almost always -
+    // lands in the right place.  That preservation is what carries the
+    // "skip this much pre-roll" packet into this pass, and Matroska refuses to
+    // write a packet with no timestamp at all:
+    //
+    //   [matroska] Can't write packet with unknown timestamp
+    //   Task finished with error code: -22 (Invalid argument)
+    //
+    // so the job fails on the part it is writing.  -avoid_negative_ts make_zero
+    // resolves that packet's timestamp against the output's own zero instead of
+    // propagating the unknown one.  Measured on this machine, the last part of a
+    // two-part HEVC split at a 0:04.000 boundary: it fails with -22 without this
+    // option and is written and verified with it.
+    arguments.push_back("-avoid_negative_ts");
+    arguments.push_back("make_zero");
     arguments.push_back("-f");
     arguments.push_back(request.containerFormat);
     arguments.push_back("-y");

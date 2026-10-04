@@ -474,6 +474,27 @@ SegmentPlan SplitPlanner::makeSegment(const SplitPlan& plan, const Rational& sta
         }
     }
 
+    // The part carries every required stream that has at least one packet in this
+    // range, plus the ones that have no timeline to trim at all (attachments and
+    // data streams, which are carried from the source by the mux step).  A stream
+    // with no packet here cannot appear in the part, so recording that is what lets
+    // the verifier check the part against what the part should be rather than
+    // against every stream the source happens to have.
+    for (const StreamModel* stream : streams) {
+        const bool packetless = stream->kind == StreamKind::Attachment || stream->kind == StreamKind::Data;
+        bool carries = packetless;
+        if (!packetless) {
+            const StreamPacketTrack* track = index_.track(stream->index);
+            if (track != nullptr) {
+                carries = track->packetsInRange(start, end) > 0;
+            }
+        }
+        if (carries) {
+            segment.expectedStreamIndexes.push_back(stream->index);
+            segment.expectedSignatures.push_back(StreamSignature::from(*stream));
+        }
+    }
+
     segment.predictedPayloadBytes = payloadInRange(start, end);
     if (segment.method != SegmentMethod::Copy) {
         // Re-encoded regions are predicted from the source payload of the same

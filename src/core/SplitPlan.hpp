@@ -98,6 +98,23 @@ struct SegmentPlan {
     /// grow or shrink by a frame.
     std::vector<StreamPacketCount> expectedPackets;
 
+    /// The source streams this part is expected to carry, in source order.
+    ///
+    /// This is not always every stream of the source.  A stream that has no packet
+    /// inside the part's range cannot appear in it - a subtitle track with three
+    /// cues in a ten second file contributes nothing to the last part - so the
+    /// verifier has to compare against what the part should contain rather than
+    /// against the source's whole stream list.  Comparing against the source is
+    /// what produced "the file has 4 stream(s) but 5 were expected" for a part that
+    /// was written exactly as planned.
+    ///
+    /// Empty means "every source stream", which is the ordinary case and keeps
+    /// plans produced before this field existed meaningful.
+    std::vector<int> expectedStreamIndexes;
+
+    /// Signatures of the source streams this part is expected to carry.
+    std::vector<StreamSignature> expectedSignatures;
+
     std::string outputFileName;      // file name only, no directory
     std::vector<std::string> notes;  // per-part remarks shown in the plan table
 
