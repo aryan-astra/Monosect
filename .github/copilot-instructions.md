@@ -1,68 +1,136 @@
 # Copilot instructions for Monosect
 
+Everything below was checked against the repository. Where a claim could not be
+verified it is marked, rather than repeated because it was in an earlier version of
+this file.
+
 ## Build, test, and lint commands
 
 ### Build (Windows + MinGW-w64 only)
 
 ```powershell
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
-cmake --build build --target Monosect -j 8
-.\build\Monosect.exe
+cmake --build build
 ```
 
-Notes:
-- This repo targets **Windows + MinGW-w64 g++**. `CMakeLists.txt` rejects non-Windows and rejects MSVC.
-- `CMAKE_BUILD_TYPE` defaults to `Release`; non-Release builds show a warning.
-- Build links statically and enables LTO (`-O3 -march=native -flto -ffat-lto-objects`).
-- Build step generates `resources\Monosect.ico` from `Monosect-icon-square.png` via PowerShell.
+- This repo targets **Windows + MinGW-w64 g++**. `CMakeLists.txt` refuses MSVC
+  explicitly. There is no POSIX build target, so the Windows-specific sources
+  (`src/engine/win/`, `src/monitor/SystemMonitor.cpp`) are compiled unconditionally
+  on the only supported platform and are not behind `#if` in practice.
+- `CMAKE_BUILD_TYPE` defaults to `Release`.
+- The GUI target is `Monosect`; there are also `monosect-cli` (a headless harness that
+  drives the same engine) and `monosect-tests`. `cmake --build build` builds all three.
+- The release flags are `-O2 -march=x86-64-v2 -mtune=generic` on the GUI target.
+  There is **no LTO**; an earlier version of this file claimed `-O3 -flto`, which
+  was never true of this CMakeLists.
 
 ### Tests
 
-No automated test suite is configured in this repository:
-- no `enable_testing()` / `add_test()` in CMake
-- no test directories or test targets
+There are two suites, and they answer different questions. Run both.
 
-Single-test command: **not available** (no test harness present).
+**Unit tests** - the rules that must never regress. Fast, no FFmpeg, no media:
+
+```powershell
+cmake --build build --target monosect-tests
+.\build\monosect-tests.exe
+```
+
+**End-to-end suite** - the product. Drives the real CLI against real media in every
+container MonoSect claims to support, and re-checks every output with ffprobe alone.
+It needs the pinned FFmpeg binaries:
+
+```powershell
+$env:MONOSECT_FFMPEG  = "C:\path\to\ffmpeg.exe"
+$env:MONOSECT_FFPROBE = "C:\path\to\ffprobe.exe"
+python tests/harness/make_fixtures.py e2e-work\fixtures
+python tests/harness/end_to_end.py build\monosect-cli.exe e2e-work
+```
+
+The end-to-end suite is the one that finds real defects. Every bug found during the
+integration of the current engine was invisible to the unit tests, because each only
+appears when FFmpeg is actually asked to split a real file:
+
+- a stream copy whose last part failed on a timestamp-less "skip pre-roll" packet;
+- a seek passed as an absolute presentation time where `-ss` expects a time relative
+  to the container's `start_time`, which silently dropped the tail of a transport
+  stream;
+- attachments dropped from every part, because they have no timeline to trim;
+- a re-encode that used the encoder's default codec profile, so the verifier rejected
+  MonoSect's own output for not matching the source.
+
+If you change anything the engine does with FFmpeg, run this suite. It is the only
+thing standing between a plausible change and a broken product.
+
+`python` is required and `bash` is not available on this platform - do not add shell
+scripts. `end_to_end.py` takes `<cli-path> [work-directory]`; `MONOSECT_E2E_SKIP`
+skips sections and the run writes its verdict to `<work-dir>/e2e.log`.
 
 ### Lint
 
-No lint target/tooling is configured (no clang-tidy/cppcheck/cpplint target in CMake).
+No lint target is configured. The build is warning-clean in project code; the warnings
+that appear during a full rebuild come from `_deps` (GLFW, ImGui) and are not ours.
 
 ## High-level architecture
 
-- Entry point is `src\main.cpp`: creates `vsm::App`, calls `initialize()`, then `run()`.
-- `App` (`src\ui\App.*`) is the orchestration layer: GLFW window, OpenGL 3.3, Dear ImGui docking UI, queue management, logs, watch-folder controls, and split job dispatch.
-- FFmpeg bootstrap is asynchronous in `App::initialize()`:
-  - `ensureFFmpeg()` downloads/extracts `ffmpeg.exe` + `ffprobe.exe` next to the executable if missing.
-  - After bootstrap, `SplitEngine`, `MediaProbe`, and `HardwareDetector` are re-bound to local FFmpeg binaries.
-- Split workflow:
-  - UI builds `SplitRequest` (`App::makeRequest`).
-  - `App::startSplitJobs()` enqueues work on `ThreadPool`.
-  - `SplitEngine::split()` routes to time-based or size-based splitting.
-- Time-based split (`SplitEngine::splitByTime`):
-  - probes duration via `MediaProbe`
-  - analyzes keyframes via `GOPAnalyzer`
-  - splits with stream-copy FFmpeg commands at nearest keyframe.
-- Size-based split (`SplitEngine::splitBySize`):
-  - uses `SizePrecisionEngine` binary search with temporary estimate files
-  - then executes final split via `splitByTime`.
-- Support components:
-  - `FFmpegProcess`: Win32 `CreateProcessW` wrapper with stdout/stderr pipe capture.
-  - `SystemMonitor`: CPU sampling via `GetSystemTimes`; GPU metric currently reported as `0.0`.
-  - `WatchFolder`: `ReadDirectoryChangesW` watcher with debounce before enqueueing files.
+Read in this order - each layer only knows the one below it.
 
-## Key conventions in this codebase
+- **`src/core/`** - platform-neutral rules. Planning (`SplitPlanner`), constraints and
+  their validation (`Constraints`), container model (`MediaModel`), packet index
+  (`PacketIndex`), verification (`Verification`), size prediction (`SizeModel`),
+  merge planning (`MergePlanner`), stream-capability matrix (`CapabilityMatrix`),
+  watch-folder readiness rules (`WatchReadiness`), dependency pinning
+  (`DependencyPin`), UTF-8 boundaries (`Utf8Path`). No FFmpeg, no Windows headers.
+- **`src/engine/`** - everything that runs FFmpeg. `FFprobeService` probes and
+  indexes, `JobRunner` executes splits, `MergeRunner` executes merges, `WatchFolder`
+  watches a directory, `FFmpegBootstrap` fetches and verifies the tools,
+  `VerificationEngine` measures what was written. `FfmpegArgs` is the single place
+  FFmpeg command lines are built, and it is pure.
+- **`src/ui/`** - `UiController` owns every decision and contains no ImGui and no
+  Windows headers, so it is unit-tested directly. `MainWindow.cpp` only draws what
+  the controller exposes. A drawing bug can look wrong; it cannot report a job as
+  verified when it was not.
+- **`src/monitor/`** - resource metrics and the hardware encoder probe. Every metric
+  that cannot be measured is reported unavailable with a reason, never as zero.
 
-- Code is under `namespace vsm`.
-- Media path safety is enforced with `isSafePath()` (`src\engine\Types.hpp`), which rejects `..` traversal components.
-- Media intake is extension-gated with `isSupportedMediaExtension()` (`.mp4`, `.mkv`, `.mov`, `.avi`, `.flv`, `.webm`).
-- Queue and logs are shared across UI + worker threads; use existing mutexes (`queueMutex_`, `logsMutex_`) for access.
-- Logging convention is through `App::pushLog()`; logs are capped (old entries are trimmed after reaching 1000).
-- `SplitEngine` currently uses stream-copy (`-c copy`) in actual split commands; `SplitRequest` fields like `precisionMode`, `useHardwareAcceleration`, and `unrestrictedMode` are populated by UI but not fully applied in splitting logic.
-- `GOPAnalyzer::nearestKeyframe` currently chooses the nearest keyframe by absolute delta.
-- Size precision uses `SizePrecisionEngine::findSplitTime()` with cached measurements keyed by rounded milliseconds.
-- Size-based split creates temporary `*_estimate_*` files in output dir and removes them after search.
-- Split output naming convention is fixed to `<stem>_part1<ext>` and `<stem>_part2<ext>`.
-- Merge path (`SplitEngine::mergeLossless`) exists and validates codec/resolution/track-count compatibility before FFmpeg concat demuxer execution.
-- FFmpeg/ffprobe subprocesses should go through `FFmpegProcess`; it handles quoting, UTF-8/UTF-16 conversion, hidden window mode, and pipe draining.
-- Watch-folder events are debounced by size stability + elapsed time before callback emission.
+### Two conventions that are easy to get wrong
+
+**A narrow `std::string` path means UTF-8.** Convert at the boundary with
+`core/Utf8Path.hpp` (`wideFromUtf8`, `utf8FromWide`, `utf8CommandLineArguments`) and
+never by widening a byte at a time. `std::filesystem::path` holds UTF-16 natively.
+This is not a style preference: on Windows the C runtime hands `main` an `argv`
+already decoded into the ANSI code page, so characters that code page cannot represent
+are gone before your code runs, and passing the survivors to `std::filesystem` raises
+`filesystem_error("Illegal byte sequence")`.
+
+**Every FFmpeg seek is on FFmpeg's timeline, not the plan's.** The plan works in
+absolute presentation timestamps (what ffprobe reports); `-ss` and `-to` are measured
+from the container's `start_time`. Use `JobRunner::seekTime`. They coincide only when
+a file starts at zero, so the bug is invisible on ordinary files and destructive on
+the rest.
+
+### Threading
+
+- `UiController::poll()` is called once per frame and never blocks; the worker pushes
+  events under a mutex.
+- Exactly one job of either kind runs at a time. A merge and a split writing into the
+  same output folder would collide on names.
+- Long real work is off the UI thread: the FFmpeg bootstrap, the hardware encoder
+  probe, each job, and the watch folder all have their own thread.
+- The watch folder's callback does the least possible - push the path and return.
+  Probing or running a job there would stop the watcher noticing the next arrival.
+
+### Other facts worth knowing
+
+- The exact-copy path runs one FFmpeg pass per stream and then muxes, because
+  `-frames` is a stop condition for the whole output and cannot limit two streams at
+  once. The exact rules `-ss`/`-t`/`-frames` do and do not obey are recorded in
+  `src/engine/FfmpegArgs.hpp` with the measurements behind them.
+- MonoSect does not trust the FFmpeg it finds: `DependencyPin` verifies the archive
+  and each executable against digests compiled in by CMake. Update the three CMake
+  variables together; one archive hash cannot match two different files.
+- FFmpeg availability is not usability. `HardwareCapabilityProbe` asks each listed
+  encoder to encode a real frame, because a static build lists every vendor encoder
+  whether or not the hardware exists. Only a listed **and** usable encoder may be
+  offered, or a requested stream copy silently becomes an encode.
+- The help topics in `src/ui/HelpContent.cpp` describe panels that must exist. If a
+  topic names a control, there is a panel that draws it.
