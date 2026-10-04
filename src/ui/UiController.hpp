@@ -258,9 +258,19 @@ public:
     void waitForJob();
 
     // ---- resources -------------------------------------------------------------------
-    /// Samples the machine.  The graphs are drawn from these, and an unmeasurable
-    /// metric stays "n/a" (TODO 206/207).
+    /// Samples the machine and returns the result.  Costs a real measurement, so it
+    /// is called at 1 Hz, not once per frame.
     [[nodiscard]] const ResourceSample& sampleResources();
+    /// The last sample, without taking a new one.
+    ///
+    /// This exists because the resources panel is drawn every frame and must not
+    /// re-measure to do it.  Drawing and sampling were the same call, so every frame
+    /// re-ran GetSystemTimes over a ~5 ms window and re-collected the PDH counters
+    /// over the same window: the CPU figure flickered between 0 and 100 because it
+    /// was a rate over five milliseconds rather than over a second, and the disk
+    /// figure swung by hundreds of MiB/s for the same reason.  Reading the cached
+    /// sample is what makes the number on screen and the line in the graph agree.
+    [[nodiscard]] const ResourceSample& resourceSnapshot() const noexcept { return lastSample_; }
     [[nodiscard]] const std::string& resourceAvailabilityNote() const noexcept {
         return monitor_.availabilityNote();
     }

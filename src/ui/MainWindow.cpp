@@ -289,6 +289,7 @@ public:
         ImGui_ImplGlfw_InitForOpenGL(window_, true);
         ImGui_ImplOpenGL3_Init("#version 330");
         imguiReady_ = true;
+        loadLogo();
 
         glfwSetWindowUserPointer(window_, this);
         glfwSetDropCallback(window_, [](GLFWwindow*, int count, const char** paths) {
@@ -583,10 +584,65 @@ private:
         }
     }
 
+    /// Loads the logo, once, after the GL context exists.
+    ///
+    /// The file is copied next to the executable by the build, so the path is
+    /// derived from where the program is rather than from the working directory -
+    /// which is not the executable's directory when the user starts it from a
+    /// shortcut or a file manager, and a logo that only appears when launched from a
+    /// terminal is worse than none.
+    ///
+    /// A missing or unreadable file is not an error: the window draws without it.
+    /// Branding should never be the reason the product does not start.
+    void loadLogo() {
+        const std::filesystem::path path = vsm::executableDirectory() / "Monosect-full-logo.png";
+        if (!std::filesystem::exists(path)) {
+            return;
+        }
+        if (!vsm::loadPngAsTexture(path, logoTexture_)) {
+            return;
+        }
+    }
+
+    void drawLogo() {
+        if (!logoTexture_.valid()) {
+            return;
+        }
+        const float padding = 14.0f;
+        const float available = 380.0f;
+        float width = available;
+        float height = width * static_cast<float>(logoTexture_.height) /
+                        static_cast<float>(logoTexture_.width == 0 ? 1 : logoTexture_.width);
+        // Never taller than a quarter of the window: a very wide logo file would
+        // otherwise push every panel below it off the screen.
+        const float maxHeight = ImGui::GetIO().DisplaySize.y * 0.25f;
+        if (height > maxHeight) {
+            height = maxHeight;
+            width = height * static_cast<float>(logoTexture_.width) /
+                    static_cast<float>(logoTexture_.height == 0 ? 1 : logoTexture_.height);
+        }
+
+        const ImVec2 outer(width + padding * 2.0f, height + padding * 2.0f);
+        const ImVec2 origin((ImGui::GetContentRegionAvail().x - outer.x) * 0.5f,
+                            ImGui::GetCursorPosY());
+        ImGui::SetCursorPos(origin);
+
+        // The logo is a dark mark on an opaque white background - a brand asset made
+        // for a light page.  Drawn raw it is a white rectangle in the middle of a
+        // dark window, which reads as a rendering failure rather than as branding.
+        // Recolouring somebody's logo to suit our theme would be the wrong call, so
+        // it is presented as a deliberate card instead: the mark is shown exactly as
+        // authored, on the surface it was drawn for.
+        ImDrawList* draw = ImGui::GetWindowDrawList();
+        draw->AddRectFilled(origin, ImVec2(origin.x + outer.x, origin.y + outer.y),
+                            ImGui::GetColorU32(ImVec4(1.0f, 1.0f, 1.0f, 1.0f)), 8.0f);
+        ImGui::SetCursorPos(ImVec2(origin.x + padding, origin.y + padding));
+        ImGui::Image(static_cast<ImTextureID>(static_cast<intptr_t>(logoTexture_.id)),
+                     ImVec2(width, height));
+        ImGui::SetCursorPosY(origin.y + outer.y);
+    }
+
     void drawDockspace() {
-        // A fixed three-column layout: the source and its limits on the left, the
-        // plan and the results in the middle, the machine and the history on the
-        // right.  The log sits under the results.
         const ImGuiViewport* viewport = ImGui::GetMainViewport();
         const float statusBarHeight = ImGui::GetFrameHeightWithSpacing() + 8.0f;
         ImGui::SetNextWindowPos(ImVec2(viewport->WorkPos.x, viewport->WorkPos.y));
@@ -607,6 +663,7 @@ private:
 
         ImGui::BeginChild("##left", ImVec2(leftWidth, 0.0f), ImGuiChildFlags_Border);
         if (!merging) {
+            drawLogo();
             drawFirstRunPanel();
             drawSourcePanel();
             drawConstraintPanel();
@@ -1461,7 +1518,7 @@ private:
         if (!controller_) {
             return;
         }
-        const ResourceSample& sample = controller_->sampleResources();
+        const ResourceSample& sample = controller_->resourceSnapshot();
         auto meter = [&](const char* label, const MeasuredValue& value, const std::vector<float>& history,
                          const char* unit) {
             const std::string text = value.known ? UiModel::meterText(value, unit, 0) : std::string("n/a");
@@ -1719,6 +1776,9 @@ private:
     std::unique_ptr<FFprobeService> prober_;
     std::unique_ptr<EngineUiEngine> engine_;
     std::unique_ptr<UiController> controller_;
+    /// The logo, loaded once the GL context exists.  Absent is fine; the window
+    /// draws without it.
+    vsm::TextureHandle logoTexture_;
     std::unique_ptr<BackgroundHardwareProbe> hardware_;
     std::unique_ptr<WatchFolder> watcher_;
     std::unique_ptr<WatchFolderSource> watchSource_;

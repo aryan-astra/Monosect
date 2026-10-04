@@ -184,9 +184,16 @@ MeasuredValue SystemMonitor::memoryPercent() {
 }
 
 void SystemMonitor::initGpuTelemetry() {
-    if (gpuReady_ || gpuLibrary_ != nullptr) {
+    // `gpuTried_` and not `gpuLibrary_ != nullptr`.  Every failure path here returns
+    // without setting the library handle, so a guard on the handle never trips on a
+    // machine with no NVIDIA driver - and this ran again on every sample, appending
+    // its explanation to `availabilityNote_` each time.  The panel then showed the
+    // same sentence a dozen times, growing on its own.  The absence of a GPU is a
+    // permanent fact about the machine, so it is recorded once.
+    if (gpuTried_ || gpuLibrary_ != nullptr) {
         return;
     }
+    gpuTried_ = true;
 #if defined(_WIN32)
     // NVML ships with the driver; it is loaded dynamically so MonoSect runs
     // without an NVIDIA card, and its absence is not an error.
@@ -242,6 +249,8 @@ void SystemMonitor::shutdownGpuTelemetry() {
     gpuReady_ = false;
     gpuLibrary_ = nullptr;
     gpuDevice_ = nullptr;
+    // Left true: a shutdown must not make the next sample start the whole NVML dance
+    // again.  The handle is released, so nothing is held open.
 }
 
 MeasuredValue SystemMonitor::gpuPercent() {

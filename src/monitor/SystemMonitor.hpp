@@ -87,6 +87,11 @@ private:
 
     // --- GPU telemetry -----------------------------------------------------------------
     bool gpuReady_ = false;
+    /// True once NVML has been looked for, whether or not it was found.  The
+    /// absence of an NVIDIA driver is permanent, so it is established once - guarded
+    /// on this rather than on the library handle, which stays null on every failure
+    /// path and so never stops the search repeating.
+    bool gpuTried_ = false;
     void* gpuLibrary_ = nullptr;
     void* gpuDevice_ = nullptr;
     using NvmlInitFn = int (*)();
