@@ -93,7 +93,6 @@ public:
     [[nodiscard]] Result<SplitPlan> planOnly(const JobRequest& request, const JobEvents& events);
 
     [[nodiscard]] Result<JobOutcome> run(const JobRequest& request, const JobEvents& events);
-
 private:
     /// The job itself.  `run` wraps it so that the job record is written on every
     /// exit path, including the failure ones.

@@ -832,6 +832,27 @@ Result<JobOutcome> JobRunner::runInternal(const JobRequest& request, const JobEv
     }
 
     OutputCommitter committer(request.outputDirectory, request.jobTag, request.naming.overwriteExisting);
+
+    // Removes the working folder, unless the caller asked for it to be kept.
+    //
+    // Split honoured keepTemporaryFilesOnFailure nowhere: every failure exit called
+    // committer.cleanUp() unconditionally, so --keep-temp did nothing on this path
+    // even though the merge runner had always honoured it and the CLI accepted the
+    // flag.  That is the worst shape a debugging flag can have - it looks like it
+    // works, it is the one thing a user reaches for when a job has failed, and it
+    // silently deletes the evidence.
+    //
+    // Returns true when the folder was kept, so a caller does not then delete the
+    // individual file it was asked to preserve.  Wording matches the merge runner so
+    // the log line means the same thing wherever it appears.
+    const auto cleanUpWorkingFolder = [&](const JobRequest& forThisJob) -> bool {
+        if (forThisJob.keepTemporaryFilesOnFailure) {
+            log("the temporary folder was kept: " + committer.jobDirectory().string());
+            return true;
+        }
+        committer.cleanUp();
+        return false;
+    };
     Status beginStatus = committer.begin();
     if (!beginStatus.ok()) {
         outcome.finalState = JobState::Failed;
@@ -853,6 +874,14 @@ Result<JobOutcome> JobRunner::runInternal(const JobRequest& request, const JobEv
     measurements.reserve(plan.segments.size());
 
     const auto executionStart = std::chrono::steady_clock::now();
+    // Stamped on every terminal exit, not only on success.  Assigning it in one
+    // place at the end meant a job that failed after thirty seconds of writing
+    // recorded execution_seconds = 0, which reads as 'did no work' in the history
+    // and is exactly what the record showed for a failed thirty-second split.
+    const auto stampExecution = [&outcome, executionStart] {
+        outcome.executionSeconds =
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - executionStart).count();
+    };
 
     for (std::size_t index = 0; index < plan.segments.size(); ++index) {
         // Pause takes effect between parts; the part that is being written is
@@ -862,11 +891,12 @@ Result<JobOutcome> JobRunner::runInternal(const JobRequest& request, const JobEv
             std::this_thread::sleep_for(std::chrono::milliseconds(150));
         }
         if (canceled()) {
-            committer.cleanUp();
+            cleanUpWorkingFolder(request);
             outcome.canceled = true;
             outcome.message = "Cancelled. " + std::to_string(outcome.publishedFiles.size()) +
                               " part(s) had already been published and were verified.";
             setState(JobState::Cancelled, outcome.message);
+            stampExecution();
             return outcome;
         }
 
@@ -898,22 +928,37 @@ Result<JobOutcome> JobRunner::runInternal(const JobRequest& request, const JobEv
         while (!partDone) {
             ++attempt;
             const std::filesystem::path temporaryPath = committer.temporaryPathFor(segment.outputFileName);
+            // Which temporary file currently holds the verified bytes.  Almost always
+            // temporaryPath, but the closeness pass below re-renders to a second path
+            // and may prefer *that* one - and when it does it deletes temporaryPath.
+            //
+            // Tracking this in a variable rather than reading temporaryPath at the
+            // publish step is the whole fix.  The publish step used the original path
+            // unconditionally, so on a won retry it flushed and committed a file that
+            // the retry branch had already deleted, and then destroyed the real,
+            // verified, larger part in cleanUp().  Every re-encode split with a size
+            // limit did exactly that: the job reported "The verified part is missing
+            // and cannot be published" after throwing away a good 36 MiB part it had
+            // already written and verified, and published nothing.
+            std::filesystem::path verifiedPath = temporaryPath;
             auto rendered = renderPart(plan, segment, temporaryPath, request, events);
             if (!rendered.has_value()) {
                 committer.discard(temporaryPath);
                 if (rendered.error().code == ErrorCode::ProcessCanceled) {
-                    committer.cleanUp();
+                    cleanUpWorkingFolder(request);
                     outcome.canceled = true;
                     outcome.message = "Cancelled while writing part " + std::to_string(segment.index) + ".";
                     setState(JobState::Cancelled, outcome.message);
+                    stampExecution();
                     return outcome;
                 }
-                committer.cleanUp();
+                cleanUpWorkingFolder(request);
                 outcome.finalState = JobState::Failed;
                 outcome.message = "Part " + std::to_string(segment.index) + " could not be written: " +
                                   rendered.error().message;
                 log(rendered.error().toString());
                 setState(JobState::Failed, outcome.message);
+                stampExecution();
                 return outcome;
             }
             SegmentOutcome partOutcome = rendered.value().outcome;
@@ -926,10 +971,11 @@ Result<JobOutcome> JobRunner::runInternal(const JobRequest& request, const JobEv
                 std::chrono::duration<double>(std::chrono::steady_clock::now() - verificationStart).count();
             if (!verification.has_value()) {
                 committer.discard(temporaryPath);
-                committer.cleanUp();
+                cleanUpWorkingFolder(request);
                 outcome.finalState = JobState::Failed;
                 outcome.message = verification.error().message;
                 setState(JobState::Failed, outcome.message);
+                stampExecution();
                 return outcome;
             }
             for (const auto& finding : verification.value().findings) {
@@ -988,6 +1034,11 @@ Result<JobOutcome> JobRunner::runInternal(const JobRequest& request, const JobEv
                                         formatBytesShort(slack) + " less than the limit; the larger boundary " +
                                         formatDuration(bigger.value().endSeconds) + " was written and verified");
                                     committer.discard(temporaryPath);
+                                    // From here on the retry file is the part.  Every
+                                    // later step - the measurement bookkeeping below, and
+                                    // the flush and commit after this block - must name
+                                    // this path and not the one just discarded.
+                                    verifiedPath = retryPath;
                                     partOutcome = renderedRetry.value().outcome;
                                     segment = bigger.value();
                                     outcome.partsRewrittenForCloseness++;
@@ -1025,17 +1076,23 @@ Result<JobOutcome> JobRunner::runInternal(const JobRequest& request, const JobEv
 
                 // Publish.
                 setState(JobState::Publishing, "Publishing part " + std::to_string(segment.index));
-                const Status flushStatus = committer.flushToDisk(temporaryPath);
+                const Status flushStatus = committer.flushToDisk(verifiedPath);
                 if (!flushStatus.ok()) {
                     log(flushStatus.error.toString());
                 }
-                const Status commitStatus = committer.commit(temporaryPath, finalPath);
+                const Status commitStatus = committer.commit(verifiedPath, finalPath);
                 if (!commitStatus.ok()) {
-                    committer.discard(temporaryPath);
-                    committer.cleanUp();
+                    // Discard the part only when the folder is going away anyway.
+                    // Deleting the verified file first and *then* honouring --keep-temp
+                    // would keep an empty folder: the flag would appear to work and
+                    // the evidence would still be gone.
+                    if (!cleanUpWorkingFolder(request)) {
+                        committer.discard(verifiedPath);
+                    }
                     outcome.finalState = JobState::Failed;
                     outcome.message = commitStatus.error.message;
                     setState(JobState::Failed, outcome.message);
+                    stampExecution();
                     return outcome;
                 }
 
@@ -1076,11 +1133,12 @@ Result<JobOutcome> JobRunner::runInternal(const JobRequest& request, const JobEv
             }
 
             if (attempt >= request.maximumAttemptsPerPart) {
-                committer.cleanUp();
+                cleanUpWorkingFolder(request);
                 outcome.finalState = JobState::Failed;
                 outcome.message = "Part " + std::to_string(segment.index) + " did not fit the limits after " +
                                   std::to_string(attempt) + " attempts. No part that breaks a limit is published.";
                 setState(JobState::Failed, outcome.message);
+                stampExecution();
                 return outcome;
             }
 
@@ -1090,23 +1148,25 @@ Result<JobOutcome> JobRunner::runInternal(const JobRequest& request, const JobEv
             auto replanned = planner.replanRemaining(plan, index);
             if (!replanned.has_value() || !replanned.value().planned ||
                 replanned.value().segments.size() <= index) {
-                committer.cleanUp();
+                cleanUpWorkingFolder(request);
                 outcome.finalState = JobState::Failed;
                 outcome.message = "Part " + std::to_string(segment.index) +
                                   " cannot be made smaller without breaking the plan: " +
                                   (replanned.has_value() ? replanned.value().failureExplanation
                                                          : replanned.error().message);
                 setState(JobState::Failed, outcome.message);
+                stampExecution();
                 return outcome;
             }
             const SegmentPlan& corrected = replanned.value().segments[index];
             if (compareRational(corrected.endSeconds, segment.endSeconds) >= 0) {
-                committer.cleanUp();
+                cleanUpWorkingFolder(request);
                 outcome.finalState = JobState::Failed;
                 outcome.message = "Part " + std::to_string(segment.index) +
                                   " stays over the limit even at the previous keyframe. The job stopped instead of "
                                   "publishing a file that breaks the limit.";
                 setState(JobState::Failed, outcome.message);
+                stampExecution();
                 return outcome;
             }
             log("part " + std::to_string(segment.index) + ": the next attempt ends at " +
@@ -1133,6 +1193,10 @@ Result<JobOutcome> JobRunner::runInternal(const JobRequest& request, const JobEv
         }
     }
 
+    // Unconditionally, not through cleanUpWorkingFolder: the flag is
+    // keepTemporaryFilesOnFailure, and on a successful job there is nothing to
+    // debug - routing this through the flag would leave an empty working folder
+    // behind every time --keep-temp was passed to a job that worked.
     committer.cleanUp();
     outcome.succeeded = true;
 

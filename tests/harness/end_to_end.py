@@ -712,6 +712,38 @@ def section_closeness(cli: str, main: Path, work: Path) -> None:
         REPORT.ok(f"a doubled limit produced fewer parts ({len(big_parts)} vs {len(parts)})",
                   len(big_parts) < len(parts))
 
+    # The same split in full re-encode, which is the mode where the closeness pass
+    # actually wins.
+    #
+    # This line is the only reason the stale-path defect in JobRunner was ever
+    # caught, and it is here because the check above is not enough on its own: with no
+    # --mode the harness defaults to keyframe-aligned copy, and in that mode the next
+    # keyframe overshoots the limit, so the retry is never larger, the retry-wins
+    # branch is never taken, and the publish step never sees the bug.  Re-encode
+    # predicts the payload from the *source* bitrate while a CRF encode lands well
+    # under it, so every part sits far below the limit, the retry always wins - and
+    # the publish step then committed the temporary file that the retry branch had
+    # already deleted, discarding a verified part and failing the whole job.
+    reencode = work / "closeness-reencode"
+    result = run_cli(cli, ["split", str(main), "--limit", f"{limit}", "--out", str(reencode),
+                           "--mode", "reencode", "--closeness", "1"])
+    if REPORT.ok("the closeness pass succeeds in full re-encode mode", result.returncode == 0,
+                 result.stdout + result.stderr):
+        re_parts = sorted(reencode.glob("*.mp4"))
+        REPORT.ok("re-encode with a closeness pass publishes every part it writes",
+                  len(re_parts) > 0, f"{len(re_parts)} part(s)")
+        re_over = [f"{p.name}={p.stat().st_size}" for p in re_parts if p.stat().st_size > limit]
+        REPORT.ok("no re-encoded part exceeds the hard limit", not re_over, ", ".join(re_over))
+        # The failure this guards against published nothing at all while the log said
+        # the retry had been written and verified, so a retry that reports itself as
+        # written must also leave a file behind.
+        REPORT.ok("a won closeness retry leaves its part on disk",
+                  not re_parts or all(p.stat().st_size > 0 for p in re_parts))
+        # No temporary working folder may survive a successful split.
+        REPORT.ok("no working folder is left behind after a successful re-encode split",
+                  not any(p.name.startswith(".monosect-") for p in reencode.iterdir()),
+                  ", ".join(p.name for p in reencode.iterdir() if p.name.startswith(".monosect-")))
+
 
 def main(argv: list[str]) -> int:
     if len(argv) < 1:
