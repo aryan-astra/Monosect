@@ -389,7 +389,14 @@ private:
         }
         prober_ = std::make_unique<FFprobeService>(windowsProcessRunner(), ffprobePath_);
         engine_ = std::make_unique<EngineUiEngine>(*prober_, windowsProcessRunner(), ffmpegPath_);
-        controller_ = std::make_unique<UiController>(*engine_);
+        hardware_ = std::make_unique<BackgroundHardwareProbe>(windowsProcessRunner(), ffmpegPath_);
+        controller_ = std::make_unique<UiController>(*engine_, hardware_.get());
+        // Started once the window exists, not here: the probe runs real FFmpeg
+        // processes - one `ffmpeg -encoders` plus one encode per listed candidate -
+        // and doing that on the UI thread would freeze the window for as long as it
+        // takes, which is exactly the number of seconds the user is waiting to find
+        // out about.
+        hardware_->startProbe();
         controller_->setDatabasePath(databaseBuffer_);
         applySettingsToController();
         controller_->setOutputDirectory(outputDirectoryBuffer_);
@@ -437,6 +444,8 @@ private:
         controller_->setVerificationPolicy(policy);
         controller_->setLowPriority(lowPriority_);
         controller_->setFfmpegThreads(threadOverride_ ? threads_ : 0);
+        controller_->setGpuEnabled(gpuEnabled_);
+        controller_->setHardwareDecodingEnabled(hardwareDecodingEnabled_);
     }
 
     static ByteCount parseSizeBytes(const char* text, int unitIndex) {
@@ -999,6 +1008,142 @@ private:
         }
     }
 
+    /// Runs HardwareCapabilityProbe on a worker thread and publishes the answer.
+///
+/// The probe is real work: `ffmpeg -encoders` plus one single-frame encode per
+/// listed hardware encoder, each with its own deadline.  A machine with a slow or
+/// wedged driver can take several seconds, and the window must stay responsive
+/// throughout - a freeze on startup would be indistinguishable from a hang.
+///
+/// The result is immutable once published and written under a lock, so the UI thread
+/// reads a consistent answer while the worker replaces it exactly once.
+class BackgroundHardwareProbe final : public HardwareCapabilitySource {
+public:
+    BackgroundHardwareProbe(IProcessRunner& runner, std::string ffmpegPath)
+        : runner_(runner), ffmpegPath_(std::move(ffmpegPath)) {}
+
+    ~BackgroundHardwareProbe() override { join(); }
+
+    void startProbe() override {
+        std::lock_guard<std::mutex> guard(mutex_);
+        if (worker_.joinable() || !workerFinished_.load()) {
+            return;   // already running: a second probe would answer the same question
+        }
+        join();
+        workerFinished_ = false;
+        worker_ = std::thread([this] {
+            HardwareCapabilityProbe probe(runner_, ffmpegPath_);
+            HardwareCapabilities answer;
+            try {
+                answer = probe.probe();
+            } catch (...) {
+                // A probe that throws has told us it cannot answer.  Recording that
+                // is the honest outcome; propagating it would take the window down
+                // over a question about the graphics card.
+                answer.probed = true;
+                answer.probeError = "the hardware encoder probe did not finish";
+            }
+            {
+                std::lock_guard<std::mutex> guard2(mutex_);
+                result_ = std::move(answer);
+            }
+            workerFinished_ = true;
+        });
+    }
+
+    bool probeRunning() const override { return !workerFinished_.load(); }
+
+    HardwareCapabilities capabilities() const override {
+        std::lock_guard<std::mutex> guard(mutex_);
+        return result_;
+    }
+
+private:
+    /// Joins a finished worker.  Called with no lock held, and never blocks on a
+    /// probe that is still running.
+    void join() {
+        if (worker_.joinable() && workerFinished_.load()) {
+            worker_.join();
+        }
+    }
+
+    mutable std::mutex mutex_;
+    IProcessRunner& runner_;
+    std::string ffmpegPath_;
+    HardwareCapabilities result_;
+    std::thread worker_;
+    std::atomic<bool> workerFinished_{true};
+};
+
+/// What this machine can actually encode on, and why.
+    ///
+    /// The distinction this panel exists to make is between an encoder FFmpeg
+    /// *lists* and one that *works*.  A static FFmpeg build lists h264_nvenc,
+    /// hevc_nvenc, h264_qsv and h264_amf whether or not the machine has the
+    /// hardware, so a panel that reported the listing as availability would offer
+    /// the user an encode that fails at run time - and, worse, would turn a
+    /// requested stream copy into a re-encode without saying so.  So each listed
+    /// encoder is shown with the result of actually asking it to encode a frame,
+    /// and a failure names its own reason.
+    void drawHardwarePanel() {
+        if (!controller_) {
+            return;
+        }
+        ImGui::TextUnformatted("Hardware encoders");
+
+        if (controller_->hardwareProbeRunning()) {
+            ImGui::TextDisabled("Testing each listed encoder with a real one-frame encode...");
+            return;
+        }
+        if (!controller_->hardwareProbed()) {
+            ImGui::TextDisabled("Not probed on this machine yet.");
+            ImGui::TextDisabled("MonoSect does not assume a card is present, or that a listed encoder works.");
+            return;
+        }
+
+        for (const EncoderProbe& encoder : controller_->hardwareEncoders()) {
+            const char* icon = encoder.usable ? "[+]" : "[-]";
+            ImGui::Text("%s %s  %s", icon, encoder.encoder.c_str(), encoder.vendor.c_str());
+            if (!ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
+                continue;
+            }
+            ImGui::BeginTooltip();
+            ImGui::PushTextWrapPos(ImGui::GetFontSize() * 40.0f);
+            if (encoder.usable) {
+                ImGui::TextUnformatted("A one-frame encode succeeded on this machine.");
+            } else {
+                ImGui::TextUnformatted(encoder.detail.empty() ? "Not usable on this machine." : encoder.detail.c_str());
+            }
+            if (!encoder.description.empty()) {
+                ImGui::Separator();
+                ImGui::TextDisabled("%s", encoder.description.c_str());
+            }
+            ImGui::PopTextWrapPos();
+            ImGui::EndTooltip();
+        }
+        ImGui::TextWrapped("%s", controller_->hardwareSummary().c_str());
+        helpMarker(HelpContent::find(HelpTopicId::GpuEncoders), [this](HelpTopicId id) { controller_->showHelp(id); });
+
+        if (ImGui::Checkbox("Use a hardware encoder when a boundary must be re-encoded", &gpuEnabled_)) {
+            controller_->setGpuEnabled(gpuEnabled_);
+        }
+        // The consequence is spelled out rather than left to be discovered: on a
+        // copy-only split no encoder is needed, so this changes nothing, and saying
+        // so is more useful than greying the box out and leaving the user to wonder.
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
+            ImGui::BeginTooltip();
+            ImGui::PushTextWrapPos(ImGui::GetFontSize() * 34.0f);
+            ImGui::TextUnformatted(
+                "A stream copy needs no encoder at all. This only applies when the boundary cannot be placed on a "
+                "keyframe and has to be re-encoded.");
+            ImGui::PopTextWrapPos();
+            ImGui::EndTooltip();
+        }
+        if (ImGui::Checkbox("Use hardware decoding", &hardwareDecodingEnabled_)) {
+            controller_->setHardwareDecodingEnabled(hardwareDecodingEnabled_);
+        }
+    }
+
     void drawResourcesPanel() {
         ImGui::SeparatorText("Machine");
         if (!controller_) {
@@ -1024,6 +1169,10 @@ private:
         ImGui::Text("Disk write: %s", bytesPerSecondText(sample.diskWriteBytesPerSecond).c_str());
         ImGui::Text("Media written: %s", bytesPerSecondText(sample.mediaThroughputBytesPerSecond).c_str());
         ImGui::TextWrapped("%s", sample.sourceDescription.c_str());
+        ImGui::Separator();
+
+        drawHardwarePanel();
+
         ImGui::Separator();
         ResourcePolicyInput input = controller_->resourceInput();
         const ResourcePolicy policy = deriveResourcePolicy(input);
@@ -1255,6 +1404,7 @@ private:
     std::unique_ptr<FFprobeService> prober_;
     std::unique_ptr<EngineUiEngine> engine_;
     std::unique_ptr<UiController> controller_;
+    std::unique_ptr<BackgroundHardwareProbe> hardware_;
 
     std::jthread bootstrapThread_;
     std::atomic<bool> toolsReady_{false};
@@ -1285,6 +1435,8 @@ private:
     bool verifyDecode_ = false;
     bool lowPriority_ = false;
     bool threadOverride_ = false;
+    bool gpuEnabled_ = true;
+    bool hardwareDecodingEnabled_ = true;
     int threads_ = 4;
     bool showResources_ = true;
     bool showHistory_ = true;

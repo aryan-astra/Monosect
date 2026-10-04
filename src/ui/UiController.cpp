@@ -10,6 +10,8 @@ namespace monosect::core {
 
 UiEngine::~UiEngine() = default;
 
+HardwareCapabilitySource::~HardwareCapabilitySource() = default;
+
 EngineUiEngine::EngineUiEngine(FFprobeService& prober, IProcessRunner& runner, std::string ffmpegPath)
     : prober_(prober), runner_(runner), ffmpegPath_(std::move(ffmpegPath)) {}
 
@@ -81,7 +83,8 @@ double steadyNow() {
 
 } // namespace
 
-UiController::UiController(UiEngine& engine) : engine_(engine) {
+UiController::UiController(UiEngine& engine, HardwareCapabilitySource* hardware)
+    : engine_(engine), hardware_(hardware) {
     refreshHistory();
 }
 
@@ -729,9 +732,56 @@ ResourcePolicyInput UiController::resourceInput() const {
     ResourcePolicyInput input;
     input.topology.logicalCores = monitor_.logicalCores();
     input.topology.physicalCores = monitor_.physicalCores();
-    // The GPU fields are filled in by the caller from the capability matrix: the
-    // UI never assumes that a card is present or that an encoder works.
+    // The GPU capability comes from the probe, not from an assumption.  The comment
+    // this replaces said the caller would fill it in - and no caller did, so
+    // ResourcePolicy always saw a GPU that was neither present nor usable and the
+    // resource panel could not tell a machine with no card from one MonoSect had
+    // not asked yet.  toGpuCapability distinguishes those three cases itself, which
+    // is exactly why it exists.
+    if (hardware_ != nullptr) {
+        input.gpu = hardware_->capabilities().toGpuCapability(userEnabledGpu_, jobWillEncode());
+    }
+    input.userEnabledGpu = userEnabledGpu_;
+    input.userEnabledHardwareDecoding = userEnabledHardwareDecoding_;
+    input.jobWillEncode = jobWillEncode();
     return input;
+}
+
+bool UiController::jobWillEncode() const noexcept {
+    // A stream copy needs no encoder at all, so GPU settings only come into play
+    // when the plan has to re-encode a boundary.
+    if (!preview_.has_value()) {
+        return false;
+    }
+    for (const SegmentPlan& segment : preview_->segments) {
+        if (!segment.reencodedStreamIndexes.empty()) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool UiController::hardwareProbed() const {
+    return hardware_ != nullptr && hardware_->capabilities().probed;
+}
+
+bool UiController::hardwareProbeRunning() const {
+    return hardware_ != nullptr && hardware_->probeRunning();
+}
+
+std::string UiController::hardwareSummary() const {
+    if (hardware_ == nullptr) {
+        return "The hardware encoder probe is not available in this build.";
+    }
+    if (hardwareProbeRunning()) {
+        return "Testing whether this machine's hardware encoders work. "
+               "A listed encoder is not a working one, so each one is asked to encode a frame.";
+    }
+    return hardware_->capabilities().describe();
+}
+
+std::vector<EncoderProbe> UiController::hardwareEncoders() const {
+    return hardware_ != nullptr ? hardware_->capabilities().encoders : std::vector<EncoderProbe>();
 }
 
 void UiController::setDatabasePath(const std::string& path) {

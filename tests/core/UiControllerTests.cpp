@@ -596,3 +596,139 @@ MONOSECT_TEST(progress_is_reported_by_parts_and_has_no_eta_before_the_first_one)
     CHECK_EQ(after.partsTotal, after.partsDone);
     CHECK_NEAR(1.0, after.fraction, 1e-9);
 }
+
+namespace {
+
+/// A hardware capability source with a fixed answer, so the resource policy can be
+/// tested for every machine MonoSect might run on without one of them.
+struct FakeHardware final : HardwareCapabilitySource {
+    explicit FakeHardware(HardwareCapabilities answer) : result(std::move(answer)) {}
+
+    void startProbe() override { ++startCalls; }
+    bool probeRunning() const override { return running; }
+    HardwareCapabilities capabilities() const override { return result; }
+
+    HardwareCapabilities result;
+    bool running = false;
+    int startCalls = 0;
+};
+
+HardwareCapabilities noHardwareAtAll() {
+    HardwareCapabilities answer;
+    answer.probed = true;
+    return answer;
+}
+
+HardwareCapabilities workingNvidia() {
+    HardwareCapabilities answer;
+    answer.probed = true;
+    EncoderProbe h264;
+    h264.encoder = "h264_nvenc";
+    h264.vendor = "NVIDIA";
+    h264.codecName = "h264";
+    h264.listed = true;
+    h264.usable = true;
+    answer.encoders.push_back(h264);
+    EncoderProbe qsv;
+    qsv.encoder = "h264_qsv";
+    qsv.vendor = "Intel";
+    qsv.codecName = "h264";
+    qsv.listed = true;
+    qsv.usable = false;      // listed by the build, refused by the machine
+    qsv.detail = "no Intel device with an Quick Sync encoder";
+    answer.encoders.push_back(qsv);
+    answer.usableVendors.push_back("NVIDIA");
+    return answer;
+}
+
+} // namespace
+
+MONOSECT_TEST(an_unprobed_machine_is_not_reported_as_a_machine_without_hardware) {
+    // The distinction the product depends on: "not asked yet" is not "no card".
+    // Reporting the second when the machine has merely not been probed would
+    // disable hardware encoding on a capable machine and tell the user their card
+    // is not there.
+    HardwareCapabilities pending;
+    FakeHardware hardware(pending);
+    FakeEngine engine;
+    UiController controller(engine, &hardware);
+
+    CHECK(!controller.hardwareProbed());
+    const ResourcePolicyInput input = controller.resourceInput();
+    CHECK(input.gpu.name == "not probed yet");
+    CHECK(!input.gpu.encoderUsable);
+    CHECK(!input.gpu.encoderPresent);
+    CHECK(controller.hardwareSummary().find("not run yet") != std::string::npos);
+}
+
+MONOSECT_TEST(a_listed_encoder_that_does_not_work_is_not_offered) {
+    // The defect the old detector had: a static FFmpeg build lists every vendor
+    // encoder, so listing them as available offered an encode that fails - and
+    // turned a requested stream copy into a re-encode without saying so.
+    FakeHardware hardware(workingNvidia());
+    FakeEngine engine;
+    UiController controller(engine, &hardware);
+
+    CHECK(controller.hardwareProbed());
+    CHECK_EQ(std::size_t(2u), controller.hardwareEncoders().size());
+
+    const ResourcePolicyInput input = controller.resourceInput();
+    // encoderPresent means "listed by this FFmpeg build", which is true of both.
+    CHECK(input.gpu.encoderPresent);
+    CHECK(input.gpu.probeDetail.find("h264_qsv") != std::string::npos);
+    // encoderUsable is deliberately false here: with no preview, jobWillEncode is
+    // false, because a stream copy needs no encoder at all - so no encoder may be
+    // selected.  That is the rule that stops a requested copy becoming an encode.
+    CHECK(!input.gpu.encoderUsable);
+    CHECK(input.gpu.usableEncoder.empty());
+    CHECK(input.gpu.name.find("no hardware encoder is needed") != std::string::npos);
+    CHECK(input.gpu.probeDetail.find("Quick Sync") != std::string::npos);
+}
+
+MONOSECT_TEST(no_gpu_encoder_is_selected_for_a_machine_without_one) {
+    FakeHardware hardware(noHardwareAtAll());
+    FakeEngine engine;
+    UiController controller(engine, &hardware);
+
+    const ResourcePolicyInput input = controller.resourceInput();
+    CHECK(!input.gpu.encoderUsable);
+    CHECK(input.gpu.usableEncoder.empty());
+
+    // jobWillEncode is false while nothing is planned, so the policy has no reason
+    // to reach for an encoder at all.
+    CHECK(!controller.jobWillEncode());
+    const ResourcePolicy policy = deriveResourcePolicy(input);
+    CHECK(!policy.useGpuEncoder);
+}
+
+MONOSECT_TEST(the_users_choice_about_the_gpu_is_kept_apart_from_what_the_machine_can_do) {
+    // "The card can encode" and "the user wants it to" are separate decisions.  A
+    // controller that conflated them would either ignore the checkbox or refuse to
+    // use a working card.
+    FakeHardware hardware(workingNvidia());
+    FakeEngine engine;
+    UiController controller(engine, &hardware);
+
+    CHECK(controller.gpuEnabled());
+    CHECK(controller.hardwareDecodingEnabled());
+
+    controller.setGpuEnabled(false);
+    CHECK(!controller.gpuEnabled());
+    CHECK(!controller.resourceInput().userEnabledGpu);
+
+    controller.setHardwareDecodingEnabled(false);
+    CHECK(!controller.resourceInput().userEnabledHardwareDecoding);
+}
+
+MONOSECT_TEST(a_controller_without_a_hardware_source_reports_it_rather_than_pretending) {
+    FakeEngine engine;
+    UiController controller(engine);
+
+    CHECK(!controller.hardwareProbed());
+    CHECK(controller.hardwareEncoders().empty());
+    CHECK(controller.hardwareSummary().find("not available") != std::string::npos);
+    // The rest of the resource policy still works: a missing probe must not stop
+    // the thread and priority settings from being derived.
+    const ResourcePolicyInput input = controller.resourceInput();
+    CHECK(input.topology.logicalCores >= 1);
+}

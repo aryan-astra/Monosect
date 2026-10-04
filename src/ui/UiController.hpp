@@ -23,6 +23,7 @@
 #include "core/Verification.hpp"
 #include "engine/JobRunner.hpp"
 #include "engine/JobStore.hpp"
+#include "monitor/HardwareCapabilities.hpp"
 #include "monitor/SystemMonitor.hpp"
 #include "ui/HelpContent.hpp"
 #include "ui/UiModel.hpp"
@@ -74,6 +75,24 @@ private:
     FFprobeService& prober_;
     IProcessRunner& runner_;
     std::string ffmpegPath_;
+};
+
+/// How the controller obtains the machine's hardware encoder capabilities.
+///
+/// This is an interface for the same reason the engine is: the controller is
+/// unit-tested on a machine with no GPU, so a probe that actually launched FFmpeg
+/// would make every resource-policy test depend on a video card.  The application
+/// binds it to HardwareCapabilityProbe; the tests bind it to a scripted answer.
+class HardwareCapabilitySource {
+public:
+    virtual ~HardwareCapabilitySource();
+    /// Runs the probe.  Returns immediately; the answer is delivered by polling.
+    /// Never throws and never blocks.
+    virtual void startProbe() = 0;
+    /// True while a probe is in flight.
+    virtual bool probeRunning() const = 0;
+    /// The most recent result.  `probed` is false until a probe has completed.
+    [[nodiscard]] virtual HardwareCapabilities capabilities() const = 0;
 };
 
 /// One source in the queue.
@@ -131,7 +150,10 @@ struct SessionSnapshot {
 
 class UiController {
 public:
-    explicit UiController(UiEngine& engine);
+    /// `hardware` may be null, in which case the controller reports "not probed"
+    /// rather than "no hardware" - the two are different answers and a machine
+    /// MonoSect has not asked yet is not a machine without a GPU.
+    explicit UiController(UiEngine& engine, HardwareCapabilitySource* hardware = nullptr);
 
     // ---- the queue -------------------------------------------------------------------
     /// Adds a source and selects it.  Returns its queue id.
@@ -202,6 +224,17 @@ public:
     }
     [[nodiscard]] ResourcePolicyInput resourceInput() const;
 
+    // ---- hardware encoder capability ------------------------------------------------
+    /// True until a hardware probe has run.  The resources panel says "not probed
+    /// yet" rather than "no hardware encoder", because those are different claims
+    /// and only the second one is supported by evidence.
+    [[nodiscard]] bool hardwareProbed() const;
+    [[nodiscard]] bool hardwareProbeRunning() const;
+    /// One paragraph for the resources panel, saying what was checked.
+    [[nodiscard]] std::string hardwareSummary() const;
+    /// The encoders as the machine answered, for the panel's detail listing.
+    [[nodiscard]] std::vector<EncoderProbe> hardwareEncoders() const;
+
     // ---- job history -----------------------------------------------------------------
     void setDatabasePath(const std::string& path);
     void refreshHistory();
@@ -226,6 +259,16 @@ public:
     void setFfmpegThreads(int threads) { ffmpegThreads_ = threads; }
     [[nodiscard]] bool lowPriority() const noexcept { return lowPriority_; }
     void setLowPriority(bool value) { lowPriority_ = value; }
+    /// The user's own choice about GPU use.  Kept apart from the probe's answer
+    /// because "the card can encode" and "the user wants it to" are separate
+    /// decisions, and the resource policy needs both.
+    [[nodiscard]] bool gpuEnabled() const noexcept { return userEnabledGpu_; }
+    void setGpuEnabled(bool value) { userEnabledGpu_ = value; }
+    [[nodiscard]] bool hardwareDecodingEnabled() const noexcept { return userEnabledHardwareDecoding_; }
+    void setHardwareDecodingEnabled(bool value) { userEnabledHardwareDecoding_ = value; }
+    /// True when the current selection would need a re-encoded boundary, and so is
+    /// the only case where a GPU encoder could matter at all.
+    [[nodiscard]] bool jobWillEncode() const noexcept;
 
     // ---- what the panels read --------------------------------------------------------
     [[nodiscard]] const SessionSnapshot& snapshot() const noexcept { return snapshot_; }
@@ -259,6 +302,9 @@ private:
     [[nodiscard]] JobEvents makeEvents();
 
     UiEngine& engine_;
+    HardwareCapabilitySource* hardware_ = nullptr;
+    bool userEnabledGpu_ = true;
+    bool userEnabledHardwareDecoding_ = true;
     std::vector<QueueItem> queue_;
     int nextId_ = 1;
     int selectedId_ = 0;
