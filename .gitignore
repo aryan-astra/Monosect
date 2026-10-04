@@ -1,11 +1,30 @@
 build/
+build-*/
 third_party/
 .vscode/
 imgui.ini
 monosect.settings
-monosect-xml.xml
 release/
 *.exe
 *.zip
 *.log
 *.tmp
+*.patch
+
+# Generated packaging and verification output.
+SHA256SUMS.txt
+monosect.version
+e2e-work/
+fixtures/
+
+# Scratch left behind by earlier analysis tooling.  The line below used to read
+# "monosect-xml.xml", which never matched the file it was meant to catch.
+repomix-output.xml
+
+# Local engineering notes.  These are working documents kept next to the code,
+# not part of the shipped repository: they are long, they change constantly, and
+# nothing in the build reads them.  Code comments must therefore never depend on
+# their contents.
+docs/RESEARCH.md
+docs/LIMITATIONS.md
+MONOSECT_LOCAL_AUDIT.md
