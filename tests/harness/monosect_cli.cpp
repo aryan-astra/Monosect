@@ -586,7 +586,15 @@ int commandSplit(const Options& options) {
     request.databasePath = options.database;
     request.recordHistory = true;
     request.jobTag = std::filesystem::path(options.input).stem().string();
-    request.appVersion = "1.2.0";
+    // The version comes from version.txt via CMake, so a job record written by this
+    // harness names the same build as the title bar does.  It used to be a
+    // hardcoded "1.2.0" while version.txt said 1.1.0, so every job the harness wrote
+    // attributed itself to a release that does not exist.
+#ifdef MONOSECT_VERSION_STR
+    request.appVersion = MONOSECT_VERSION_STR;
+#else
+    request.appVersion = "0.0.0";
+#endif
     request.ffprobeVersion = ffprobeVersion.has_value() ? ffprobeVersion.value() : std::string();
 
     JobEvents events;
@@ -692,7 +700,15 @@ int commandMerge(const Options& options) {
     request.keepTemporaryFilesOnFailure = options.keepTemp;
     request.databasePath = options.database;
     request.recordHistory = true;
-    request.appVersion = "1.2.0";
+    // The version comes from version.txt via CMake, so a job record written by this
+    // harness names the same build as the title bar does.  It used to be a
+    // hardcoded "1.2.0" while version.txt said 1.1.0, so every job the harness wrote
+    // attributed itself to a release that does not exist.
+#ifdef MONOSECT_VERSION_STR
+    request.appVersion = MONOSECT_VERSION_STR;
+#else
+    request.appVersion = "0.0.0";
+#endif
     if (const auto version = prober.version(); version.has_value()) {
         request.ffprobeVersion = version.value();
     }
