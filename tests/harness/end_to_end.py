@@ -166,12 +166,16 @@ def section_probe(cli: str, fixtures: Path, main: Path) -> None:
     if multi.exists():
         result = run_cli(cli, ["probe", str(multi)])
         streams = probe_stream_names(multi)
-        kinds = sorted({kind for _, kind, _ in streams})
+        # `streams` is a list, not a set: collapsing it first would make "two audio
+        # tracks" impossible to assert, because a set holds one "audio" however many
+        # tracks the file has.  This is a real assertion and it does fail when the
+        # fixture is wrong, which a set comparison could never do.
+        kinds = [kind for _, kind, _ in streams]
         REPORT.ok("the multi-stream fixture has video, two audio tracks and a subtitle",
                   kinds.count("audio") == 2 and kinds.count("video") == 1 and "subtitle" in kinds,
                   f"streams={streams}")
         REPORT.ok("the probe reports the subtitle and both audio streams",
-                  text.count("audio") >= 2 and "subtitle" in text, result.stdout)
+                  result.stdout.count("audio") >= 2 and "subtitle" in result.stdout, result.stdout)
 
 
 # ---------------------------------------------------------------------------

@@ -188,6 +188,21 @@ Result<PacketIndex> FFprobeService::packetIndex(const std::filesystem::path& pat
                                  "in any time range");
     }
 
+    // A still image is recognised twice, and the second test is the one that works
+    // in practice.  ProbeParsing sets the flag from nb_frames == 1, but the
+    // containers that actually carry single images - a bare PNG is a piped image
+    // sequence, and so reports nb_frames as N/A - do not report a frame count at
+    // all.  The packet index is always built, so it is the reliable evidence: a
+    // file with exactly one video packet and nothing else has no timeline to split
+    // along.  Verified on this machine: a 799 byte PNG reports nb_frames = N/A,
+    // one video packet, and duration N/A, and MonoSect planned it instead of
+    // refusing with "This file contains a single image and cannot be split into
+    // time ranges".
+    if (!model.isStillImage && index.value().totalPacketCount() == 1 && model.streams.size() == 1 &&
+        model.streams.front().kind == StreamKind::Video) {
+        model.isStillImage = true;
+    }
+
     auto& entry = cache_[key.value()];
     entry.model = model;
     entry.index = index.value();
@@ -196,18 +211,26 @@ Result<PacketIndex> FFprobeService::packetIndex(const std::filesystem::path& pat
 
 Result<ProbeSnapshot> FFprobeService::probeAll(const std::filesystem::path& path) {
     ProbeSnapshot snapshot;
-    auto model = probe(path);
-    if (!model.has_value()) {
-        return failure<ProbeSnapshot>(model.error());
-    }
-    snapshot.container = model.value();
-    if (!snapshot.container.warnings.empty()) {
-        // Keep any warnings produced while parsing packets out of the model copy.
-    }
     auto index = packetIndex(path);
     if (!index.has_value()) {
         return failure<ProbeSnapshot>(index.error());
     }
+    // Read the model back out of the cache rather than calling probe() first:
+    // packetIndex() re-probes and may have refined it - it is what recognises a
+    // still image from the packet count - and reading the cached copy is what makes
+    // that refinement visible to the caller.  Calling probe() here instead returned
+    // the pre-refinement model, so the caller planned a file it had already been
+    // told it must refuse.
+    const auto key = keyFor(path);
+    if (!key.has_value()) {
+        return failure<ProbeSnapshot>(key.error());
+    }
+    const auto found = cache_.find(key.value());
+    if (found == cache_.end()) {
+        return Error{ErrorCode::ProbeFailed, "The probe result went missing while it was being read.",
+                     "path: " + path.string(), "Try again."};
+    }
+    snapshot.container = found->second.model;
     snapshot.packets = index.value();
     snapshot.hasPacketIndex = true;
     snapshot.packetsWithoutTimestamp = index.value().untimedPacketCount();
