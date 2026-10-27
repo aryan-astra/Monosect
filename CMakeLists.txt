@@ -53,9 +53,6 @@ else ()
         # GCC 13 and later, Clang and MSVC do not need it.
         add_compile_options(-Wno-restrict)
     endif ()
-    if (MONOSECT_STRICT_WARNINGS)
-        add_compile_options(-Werror)
-    endif ()
 endif ()
 
 set(MONOSECT_CORE_SOURCES
@@ -104,6 +101,9 @@ target_link_libraries(monosect_uimodel PUBLIC monosect_core)
 
 add_library(monosect_core STATIC ${MONOSECT_CORE_SOURCES})
 target_include_directories(monosect_core PUBLIC src)
+if (MONOSECT_STRICT_WARNINGS)
+    target_compile_options(monosect_core PRIVATE $<IF:$<CXX_COMPILER_ID:MSVC>,/WX,-Werror>)
+endif ()
 target_compile_definitions(monosect_core PUBLIC MONOSECT_VERSION_STR="${PROJECT_VERSION}")
 
 # One pin shared by the application, CI and release packaging.
@@ -193,6 +193,10 @@ if (MONOSECT_BUILD_TESTS)
     )
     target_include_directories(monosect-tests PRIVATE src tests)
     target_link_libraries(monosect-tests PRIVATE monosect_core monosect_uimodel)
+    if (WIN32)
+        target_sources(monosect-tests PRIVATE tests/core/BootstrapTests.cpp src/engine/FFmpegBootstrap.cpp)
+        target_link_libraries(monosect-tests PRIVATE winhttp)
+    endif ()
 
     add_test(NAME monosect-unit-tests COMMAND monosect-tests)
     set_tests_properties(monosect-unit-tests PROPERTIES TIMEOUT 90)
@@ -206,6 +210,10 @@ if (MONOSECT_BUILD_TESTS)
     # meant the suite simply could not run on a stock Windows machine - bash is not
     # part of Windows, and the developer's own machine has none.
     find_program(MONOSECT_PYTHON_EXECUTABLE NAMES python3 python)
+    if (MONOSECT_PYTHON_EXECUTABLE)
+        add_test(NAME monosect-harness-safety
+                 COMMAND ${MONOSECT_PYTHON_EXECUTABLE} -B ${CMAKE_SOURCE_DIR}/tests/harness/test_work_directory.py)
+    endif ()
     find_program(MONOSECT_FFMPEG_EXECUTABLE ffmpeg)
     find_program(MONOSECT_FFPROBE_EXECUTABLE ffprobe)
     if (MONOSECT_FFMPEG_EXECUTABLE AND MONOSECT_FFPROBE_EXECUTABLE AND MONOSECT_PYTHON_EXECUTABLE)
@@ -249,7 +257,7 @@ include(FetchContent)
 FetchContent_Declare(
     glfw
     GIT_REPOSITORY https://github.com/glfw/glfw.git
-    GIT_TAG 3.4
+    GIT_TAG 7b6aead9fb88b3623e3b3725ebb42670cbe4c579 # GLFW 3.4
 )
 set(GLFW_BUILD_DOCS OFF CACHE BOOL "" FORCE)
 set(GLFW_BUILD_TESTS OFF CACHE BOOL "" FORCE)
@@ -261,7 +269,7 @@ if (NOT EXISTS "${IMGUI_DIR}/imgui.cpp")
     FetchContent_Declare(
         imgui_src
         GIT_REPOSITORY https://github.com/ocornut/imgui.git
-        GIT_TAG v1.91.5
+        GIT_TAG f401021d5a5d56fe2304056c391e78f81c8d4b8f # ImGui 1.91.5
     )
     FetchContent_MakeAvailable(imgui_src)
     set(IMGUI_DIR "${imgui_src_SOURCE_DIR}")

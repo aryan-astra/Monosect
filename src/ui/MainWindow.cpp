@@ -474,7 +474,13 @@ public:
         std::snprintf(durationValueBuffer_, sizeof(durationValueBuffer_), "%s", "00:10:00");
         std::snprintf(databaseBuffer_, sizeof(databaseBuffer_), "%s",
                       utf8FromPath(JobStore::defaultStore().path()).c_str());
-        if (!smokeTest) {
+        if (smokeTest) {
+            // Check the pins compiled into this executable, not only the packaging script's JSON.
+            if (!verifyToolFile(executableDirectory_ / "ffmpeg.exe", pinnedFfmpeg(), false).ok() ||
+                !verifyToolFile(executableDirectory_ / "ffprobe.exe", pinnedFfprobe(), false).ok()) {
+                return false;
+            }
+        } else {
             startToolBootstrap();
         }
         return true;
@@ -528,11 +534,11 @@ private:
 
     void startToolBootstrap() {
         bootstrapRunning_ = true;
-        bootstrapThread_ = std::jthread([this](std::stop_token) {
+        bootstrapThread_ = std::jthread([this](std::stop_token stop) {
             const bool ok = vsm::ensureFFmpeg(executableDirectory_, [this](const std::string& line) {
                 std::lock_guard<std::mutex> lock(bootstrapMutex_);
                 bootstrapLog_.push_back(line);
-            });
+            }, stop);
             if (!ok) {
                 std::lock_guard<std::mutex> lock(bootstrapMutex_);
                 bootstrapLog_.push_back(kBootstrapFailureMark +
@@ -642,44 +648,16 @@ private:
         controller_->setVerificationPolicy(policy);
         controller_->setLowPriority(lowPriority_);
         controller_->setFfmpegThreads(threadOverride_ ? threads_ : 0);
-        controller_->setGpuEnabled(gpuEnabled_);
-        controller_->setHardwareDecodingEnabled(hardwareDecodingEnabled_);
     }
 
     static ByteCount parseSizeBytes(const char* text, int unitIndex) {
-        const double value = std::strtod(text, nullptr);
-        if (!(value > 0.0)) {
-            return 0;
-        }
-        const double multiplier = unitIndex == 0 ? 1024.0 * 1024.0 * 1024.0
-                                                 : unitIndex == 1 ? 1024.0 * 1024.0 : 1024.0;
-        return static_cast<ByteCount>(value * multiplier);
+        const char* unit = unitIndex == 0 ? " GiB" : unitIndex == 1 ? " MiB" : " KiB";
+        const auto parsed = parseByteSize(std::string(text) + unit);
+        return parsed.has_value() ? parsed.value().bytes : 0;
     }
 
     static Rational parseDurationSeconds(const char* text) {
-        int hours = 0;
-        int minutes = 0;
-        double seconds = 0.0;
-        if (std::sscanf(text, "%d:%d:%lf", &hours, &minutes, &seconds) != 3) {
-            if (std::sscanf(text, "%d:%lf", &minutes, &seconds) != 2) {
-                seconds = std::strtod(text, nullptr);
-                if (!(seconds > 0.0)) {
-                    return Rational{0, 1};
-                }
-                return Rational{static_cast<std::int64_t>(seconds * 1000.0 + 0.5), 1000};
-            }
-            hours = 0;
-        }
-        // A negative field is rejected here rather than left to be clamped downstream.
-        // "-5:00" parses perfectly well through the "%d:%lf" arm - minutes is simply
-        // -5 - and a limit of -5 minutes is not a limit, so the field that would produce
-        // one is refused at the boundary the text comes in through.
-        if (hours < 0 || minutes < 0 || !(seconds >= 0.0)) {
-            return Rational{0, 1};
-        }
-        const std::int64_t milliseconds =
-            static_cast<std::int64_t>((hours * 3600.0 + minutes * 60.0 + seconds) * 1000.0 + 0.5);
-        return Rational{milliseconds, 1000};
+        return parseDuration(text).value_or(Rational{0, 1});
     }
 
     void addSourceFromDialog() {
@@ -1147,6 +1125,7 @@ private:
             return;
         }
         UserConstraint& constraint = controller_->constraint();
+        ImGui::BeginDisabled(controller_->jobRunning() || controller_->mergeRunning());
 
         // --- size limit ---------------------------------------------------------------
         if (ImGui::Checkbox("Maximum size per part", &sizeLimitEnabled_)) {
@@ -1187,8 +1166,9 @@ private:
         ImGui::Spacing();
         const char* modes[] = {"Stream copy (bit-identical)", "Keyframe-aligned copy (default)",
                                "Smart cut (re-encode near the cuts)", "Full re-encode"};
-        ImGui::SetNextItemWidth(320.0f);
-        if (ImGui::Combo("How to cut##mode", &preservationIndex_, modes, 4)) {
+        ImGui::TextUnformatted("How to cut");
+        ImGui::SetNextItemWidth(-1.0f);
+        if (ImGui::Combo("##mode", &preservationIndex_, modes, 4)) {
             applySettingsToController();
         }
         helpMarker(HelpContent::find(HelpTopicId::PreservationModes), [this](HelpTopicId id) { controller_->showHelp(id); });
@@ -1196,8 +1176,9 @@ private:
         ImGui::TextWrapped("%s", preservationModeDetail(constraint.preservation).c_str());
 
         const char* precisions[] = {"Fast", "Balanced", "Maximum (search for the closest fit)"};
-        ImGui::SetNextItemWidth(320.0f);
-        if (ImGui::Combo("How hard to try##precision", &precisionIndex_, precisions, 3)) {
+        ImGui::TextUnformatted("How hard to try");
+        ImGui::SetNextItemWidth(-1.0f);
+        if (ImGui::Combo("##precision", &precisionIndex_, precisions, 3)) {
             applySettingsToController();
         }
         helpMarker(HelpContent::find(HelpTopicId::Precision), [this](HelpTopicId id) { controller_->showHelp(id); });
@@ -1217,21 +1198,28 @@ private:
         }
 
         ImGui::SeparatorText("Output");
+        ImGui::TextUnformatted("File name pattern");
         ImGui::SetNextItemWidth(-1.0f);
         if (ImGui::InputText("##pattern", namingBuffer_, sizeof(namingBuffer_))) {
             applySettingsToController();
         }
         helpMarker(HelpContent::find(HelpTopicId::OutputNaming), [this](HelpTopicId id) { controller_->showHelp(id); });
-        ImGui::SetNextItemWidth(-1.0f);
+        ImGui::TextUnformatted("Destination folder");
+        ImGui::SetNextItemWidth(-ImGui::GetFrameHeight() - ImGui::GetStyle().ItemSpacing.x);
         ImGui::InputText("##outdir", outputDirectoryBuffer_, sizeof(outputDirectoryBuffer_),
                          ImGuiInputTextFlags_ReadOnly);
         ImGui::SameLine();
-        if (ImGui::Button("...##outdir")) {
+        if (ImGui::Button("...##outdir", ImVec2(ImGui::GetFrameHeight(), 0.0f))) {
             const std::string folder = chooseFolderDialog(L"Output folder for the parts", nativeWindow());
             if (!folder.empty()) {
                 std::snprintf(outputDirectoryBuffer_, sizeof(outputDirectoryBuffer_), "%s", folder.c_str());
                 controller_->setOutputDirectory(folder);
             }
+        }
+        ImGui::SeparatorText("Verification");
+        ImGui::TextWrapped("Size, duration, streams and the first keyframe are checked before each part is published.");
+        if (ImGui::Checkbox("Full decode check (slower)", &verifyDecode_)) {
+            applySettingsToController();
         }
 
         // The constraint report is the engine's verdict, shown as is.
@@ -1246,6 +1234,7 @@ private:
                 }
             }
         }
+        ImGui::EndDisabled();
     }
 
     void drawRunPanel() {
@@ -1268,33 +1257,33 @@ private:
         const bool running = controller_->jobRunning();
         const ConstraintReport report = controller_->validate();
         const bool canStart = report.valid && !running && controller_->selected() != nullptr;
+        const float buttonWidth = std::max(80.0f, (ImGui::GetContentRegionAvail().x - ImGui::GetStyle().ItemSpacing.x) / 2.0f);
 
         ImGui::BeginDisabled(running || controller_->selected() == nullptr);
-        if (ImGui::Button("Preview plan", ImVec2(140.0f, 0.0f))) {
+        if (ImGui::Button("Preview plan", ImVec2(buttonWidth, 0.0f))) {
             controller_->previewPlan(controller_->outputDirectory());
         }
         helpMarker(HelpContent::find(HelpTopicId::Boundaries), [this](HelpTopicId id) { controller_->showHelp(id); });
         ImGui::EndDisabled();
         ImGui::SameLine();
         ImGui::BeginDisabled(!canStart);
-        if (ImGui::Button("Start", ImVec2(140.0f, 0.0f))) {
+        if (ImGui::Button("Start", ImVec2(buttonWidth, 0.0f))) {
             controller_->start(controller_->outputDirectory());
         }
         ImGui::EndDisabled();
-        ImGui::SameLine();
-        ImGui::BeginDisabled(!running);
-        if (ImGui::Button("Cancel", ImVec2(100.0f, 0.0f))) {
-            controller_->requestCancel();
-        }
-        ImGui::SameLine();
-        if (controller_->snapshot().phase == SessionPhase::Paused) {
-            if (ImGui::Button("Resume", ImVec2(100.0f, 0.0f))) {
-                controller_->requestResume();
+        if (running) {
+            if (ImGui::Button("Cancel", ImVec2(buttonWidth, 0.0f))) {
+                controller_->requestCancel();
             }
-        } else if (ImGui::Button("Pause after this part", ImVec2(180.0f, 0.0f))) {
-            controller_->requestPause();
+            ImGui::SameLine();
+            if (controller_->snapshot().phase == SessionPhase::Paused) {
+                if (ImGui::Button("Resume", ImVec2(buttonWidth, 0.0f))) {
+                    controller_->requestResume();
+                }
+            } else if (ImGui::Button("Pause after this part", ImVec2(buttonWidth, 0.0f))) {
+                controller_->requestPause();
+            }
         }
-        ImGui::EndDisabled();
 
         const ProgressView progress = controller_->progressView();
         const float fraction = static_cast<float>(progress.fraction);
@@ -1937,24 +1926,7 @@ private:
         }
         helpMarker(HelpContent::find(HelpTopicId::GpuEncoders), [this](HelpTopicId id) { controller_->showHelp(id); });
 
-        if (ImGui::Checkbox("Use a hardware encoder when a boundary must be re-encoded", &gpuEnabled_)) {
-            controller_->setGpuEnabled(gpuEnabled_);
-        }
-        // The consequence is spelled out rather than left to be discovered: on a
-        // copy-only split no encoder is needed, so this changes nothing, and saying
-        // so is more useful than greying the box out and leaving the user to wonder.
-        if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
-            ImGui::BeginTooltip();
-            ImGui::PushTextWrapPos(ImGui::GetFontSize() * 34.0f);
-            ImGui::TextUnformatted(
-                "A stream copy needs no encoder at all. This only applies when the boundary cannot be placed on a "
-                "keyframe and has to be re-encoded.");
-            ImGui::PopTextWrapPos();
-            ImGui::EndTooltip();
-        }
-        if (ImGui::Checkbox("Use hardware decoding", &hardwareDecodingEnabled_)) {
-            controller_->setHardwareDecodingEnabled(hardwareDecodingEnabled_);
-        }
+        ImGui::TextWrapped("Hardware probes are informational. Splitting uses stream copy or software encoders; GPU acceleration is not enabled for jobs.");
     }
 
     void drawResourcesPanel() {
@@ -2407,8 +2379,6 @@ private:
     bool verifyDecode_ = false;
     bool lowPriority_ = false;
     bool threadOverride_ = false;
-    bool gpuEnabled_ = true;
-    bool hardwareDecodingEnabled_ = true;
     int threads_ = 4;
     bool showResources_ = true;
     bool showHistory_ = true;

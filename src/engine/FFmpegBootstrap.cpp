@@ -7,6 +7,7 @@
 #include <shlwapi.h>
 
 #include <cstdio>
+#include <chrono>
 #include <fstream>
 #include <string>
 #include <string_view>
@@ -91,12 +92,13 @@ std::wstring toPowerShellSingleQuotedLiteral(const std::filesystem::path& path) 
 // Download a URL to a local file using WinHTTP. Follows one redirect level.
 bool downloadFile(const std::wstring& host, const std::wstring& path,
                   const std::filesystem::path& outputPath,
-                  const std::function<void(const std::string&)>& onStatus) {
+                  const std::function<void(const std::string&)>& onStatus, std::stop_token stop) {
     HINTERNET hSession = WinHttpOpen(L"Monosect/1.0",
                                      WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
                                      WINHTTP_NO_PROXY_NAME,
                                      WINHTTP_NO_PROXY_BYPASS, 0);
     if (!hSession) return false;
+    WinHttpSetTimeouts(hSession, 5000, 10000, 10000, 5000);
 
     auto cleanup = [&](HINTERNET h) { if (h) WinHttpCloseHandle(h); };
 
@@ -198,7 +200,7 @@ bool downloadFile(const std::wstring& host, const std::wstring& path,
     DWORD totalRead = 0;
     DWORD available = 0;
     std::vector<char> buffer(65536);
-    while (WinHttpQueryDataAvailable(hRequest, &available) && available > 0) {
+    while (!stop.stop_requested() && WinHttpQueryDataAvailable(hRequest, &available) && available > 0) {
         DWORD toRead = std::min(available, static_cast<DWORD>(buffer.size()));
         DWORD read = 0;
         if (WinHttpReadData(hRequest, buffer.data(), toRead, &read) && read > 0) {
@@ -214,7 +216,7 @@ bool downloadFile(const std::wstring& host, const std::wstring& path,
 
     out.close();
     cleanup(hRequest); cleanup(hConnect); cleanup(hSession);
-    return totalRead > 0;
+    return !stop.stop_requested() && totalRead > 0 && out.good();
 }
 
 // Extract ffmpeg.exe and ffprobe.exe from a verified zip.
@@ -243,7 +245,7 @@ bool downloadFile(const std::wstring& host, const std::wstring& path,
 bool extractFFmpegFromZip(const std::filesystem::path& zipPath,
                           const std::filesystem::path& destinationDir,
                           const std::function<void(const std::string&)>& onStatus,
-                          std::string& failureReason) {
+                          std::string& failureReason, std::stop_token stop) {
     if (onStatus) onStatus("Extracting FFmpeg binaries...");
 
     const std::filesystem::path tempDir = destinationDir / "ffmpeg_extract_tmp";
@@ -295,9 +297,16 @@ bool extractFFmpegFromZip(const std::filesystem::path& zipPath,
     }
 
     constexpr DWORD kExtractionTimeoutMs = 300000;   // 5 minutes for a ~200 MB archive
-    const DWORD waited = WaitForSingleObject(pi.hProcess, kExtractionTimeoutMs);
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(kExtractionTimeoutMs);
+    DWORD waited = WAIT_TIMEOUT;
+    while (!stop.stop_requested() && std::chrono::steady_clock::now() < deadline) {
+        waited = WaitForSingleObject(pi.hProcess, 100);
+        if (waited != WAIT_TIMEOUT) {
+            break;
+        }
+    }
     bool timedOut = false;
-    if (waited == WAIT_TIMEOUT) {
+    if (waited != WAIT_OBJECT_0) {
         timedOut = true;
         // Terminate and *wait*: a child that is still alive after this point would
         // keep writing into the folder the caller is about to delete.
@@ -310,7 +319,8 @@ bool extractFFmpegFromZip(const std::filesystem::path& zipPath,
     ::CloseHandle(pi.hProcess);
 
     if (timedOut) {
-        failureReason = "Extraction did not finish within " + std::to_string(kExtractionTimeoutMs / 1000) +
+        failureReason = stop.stop_requested() ? "Extraction was cancelled." :
+                       "Extraction did not finish within " + std::to_string(kExtractionTimeoutMs / 1000) +
                         " seconds and was stopped. Retry, or extract ffmpeg.exe and ffprobe.exe from the archive "
                         "yourself and place them next to MonoSect.exe.";
         std::filesystem::remove_all(tempDir, error);
@@ -336,7 +346,10 @@ bool extractFFmpegFromZip(const std::filesystem::path& zipPath,
 } // namespace
 
 bool ensureFFmpeg(const std::filesystem::path& appDirectory,
-                  const std::function<void(const std::string&)>& onStatus) {
+                  const std::function<void(const std::string&)>& onStatus, std::stop_token stop) {
+    if (stop.stop_requested()) {
+        return false;
+    }
     const std::filesystem::path ffmpegPath = appDirectory / "ffmpeg.exe";
     const std::filesystem::path ffprobePath = appDirectory / "ffprobe.exe";
     const std::filesystem::path zipPath = appDirectory / "ffmpeg_download.zip";
@@ -382,7 +395,7 @@ bool ensureFFmpeg(const std::filesystem::path& appDirectory,
         return false;
     }
     report("Downloading the pinned FFmpeg build: " + archivePin.version);
-    if (!downloadFile(host, path, zipPath, onStatus)) {
+    if (!downloadFile(host, path, zipPath, onStatus, stop)) {
         cleanupArchive();
         report("The FFmpeg download failed. Place ffmpeg.exe and ffprobe.exe next to MonoSect.exe to use MonoSect "
                "without downloading anything.");
@@ -412,7 +425,7 @@ bool ensureFFmpeg(const std::filesystem::path& appDirectory,
 
     // ---- 4. Extract into a temporary folder ----------------------------------
     std::string extractionFailure;
-    if (!extractFFmpegFromZip(zipPath, appDirectory, onStatus, extractionFailure)) {
+    if (!extractFFmpegFromZip(zipPath, appDirectory, onStatus, extractionFailure, stop)) {
         cleanupArchive();
         report(extractionFailure);
         return false;
