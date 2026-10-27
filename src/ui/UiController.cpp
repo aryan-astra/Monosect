@@ -921,6 +921,13 @@ JobStatusLine UiController::verificationLine() const {
         line.detail = "Each part is verified after it is written; results appear here.";
         return line;
     }
+    if (std::none_of(snapshot_.parts.begin(), snapshot_.parts.end(),
+                     [](const SegmentOutcome& part) { return part.wrote; })) {
+        JobStatusLine line;
+        line.headline = "Preview only";
+        line.detail = "No files have been written. Verification runs after each part is written.";
+        return line;
+    }
     VerificationResult result;
     result.passed = snapshot_.verified && !snapshot_.canceled && std::all_of(snapshot_.parts.begin(), snapshot_.parts.end(),
                                                        [](const SegmentOutcome& part) { return part.verified; });

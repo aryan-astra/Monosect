@@ -377,6 +377,8 @@ MONOSECT_TEST(changing_a_limit_makes_the_preview_out_of_date) {
     CHECK(controller.snapshot().parts.size() == controller.preview()->segments.size());
     CHECK(controller.snapshot().partsTotal > 0);
     CHECK(!controller.partLines().empty());
+    CHECK_EQ(std::string("Preview only"), controller.verificationLine().headline);
+    CHECK(controller.verificationLine().tone == StatusTone::Neutral);
     CHECK(controller.snapshot().statusDetail.find("limit") != std::string::npos);
 
     // The user then asks for something else: the old preview may not be started.
@@ -832,8 +834,11 @@ struct FakeMergeEngine final : UiEngine {
         return plan;
     }
 
-    Result<MergeOutcome> runMerge(const MergeJobRequest& request, const JobEvents&) override {
+    Result<MergeOutcome> runMerge(const MergeJobRequest& request, const JobEvents& events) override {
         ++runCalls;
+        while (waitForCancel && events.shouldCancel && !events.shouldCancel()) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        }
         lastInputs = request.inputs;
         MergeOutcome outcome;
         outcome.succeeded = true;
@@ -847,12 +852,35 @@ struct FakeMergeEngine final : UiEngine {
     }
 
     bool planFails = false;
+    bool waitForCancel = false;
     int planCalls = 0;
     int runCalls = 0;
     std::vector<std::string> lastInputs;
 };
 
 } // namespace
+
+MONOSECT_TEST(running_merge_blocks_split_actions_and_input_mutations) {
+    FakeMergeEngine engine;
+    engine.waitForCancel = true;
+    UiController controller(engine);
+    controller.addMergeInput("first.mp4");
+    controller.addMergeInput("second.mp4");
+    controller.previewMerge("out", "joined.mp4");
+    controller.startMerge();
+    CHECK(controller.mergeRunning());
+    controller.start("out");
+    CHECK(controller.snapshot().statusDetail.find("already running") != std::string::npos);
+    CHECK_EQ(0, controller.addSource("source.mp4"));
+    controller.clearMergeInputs();
+    controller.moveMergeInput(0, 1);
+    controller.previewMerge("elsewhere", "changed.mp4");
+    CHECK_EQ(2u, controller.merge().inputs.size());
+    CHECK_EQ(std::string("first.mp4"), controller.merge().inputs.front());
+    CHECK_EQ(std::string("joined.mp4"), controller.merge().outputName);
+    controller.requestMergeCancel();
+    controller.waitForMerge();
+}
 
 MONOSECT_TEST(a_merge_needs_two_files_and_says_so_rather_than_asking_the_engine) {
     FakeMergeEngine engine;
