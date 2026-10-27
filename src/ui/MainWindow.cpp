@@ -152,17 +152,27 @@ void helpMarker(const HelpTopic* topic, const std::function<void(HelpTopicId)>& 
     }
 }
 
-std::string genericFilePathDialog(const wchar_t* title, bool save, const wchar_t* filter) {
+void clearDialogInput() {
+    // Native modal loops can consume releases before GLFW/ImGui sees them.
+    ImGui::GetIO().ClearEventsQueue();
+    ImGui::GetIO().ClearInputKeys();
+    ImGui::GetIO().ClearInputMouse();
+}
+
+std::string genericFilePathDialog(const wchar_t* title, bool save, const wchar_t* filter, HWND owner) {
     std::vector<wchar_t> buffer(32768, L'\0');
     OPENFILENAMEW info{};
     info.lStructSize = sizeof(info);
+    info.hwndOwner = owner;
     info.lpstrFile = buffer.data();
     info.nMaxFile = static_cast<DWORD>(buffer.size());
     info.lpstrTitle = title;
     info.lpstrFilter = filter;
     info.Flags = save ? (OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST)
                       : (OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_EXPLORER);
+    info.Flags |= OFN_NOCHANGEDIR;
     const BOOL ok = save ? GetSaveFileNameW(&info) : GetOpenFileNameW(&info);
+    clearDialogInput();
     if (!ok) {
         return {};
     }
@@ -196,6 +206,7 @@ std::string chooseFolderDialog(const wchar_t* title, HWND owner) {
     info.lpszTitle = title;
     info.ulFlags = BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE;
     PIDLIST_ABSOLUTE items = SHBrowseForFolderW(&info);
+    clearDialogInput();
 
     std::string result;
     if (items != nullptr) {
@@ -213,18 +224,21 @@ std::string chooseFolderDialog(const wchar_t* title, HWND owner) {
     return result;
 }
 
-std::vector<std::string> openFileDialogMulti(const wchar_t* title) {
+std::vector<std::string> openFileDialogMulti(const wchar_t* title, HWND owner) {
     std::vector<std::string> paths;
     std::vector<wchar_t> buffer(65536, L'\0');
     OPENFILENAMEW info{};
     info.lStructSize = sizeof(info);
+    info.hwndOwner = owner;
     info.lpstrFile = buffer.data();
     info.nMaxFile = static_cast<DWORD>(buffer.size());
     info.lpstrTitle = title;
     info.lpstrFilter = L"Media files\0*.mkv;*.mp4;*.mov;*.m4v;*.ts;*.m2ts;*.webm;*.avi;*.flv;*.wmv;*.mpg;*.mpeg\0"
                        L"All files\0*.*\0";
-    info.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_EXPLORER | OFN_ALLOWMULTISELECT;
-    if (!GetOpenFileNameW(&info)) {
+    info.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_EXPLORER | OFN_ALLOWMULTISELECT | OFN_NOCHANGEDIR;
+    const BOOL ok = GetOpenFileNameW(&info);
+    clearDialogInput();
+    if (!ok) {
         return paths;
     }
     // Multi-select returns "folder\0name1\0name2\0\0" or a single full path.
@@ -665,7 +679,7 @@ private:
         if (!controller_ || controller_->jobRunning() || controller_->mergeRunning()) {
             return;
         }
-        const std::vector<std::string> paths = openFileDialogMulti(L"Add source files");
+        const std::vector<std::string> paths = openFileDialogMulti(L"Add source files", nativeWindow());
         for (const std::string& path : paths) {
             controller_->addSource(path);
         }
@@ -1050,7 +1064,7 @@ private:
             ImGui::TextColored(toneColor(StatusTone::Bad), "%s", bootstrapError_.c_str());
             if (ImGui::Button("Locate ffmpeg.exe...")) {
                 const std::string path = genericFilePathDialog(L"Select ffmpeg.exe", false,
-                                                               L"ffmpeg\0ffmpeg.exe\0All files\0*.*\0");
+                                                               L"ffmpeg\0ffmpeg.exe\0All files\0*.*\0", nativeWindow());
                 if (!path.empty()) {
                     // Under the lock, because the bootstrap thread writes these same
                     // two strings; see startToolBootstrap().
@@ -1636,7 +1650,7 @@ private:
         }
 
         if (ImGui::Button("Add files...")) {
-            for (const std::string& path : openFileDialogMulti(L"Choose files to merge")) {
+            for (const std::string& path : openFileDialogMulti(L"Choose files to merge", nativeWindow())) {
                 controller_->addMergeInput(path);
             }
         }
