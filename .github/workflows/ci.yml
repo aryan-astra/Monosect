@@ -31,7 +31,7 @@ jobs:
 
       - name: Configure
         shell: msys2 {0}
-        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DMONOSECT_STRICT_WARNINGS=ON
 
       - name: Build
         shell: msys2 {0}

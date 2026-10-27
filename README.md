@@ -148,6 +148,11 @@ build manifest. Packaging renders one GUI frame with compiler directories remove
 from PATH; it fails if the package cannot start. Tags produce draft releases only.
 Review [production readiness](docs/PRODUCTION_READINESS.md) before publishing.
 
+Public release packages use `-OmitMediaTools`: FFmpeg is downloaded and verified
+from upstream on first launch. Extract to a writable directory and allow internet
+access for that initial setup. Local packages without that switch bundle the tools
+and require a separate review of their redistribution obligations.
+
 Hardware probes report available encoders; current jobs use stream copy or software
 encoders. Hardware acceleration is not wired into job execution.
 

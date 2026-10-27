@@ -1,7 +1,8 @@
 param(
     [Parameter(Mandatory = $true)][string]$BuildDirectory,
     [Parameter(Mandatory = $true)][string]$ToolsDirectory,
-    [Parameter(Mandatory = $true)][string]$Destination
+    [Parameter(Mandatory = $true)][string]$Destination,
+    [switch]$OmitMediaTools
 )
 $ErrorActionPreference = 'Stop'
 $repo = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
@@ -79,6 +80,13 @@ try {
     $process.Dispose()
 } finally {
     $env:PATH = $previousPath
+}
+if ($OmitMediaTools) {
+    foreach ($file in @('ffmpeg.exe', 'ffprobe.exe', 'FFmpeg-LICENSE.txt', 'FFmpeg-README.txt')) {
+        Remove-Item -LiteralPath (Join-Path $stage $file)
+    }
+    'FFmpeg and ffprobe are downloaded from the pinned upstream build on first launch. Internet access and write permission to this folder are required for that setup.' |
+        Set-Content -LiteralPath (Join-Path $stage 'FIRST-RUN.txt') -Encoding utf8
 }
 $zip = Join-Path $output "Monosect-$version-portable.zip"
 Compress-Archive -Path (Join-Path $stage '*') -DestinationPath $zip -Force

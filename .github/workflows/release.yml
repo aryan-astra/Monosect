@@ -53,7 +53,7 @@ jobs:
 
       - name: Configure CMake
         shell: msys2 {0}
-        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DMONOSECT_STRICT_WARNINGS=ON
 
       - name: Build all release targets
         shell: msys2 {0}
@@ -86,7 +86,7 @@ jobs:
           MONOSECT_RELEASE_SIGNING_KEY_ID: ${{ secrets.MONOSECT_RELEASE_SIGNING_KEY_ID }}
         run: |
           $ErrorActionPreference = 'Stop'
-          ./tools/package-release.ps1 -BuildDirectory build -ToolsDirectory release -Destination release
+          ./tools/package-release.ps1 -BuildDirectory build -ToolsDirectory release -Destination release -OmitMediaTools
           $version = (Get-Content version.txt -Raw).Trim()
           $uploadFiles = @("release/Monosect-$version-portable.zip", 'release/SHA256SUMS.txt')
           if ($env:MONOSECT_RELEASE_SIGNING_KEY) {
@@ -124,10 +124,11 @@ jobs:
             **Monosect ${{ github.ref_name }}**
 
             ### Installation
-            **Recommended:** Download the portable ZIP, extract anywhere, and run `Monosect.exe`.
+            Download the portable ZIP, extract it to a writable folder, and run `Monosect.exe`.
+            The first launch needs internet access to download and verify FFmpeg from the pinned upstream build.
 
             ### Contents
-            - `Monosect-<version>-portable.zip` — Complete package (executable + bundled FFmpeg + resources)
+            - `Monosect-<version>-portable.zip` — Application, compiler runtimes, resources, license notices and build manifest
             - `SHA256SUMS.txt` — Checksums for file integrity verification
 
             ### Verification
