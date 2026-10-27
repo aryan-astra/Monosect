@@ -225,6 +225,7 @@ if (MONOSECT_BUILD_TESTS)
         tests/core/PlannerTests.cpp
         tests/core/VerificationTests.cpp
         tests/core/VerificationEngineTests.cpp
+        tests/core/OutputCommitterTests.cpp
         tests/core/NamingTests.cpp
         tests/core/MergePlannerTests.cpp
         tests/core/JobStoreTests.cpp
@@ -237,6 +238,7 @@ if (MONOSECT_BUILD_TESTS)
     target_link_libraries(monosect-tests PRIVATE monosect_core monosect_uimodel)
 
     add_test(NAME monosect-unit-tests COMMAND monosect-tests)
+    set_tests_properties(monosect-unit-tests PROPERTIES TIMEOUT 90)
 
     # The end-to-end suite drives the real FFmpeg tools through monosect-cli and
     # then re-checks every written file with an *independent* checker, so a bug in

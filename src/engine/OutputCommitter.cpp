@@ -18,6 +18,24 @@
 namespace monosect::core {
 namespace {
 
+#if defined(_WIN32)
+std::filesystem::path extendedPath(const std::filesystem::path& path) {
+    std::error_code error;
+    const auto absolute = std::filesystem::absolute(path, error);
+    if (error) {
+        return path;
+    }
+    std::wstring native = absolute.lexically_normal().wstring();
+    if (native.rfind(L"\\\\?\\", 0) == 0) {
+        return absolute;
+    }
+    if (native.rfind(L"\\\\", 0) == 0) {
+        return std::filesystem::path(L"\\\\?\\UNC\\" + native.substr(2));
+    }
+    return std::filesystem::path(L"\\\\?\\" + native);
+}
+#endif
+
 std::string randomSuffix() {
     std::random_device device;
     std::mt19937_64 generator(device());
@@ -58,6 +76,10 @@ Status OutputCommitter::begin() {
     }
     for (int attempt = 0; attempt < 8; ++attempt) {
         jobDirectory_ = outputDirectory_ / (".monosect-" + jobTag_ + "-" + randomSuffix());
+#if defined(_WIN32)
+        // Temporary names add a job folder and suffixes beyond the visible output path.
+        jobDirectory_ = extendedPath(jobDirectory_);
+#endif
         std::error_code createError;
         if (std::filesystem::create_directory(jobDirectory_, createError)) {
             return Status::success();
