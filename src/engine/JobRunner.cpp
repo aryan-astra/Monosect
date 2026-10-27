@@ -60,6 +60,12 @@ JobRunner::JobRunner(FFprobeService& prober, IProcessRunner& runner, std::string
     : prober_(prober), runner_(runner), ffmpegPath_(std::move(ffmpegPath)) {}
 
 Result<SplitPlan> JobRunner::planOnly(const JobRequest& request, const JobEvents& events) {
+    if (request.verification.contentHashCheck &&
+        request.constraint.preservation != PreservationMode::StreamCopy &&
+        request.constraint.preservation != PreservationMode::KeyframeAligned) {
+        return Error{ErrorCode::ConstraintInvalid, "Source hash comparison requires stream-copy mode.", {},
+                     "Choose stream copy or keyframe-aligned copy, or disable source hash comparison."};
+    }
     const auto log = [&events](const std::string& line) {
         if (events.onLog) {
             events.onLog(line);
@@ -511,7 +517,7 @@ Result<JobRunner::RenderResult> JobRunner::renderSmartCut(const SplitPlan& plan,
     headRender.input = plan.sourcePath;
     headRender.output = headPath.string();
     headRender.start = seekTime(head.startSeconds);
-    headRender.end = head.endSeconds;
+    headRender.end = seekTime(head.endSeconds);
     headRender.containerFormat = containerNameForExtension(plan.outputExtension);
     headRender.threads = request.ffmpegThreads;
     headRender.lowPriority = request.lowPriority;
@@ -565,7 +571,7 @@ Result<JobRunner::RenderResult> JobRunner::renderSmartCut(const SplitPlan& plan,
     bodyRender.input = plan.sourcePath;
     bodyRender.output = bodyPath.string();
     bodyRender.start = seekTime(head.endSeconds);
-    bodyRender.end = segment.endSeconds;
+    bodyRender.end = seekTime(segment.endSeconds);
     bodyRender.copiedStreams = segment.copiedStreamIndexes;
     bodyRender.containerFormat = containerNameForExtension(plan.outputExtension);
     bodyRender.threads = request.ffmpegThreads;
@@ -628,7 +634,7 @@ Result<JobRunner::RenderResult> JobRunner::renderReencode(const SplitPlan& plan,
     render.input = plan.sourcePath;
     render.output = temporaryPath.string();
     render.start = seekTime(segment.startSeconds);
-    render.end = segment.endSeconds;
+    render.end = seekTime(segment.endSeconds);
     render.copiedStreams = segment.copiedStreamIndexes;
     render.containerFormat = containerNameForExtension(plan.outputExtension);
     render.threads = request.ffmpegThreads;
@@ -1040,59 +1046,59 @@ Result<JobOutcome> JobRunner::runInternal(const JobRequest& request, const JobEv
                             if (!remaining.has_value() || !remaining.value().planned) {
                                 log("the larger boundary was skipped because the remaining source could not be planned");
                             } else {
-                            const std::filesystem::path retryPath =
-                                committer.temporaryPathFor(segment.outputFileName + ".closer");
-                            auto renderedRetry = renderPart(plan, bigger.value(), retryPath, request, events);
-                            if (renderedRetry.has_value()) {
-                                const std::size_t beforeRetry = measurements.size();
-                                auto retryVerification =
-                                    verifier.verifyPart(plan, bigger.value(), retryPath, &measurements,
-                                                        events.shouldCancel);
-                                if (retryVerification.has_value() && retryVerification.value().passed &&
-                                    renderedRetry.value().outcome.fileSizeBytes > partOutcome.fileSizeBytes) {
-                                    log("part " + std::to_string(segment.index) + ": the first result used " +
-                                        formatBytesShort(slack) + " less than the limit; the larger boundary " +
-                                        formatDuration(bigger.value().endSeconds) + " was written and verified");
-                                    committer.discard(temporaryPath);
-                                    // From here on the retry file is the part.  Every
-                                    // later step - the measurement bookkeeping below, and
-                                    // the flush and commit after this block - must name
-                                    // this path and not the one just discarded.
-                                    verifiedPath = retryPath;
-                                    partOutcome = renderedRetry.value().outcome;
-                                    plan = std::move(remaining.value());
-                                    segment = plan.segments[index];
-                                    outcome.plan = plan;
-                                    if (events.onPlanReady) {
-                                        events.onPlanReady(plan);
-                                    }
-                                    outcome.partsRewrittenForCloseness++;
-                                    if (measurements.size() > beforeRetry) {
-                                        // The retry is the file that is kept, so its
-                                        // measurement replaces the discarded part's.
-                                        const SegmentMeasurement retryMeasurement = measurements.back();
-                                        measurements.erase(measurements.begin() +
-                                                           static_cast<std::ptrdiff_t>(measurementsBefore));
-                                        if (retryMeasurement.durationKnown) {
-                                            partOutcome.duration = retryMeasurement.duration;
+                                const std::filesystem::path retryPath =
+                                    committer.temporaryPathFor(segment.outputFileName + ".closer");
+                                auto renderedRetry = renderPart(plan, bigger.value(), retryPath, request, events);
+                                if (renderedRetry.has_value()) {
+                                    const std::size_t beforeRetry = measurements.size();
+                                    auto retryVerification =
+                                        verifier.verifyPart(plan, bigger.value(), retryPath, &measurements,
+                                                            events.shouldCancel);
+                                    if (retryVerification.has_value() && retryVerification.value().passed &&
+                                        renderedRetry.value().outcome.fileSizeBytes > partOutcome.fileSizeBytes) {
+                                        log("part " + std::to_string(segment.index) + ": the first result used " +
+                                            formatBytesShort(slack) + " less than the limit; the larger boundary " +
+                                            formatDuration(bigger.value().endSeconds) + " was written and verified");
+                                        committer.discard(temporaryPath);
+                                        // From here on the retry file is the part.  Every
+                                        // later step - the measurement bookkeeping below, and
+                                        // the flush and commit after this block - must name
+                                        // this path and not the one just discarded.
+                                        verifiedPath = retryPath;
+                                        partOutcome = renderedRetry.value().outcome;
+                                        plan = std::move(remaining.value());
+                                        segment = plan.segments[index];
+                                        outcome.plan = plan;
+                                        if (events.onPlanReady) {
+                                            events.onPlanReady(plan);
                                         }
-                                        SizeObservation retryObservation = observation;
-                                        retryObservation.actualFileBytes = partOutcome.fileSizeBytes;
-                                        retryObservation.duration = retryMeasurement.durationKnown
-                                                                        ? retryMeasurement.duration
-                                                                        : bigger.value().predictedDuration;
-                                        sizeModel.observe(retryObservation);
+                                        outcome.partsRewrittenForCloseness++;
+                                        if (measurements.size() > beforeRetry) {
+                                            // The retry is the file that is kept, so its
+                                            // measurement replaces the discarded part's.
+                                            const SegmentMeasurement retryMeasurement = measurements.back();
+                                            measurements.erase(measurements.begin() +
+                                                               static_cast<std::ptrdiff_t>(measurementsBefore));
+                                            if (retryMeasurement.durationKnown) {
+                                                partOutcome.duration = retryMeasurement.duration;
+                                            }
+                                            SizeObservation retryObservation = observation;
+                                            retryObservation.actualFileBytes = partOutcome.fileSizeBytes;
+                                            retryObservation.duration = retryMeasurement.durationKnown
+                                                                            ? retryMeasurement.duration
+                                                                            : bigger.value().predictedDuration;
+                                            sizeModel.observe(retryObservation);
+                                        }
+                                    } else {
+                                        committer.discard(retryPath);
+                                        if (measurements.size() > beforeRetry) {
+                                            measurements.erase(measurements.begin() +
+                                                               static_cast<std::ptrdiff_t>(beforeRetry));
+                                        }
                                     }
                                 } else {
                                     committer.discard(retryPath);
-                                    if (measurements.size() > beforeRetry) {
-                                        measurements.erase(measurements.begin() +
-                                                           static_cast<std::ptrdiff_t>(beforeRetry));
-                                    }
                                 }
-                            } else {
-                                committer.discard(retryPath);
-                            }
                             }
                         } else {
                             // Keep the calibration from the verified part.
@@ -1203,6 +1209,10 @@ Result<JobOutcome> JobRunner::runInternal(const JobRequest& request, const JobEv
             log("part " + std::to_string(segment.index) + ": the next attempt ends at " +
                 formatDuration(corrected.endSeconds) + " instead of " + formatDuration(segment.endSeconds));
             plan = replanned.value();
+            outcome.plan = plan;
+            if (events.onPlanReady) {
+                events.onPlanReady(plan);
+            }
             segment = corrected;
             outcome.partsRewrittenAfterFailure++;
         }

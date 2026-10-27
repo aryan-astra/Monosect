@@ -570,6 +570,20 @@ def section_modes(cli: str, fixtures: Path, work: Path) -> None:
                       "re-encode" in result.stdout or "re-encod" in result.stdout,
                       result.stdout)
 
+    for mode in ("smart", "reencode"):
+        out = work / f"offset-{mode}"
+        result = run_cli(cli, ["split", str(fixtures / "non_zero_start.mkv"), "--duration", "2",
+                               "--mode", mode, "--out", str(out)])
+        REPORT.ok(f"{mode} handles a source starting at 5 seconds", result.returncode == 0,
+                  result.stdout + result.stderr)
+        durations = [probe_duration(str(part)) for part in out.glob("*.mkv")]
+        REPORT.ok(f"{mode} offset outputs obey the duration limit", bool(durations)
+                  and all(value is not None and value <= 2.0 for value in durations))
+    hashed = run_cli(cli, ["split", str(fixtures / "h264_cfr.mp4"), "--duration", "3", "--verify-hash",
+                           "--out", str(work / "split-hash")])
+    REPORT.ok("copied video and audio hashes match exact source packet ranges", hashed.returncode == 0,
+              hashed.stdout + hashed.stderr)
+
 
 # ---------------------------------------------------------------------------
 # job history
@@ -777,6 +791,17 @@ def section_closeness(cli: str, main: Path, work: Path) -> None:
                   and abs(seconds(parts[-1]["end"]) - probe_duration(str(larger))) < 0.05)
         REPORT.ok("all larger retry outputs stay inside the byte limit",
                   all(Path(p["path"]).stat().st_size <= retry_limit for p in parts))
+        def frame_count(path: str) -> int:
+            counted = subprocess.run([FFPROBE, "-v", "error", "-select_streams", "v:0", "-count_frames",
+                                      "-show_entries", "stream=nb_read_frames", "-of", "csv=p=0", path],
+                                     capture_output=True, text=True)
+            return int(counted.stdout.strip()) if counted.returncode == 0 and counted.stdout.strip().isdigit() else -1
+        source_frames = frame_count(str(larger))
+        output_frames = [frame_count(p["path"]) for p in parts]
+        REPORT.ok("retry outputs preserve the source frame count independently",
+                  source_frames > 0 and all(count > 0 for count in output_frames)
+                  and sum(output_frames) == source_frames,
+                  f"source={source_frames} parts={output_frames}")
 
 
 def prepare_work_directory(work: Path) -> None:
