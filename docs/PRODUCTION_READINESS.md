@@ -2,12 +2,19 @@
 
 This records the production hardening performed on 2026-10-27. The original
 [audit](audits/PROJECT_AUDIT_AND_ROADMAP.md) remains a historical snapshot. The
-current branch is `codex/production-hardening`; nothing has been pushed or released.
+implementation branch is `codex/production-hardening`. GitHub run and release
+status must be checked separately from these local validation results.
 
 ## Completed
 
 - Correct merge-name capacity and synchronize bootstrap progress.
 - Deliver merge results to the UI thread instead of mutating its live state.
+- Consume completed split results once, avoiding repeated per-frame result copies.
+- Freeze completed elapsed time and prevent old results returning after source changes.
+- Block conflicting split/merge actions, invalidate changed output folders, route
+  shortcuts to the visible session, and discard stale source plans.
+- Own native dialogs, preserve the working directory and clear stale dialog input.
+- Distinguish preview-only results and wrap progress details below the progress bar.
 - Reject size-read errors, requested decode failures and failed/mismatching hashes.
 - Fail incomplete sequences while retaining already published parts; show warnings.
 - Replan from the actual successful retry boundary and retain the final actual plan.
@@ -42,7 +49,7 @@ the existing local checkout after verifying their revision IDs matched the pins.
 
 - Full Windows GUI/core/CLI build with strict core warnings: passed. Third-party
   code emits warnings; strict core warnings no longer break on third-party code.
-- All 114 unit tests (1,032 checks) and the harness-safety CTest suite: passed, including long temporary paths,
+- All 119 unit tests (1,061 checks) and the harness-safety CTest suite: passed, including long temporary paths,
   failed verification, retry boundaries, safe work directories and cancelled bootstrap.
 - Full real-media run: 149 passed, zero failed, zero skipped. An independent
   frame-count check found all 1,800 source frames across the eight winning-retry
@@ -60,6 +67,12 @@ the existing local checkout after verifying their revision IDs matched the pins.
   window controls but not meaningful application controls in the observed UIA tree.
 - Split and merge panels inspected after the layout fixes. PowerShell and Python
   syntax checks, workflow YAML parsing and Git whitespace checks passed.
+- Actual first-run setup without bundled tools downloaded, verified and extracted
+  FFmpeg successfully and reached the ready screen. Native file selection was
+  retested after the dialog fix; source reading, keyboard preview and a complete
+  verified split were exercised through the desktop UI.
+- Public release packaging omits FFmpeg executables and uses that verified upstream
+  download on first launch. Bundled-media local packages remain a separate option.
 
 Key commands:
 
@@ -76,8 +89,8 @@ python -B tests/harness/end_to_end.py build/monosect-cli.exe e2e-work
 
 ## Before public distribution
 
-The result is a tested release candidate, not certification of every supported
-machine or media format. Keep the release as a draft until these checks are resolved:
+The result is tested against the cases above, not certification of every supported
+machine or media format. Remaining validation and limitations:
 
 1. Run the updated workflow on GitHub; no remote workflow was dispatched locally.
    The local test does not establish hosted-runner OpenGL or signing behavior.
@@ -85,9 +98,10 @@ machine or media format. Keep the release as a draft until these checks are reso
    layouts, shutdown during a real first-run download, and representative user media.
 3. Resolve screen-reader accessibility. ImGui keyboard navigation is enabled but
    the observed application controls are not exposed through Windows UI Automation.
-4. Review Corresponding Source and complete third-party redistribution obligations
-   for the exact FFmpeg and compiler runtime binaries. Included notices and source
-   links do not substitute for fulfilling those obligations.
+4. Public packages download FFmpeg directly from upstream instead of redistributing
+   it. Before distributing a bundled-media package, review Corresponding Source and
+   complete the obligations for that exact FFmpeg build and its linked libraries.
+   Included notices and source links do not substitute for those obligations.
 5. Configure a private vulnerability-reporting channel and review dependency
    advisories. No complete advisory scan, secret-history scan, fuzzing or sanitizer
    run has been performed.
