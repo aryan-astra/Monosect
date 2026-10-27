@@ -17,13 +17,15 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
       - name: Validate tag matches repository version
         if: startsWith(github.ref, 'refs/tags/')
         shell: pwsh
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
         run: |
-          $tag = "${{ github.ref_name }}"
+          $tag = $env:RELEASE_TAG
           $versionFromTag = $tag.TrimStart('v')
           if (-not (Test-Path "version.txt")) {
             throw "version.txt not found"
@@ -38,7 +40,7 @@ jobs:
           Write-Host "✓ Tag/version validation passed: $versionFromTag"
 
       - name: Setup MSYS2 (MinGW64 toolchain)
-        uses: msys2/setup-msys2@v2
+        uses: msys2/setup-msys2@ec48f7c5447b3140e2b088413ae3a55687bccb6e # v2
         with:
           msystem: MINGW64
           update: true
@@ -59,7 +61,7 @@ jobs:
 
       - name: Run unit tests
         shell: msys2 {0}
-        run: ctest --test-dir build -R '^monosect-unit-tests$' --output-on-failure
+        run: ctest --test-dir build -E monosect-end-to-end --output-on-failure
 
       - name: Bundle and verify the pinned FFmpeg
         shell: pwsh
@@ -69,94 +71,53 @@ jobs:
         shell: msys2 {0}
         run: python tests/harness/end_to_end.py build/monosect-cli.exe e2e-work
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         if: always()
         with:
           name: release-e2e-log
           path: e2e-work/e2e.log
           if-no-files-found: ignore
 
-      - name: Prepare release assets
+      - name: Prepare and smoke-test portable package
         id: prepare_assets
         shell: pwsh
+        env:
+          MONOSECT_RELEASE_SIGNING_KEY: ${{ secrets.MONOSECT_RELEASE_SIGNING_KEY }}
+          MONOSECT_RELEASE_SIGNING_KEY_ID: ${{ secrets.MONOSECT_RELEASE_SIGNING_KEY_ID }}
         run: |
           $ErrorActionPreference = 'Stop'
-          Write-Host "Preparing release assets..."
-          
-          if (-not (Test-Path "build/Monosect.exe")) {
-            throw "Build artifact not found: build/Monosect.exe"
-          }
-          if (-not ((Test-Path "release/ffmpeg.exe") -and (Test-Path "release/ffprobe.exe"))) {
-            throw "FFmpeg binaries not found in release directory"
-          }
-          
-          $version = "${{ github.ref_name }}".TrimStart('v')
-          $exePath = "release/Monosect.exe"
-          $portableZipPath = "release/Monosect-$version-portable.zip"
-          
-          Copy-Item "build/Monosect.exe" $exePath -Force
-          
-          # Create portable package with bundled FFmpeg
-          $portableFiles = @($exePath, "release/ffmpeg.exe", "release/ffprobe.exe")
-          if (Test-Path "Monosect-icon-square.png") { $portableFiles += "Monosect-icon-square.png" }
-          if (Test-Path "Monosect-full-logo.png") { $portableFiles += "Monosect-full-logo.png" }
-          
-          Compress-Archive -Path $portableFiles -DestinationPath $portableZipPath -Force
-          if (-not (Test-Path $portableZipPath)) {
-            throw "Failed to create portable ZIP"
-          }
-          Write-Host "✓ Created portable package: $(Split-Path -Leaf $portableZipPath)"
-          
-          # Generate SHA256 checksums
-          $checksumLines = @()
-          $checksumTargets = @($exePath, $portableZipPath)
-          
-          foreach ($target in $checksumTargets) {
-            if (Test-Path $target) {
-              $sha = (Get-FileHash -Algorithm SHA256 $target).Hash.ToLowerInvariant()
-              $checksumLines += "$sha  $(Split-Path -Path $target -Leaf)"
+          ./tools/package-release.ps1 -BuildDirectory build -ToolsDirectory release -Destination release
+          $version = (Get-Content version.txt -Raw).Trim()
+          $uploadFiles = @("release/Monosect-$version-portable.zip", 'release/SHA256SUMS.txt')
+          if ($env:MONOSECT_RELEASE_SIGNING_KEY) {
+            if (-not $env:MONOSECT_RELEASE_SIGNING_KEY_ID) { throw 'A signing key ID is required' }
+            $privateKeyPath = Join-Path $env:RUNNER_TEMP 'monosect-signing.key'
+            try {
+              $env:MONOSECT_RELEASE_SIGNING_KEY | Set-Content -LiteralPath $privateKeyPath -Encoding ascii
+              gpg --batch --import $privateKeyPath
+              if ($LASTEXITCODE -ne 0) { throw 'Signing key import failed' }
+              gpg --batch --yes --armor --detach-sign --local-user $env:MONOSECT_RELEASE_SIGNING_KEY_ID --output release/SHA256SUMS.txt.asc release/SHA256SUMS.txt
+              if ($LASTEXITCODE -ne 0) { throw 'Checksum signature failed' }
+              $uploadFiles += 'release/SHA256SUMS.txt.asc'
+            } finally {
+              if (Test-Path -LiteralPath $privateKeyPath) { Remove-Item -LiteralPath $privateKeyPath -Force }
             }
           }
-          $checksumLines | Set-Content "release/SHA256SUMS.txt" -Encoding ascii
-          Write-Host "✓ Generated SHA256SUMS.txt"
-          
-          # Prepare upload list
-          $uploadFiles = @(
-            $exePath,
-            $portableZipPath,
-            "release/SHA256SUMS.txt"
-          )
-          
-          # GPG sign if credentials provided
-          if ("${{ secrets.MONOSECT_RELEASE_SIGNING_KEY }}" -ne "") {
-            Write-Host "Signing release with GPG..."
-            $privateKeyPath = Join-Path $env:RUNNER_TEMP "release-signing.key"
-            "${{ secrets.MONOSECT_RELEASE_SIGNING_KEY }}" | Set-Content $privateKeyPath -Encoding ascii
-            
-            gpg --batch --import $privateKeyPath 2>&1 | Out-Null
-            Remove-Item $privateKeyPath -Force
-            
-            if ("${{ secrets.MONOSECT_RELEASE_SIGNING_KEY_ID }}" -eq "") {
-              throw "MONOSECT_RELEASE_SIGNING_KEY_ID required when signing key is provided"
-            }
-            
-            gpg --batch --yes --armor --detach-sign --local-user "${{ secrets.MONOSECT_RELEASE_SIGNING_KEY_ID }}" --output "release/Monosect.exe.asc" $exePath
-            
-            if (Test-Path "release/Monosect.exe.asc") {
-              $uploadFiles += "release/Monosect.exe.asc"
-              Write-Host "✓ GPG signature generated"
-            }
-          } else {
-            Write-Host "⚠ No GPG credentials configured; skipping signature"
-          }
-          
-          "files<<EOF" >> $env:GITHUB_OUTPUT
-          ($uploadFiles | Sort-Object -Unique) -join "`n" >> $env:GITHUB_OUTPUT
-          "EOF" >> $env:GITHUB_OUTPUT
+          'files<<EOF' >> $env:GITHUB_OUTPUT
+          $uploadFiles -join "`n" >> $env:GITHUB_OUTPUT
+          'EOF' >> $env:GITHUB_OUTPUT
+
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: portable-package
+          path: |
+            release/Monosect-*-portable.zip
+            release/SHA256SUMS.txt*
+          if-no-files-found: error
 
       - name: Create GitHub release
         if: startsWith(github.ref, 'refs/tags/')
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           files: ${{ steps.prepare_assets.outputs.files }}
           body: |
@@ -166,8 +127,7 @@ jobs:
             **Recommended:** Download the portable ZIP, extract anywhere, and run `Monosect.exe`.
 
             ### Contents
-            - `Monosect.exe` — Standalone executable
-            - `Monosect-${{ github.ref_name }}-portable.zip` — Complete package (executable + bundled FFmpeg + resources)
+            - `Monosect-<version>-portable.zip` — Complete package (executable + bundled FFmpeg + resources)
             - `SHA256SUMS.txt` — Checksums for file integrity verification
 
             ### Verification
@@ -178,5 +138,5 @@ jobs:
             For documentation, source code, and issue tracking, visit [github.com/aryan-astra/Monosect](https://github.com/aryan-astra/Monosect).
           generate_release_notes: true
           fail_on_unmatched_files: true
-          draft: false
+          draft: true
           prerelease: false
