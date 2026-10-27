@@ -93,8 +93,11 @@ MONOSECT_TEST(a_damaged_line_is_reported_not_hidden) {
 }
 
 MONOSECT_TEST(an_unwritable_database_reports_an_error_instead_of_crashing) {
-    JobStore store(std::filesystem::path("Z:\\no\\such\\folder\\jobs.jsonl"));
+    const auto blocker = temporaryDatabase(("monosect-blocker-" + makeJobId()).c_str());
+    std::ofstream(blocker).put('x');
+    JobStore store(blocker / "jobs.jsonl");
     const Status status = store.append(makeRecord("x", "completed", 1));
     CHECK(!status.ok());
     CHECK(!status.error.message.empty());
+    std::filesystem::remove(blocker);
 }

@@ -17,7 +17,6 @@ Usage:
 Environment:
     MONOSECT_FFMPEG, MONOSECT_FFPROBE   binaries to use (default: PATH)
     MONOSECT_E2E_SKIP                   comma-separated section names to skip
-    MONOSECT_E2E_KEEP                   set to keep the work directory
 """
 
 from __future__ import annotations
@@ -30,6 +29,7 @@ import signal
 import subprocess
 import sys
 import time
+import tempfile
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -473,6 +473,18 @@ def section_collisions(cli: str, main: Path, work: Path) -> None:
     stray = [p.name for p in out.iterdir() if p.name.startswith(".monosect-")]
     REPORT.ok("no working folder was left behind", not stray, ", ".join(stray))
 
+    source_bytes = main.read_bytes()
+    protected = run_cli(cli, ["split", str(main), "--limit", "256KiB", "--out", str(main.parent),
+                              "--pattern", "{name}", "--overwrite"])
+    REPORT.ok("a split refuses to overwrite its own source", protected.returncode != 0)
+    protected = run_cli(cli, ["merge", str(main.parent), str(main), str(main),
+                              "--name", main.name, "--overwrite"])
+    REPORT.ok("a merge refuses to overwrite an input", protected.returncode != 0)
+    REPORT.ok("source bytes survive overwrite requests", main.read_bytes() == source_bytes)
+    traversal = run_cli(cli, ["merge", str(out), str(main), str(main), "--name", "../escape.mp4"])
+    REPORT.ok("a merge name cannot escape its output directory", traversal.returncode != 0
+              and not (work / "escape.mp4").exists())
+
 
 # ---------------------------------------------------------------------------
 # formats
@@ -744,6 +756,41 @@ def section_closeness(cli: str, main: Path, work: Path) -> None:
                   not any(p.name.startswith(".monosect-") for p in reencode.iterdir()),
                   ", ".join(p.name for p in reencode.iterdir() if p.name.startswith(".monosect-")))
 
+    # The small fixture cannot cross the runner's 1 MiB retry threshold.
+    larger = work / "fixtures" / "larger.mp4"
+    retry_out = work / "closeness-won-retry"
+    retry_db = work / "closeness-won-retry.jsonl"
+    retry_limit = 4 * 1024 * 1024
+    retry = run_cli(cli, ["split", str(larger), "--limit", str(retry_limit), "--out", str(retry_out),
+                          "--mode", "reencode", "--closeness", "1", "--db", str(retry_db)])
+    if REPORT.ok("a large re-encode with a closeness retry succeeds", retry.returncode == 0,
+                 retry.stdout + retry.stderr):
+        REPORT.ok("the large fixture exercises a winning retry", "larger boundary" in retry.stdout)
+        record = json.loads(retry_db.read_text(encoding="utf-8").splitlines()[-1])
+        parts = record["parts"]
+        def seconds(value: dict) -> float:
+            return value["num"] / value["den"]
+        REPORT.ok("winning retries leave contiguous source ranges",
+                  all(abs(seconds(a["end"]) - seconds(b["start"])) < 1e-6 for a, b in zip(parts, parts[1:])))
+        REPORT.ok("winning retries preserve the full source span",
+                  bool(parts) and abs(seconds(parts[0]["start"])) < 0.05
+                  and abs(seconds(parts[-1]["end"]) - probe_duration(str(larger))) < 0.05)
+        REPORT.ok("all larger retry outputs stay inside the byte limit",
+                  all(Path(p["path"]).stat().st_size <= retry_limit for p in parts))
+
+
+def prepare_work_directory(work: Path) -> None:
+    work = work.resolve()
+    marker = work / ".monosect-e2e"
+    if work == Path.home() or work == work.parent or work in HERE.parents:
+        raise ValueError("The work directory must be a dedicated test directory")
+    if work.exists() and any(work.iterdir()):
+        if not marker.is_file() or marker.read_text(encoding="utf-8") != "monosect-e2e-v1\n":
+            raise ValueError("Refusing to remove a directory not owned by the end-to-end suite")
+        shutil.rmtree(work)
+    work.mkdir(parents=True, exist_ok=True)
+    marker.write_text("monosect-e2e-v1\n", encoding="utf-8")
+
 
 def main(argv: list[str]) -> int:
     if len(argv) < 1:
@@ -753,15 +800,19 @@ def main(argv: list[str]) -> int:
     if not os.path.exists(cli):
         print(f"the CLI does not exist: {cli}", file=sys.stderr)
         return 64
-    work = Path(argv[1] if len(argv) > 1 else "e2e-work").resolve()
+    work = Path(argv[1] if len(argv) > 1 else tempfile.mkdtemp(prefix="monosect-e2e-")).resolve()
     for tool, name in ((FFMPEG, "ffmpeg"), (FFPROBE, "ffprobe")):
         if shutil.which(tool) is None and not Path(tool).exists():
             print(f"missing tool: {name} ({tool})", file=sys.stderr)
             return 69
 
-    if work.exists():
-        shutil.rmtree(work, ignore_errors=True)
-    work.mkdir(parents=True, exist_ok=True)
+    try:
+        prepare_work_directory(work)
+    except (OSError, ValueError) as error:
+        print(str(error), file=sys.stderr)
+        return 64
+    os.environ["LOCALAPPDATA"] = str(work / "appdata")
+    os.environ["XDG_DATA_HOME"] = str(work / "appdata")
     fixtures = work / "fixtures"
 
     print(f"end-to-end: CLI={cli} work={work}")
