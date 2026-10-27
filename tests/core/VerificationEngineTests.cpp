@@ -43,8 +43,8 @@ public:
         } else {
             result.exitCode = checkExitCode;
             result.canceled = cancel;
-            const bool source = std::find(spec.arguments.begin(), spec.arguments.end(), "source.wav") != spec.arguments.end();
-            result.stdoutText = emptyHash ? "" : (source && mismatch ? "different" : "same");
+            const bool source = std::any_of(spec.arguments.begin(), spec.arguments.end(), [](const std::string& arg) { return arg.ends_with("source.wav"); });
+            result.stdoutText = emptyHash ? "" : (source && mismatch ? "0,a,SHA256=different\n" : "0,a,SHA256=same\n");
         }
         return result;
     }
@@ -92,7 +92,8 @@ MONOSECT_TEST(a_requested_hash_must_exist_and_match_even_on_the_last_part) {
     policy.contentHashCheck = true;
     VerificationEngine verifier(probe, runner, "ffmpeg", policy);
     SplitPlan plan;
-    plan.sourcePath = "source.wav";
+    plan.sourcePath = (part.directory / "source.wav").string();
+    std::ofstream(plan.sourcePath).put('s');
     SegmentPlan segment;
     segment.method = SegmentMethod::Copy;
     segment.endSeconds = Rational{1, 1};
@@ -106,6 +107,8 @@ MONOSECT_TEST(a_requested_hash_must_exist_and_match_even_on_the_last_part) {
     const auto checked = verifier.verifyPart(plan, segment, part.file, nullptr);
     CHECK(checked.has_value());
     CHECK(checked.value().passed);
+    segment.method = SegmentMethod::ReEncode;
+    CHECK(!verifier.verifyPart(plan, segment, part.file, nullptr).has_value());
 }
 
 MONOSECT_TEST(packet_duration_cannot_be_hidden_by_shorter_container_metadata) {

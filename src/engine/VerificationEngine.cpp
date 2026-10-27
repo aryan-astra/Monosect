@@ -3,6 +3,7 @@
 #include "engine/FfmpegArgs.hpp"
 
 #include <chrono>
+#include <algorithm>
 #include <system_error>
 
 namespace monosect::core {
@@ -156,34 +157,64 @@ Result<VerificationResult> VerificationEngine::verifyPart(const SplitPlan& plan,
         return failure<VerificationResult>(measurement.error());
     }
 
-    // Content comparison: for a pure copy the payload must be identical to the
-    // source range with the same boundaries.  This is the strongest statement
-    // MonoSect can make, so it is only made when the check is enabled and the
-    // mode really copies everything.
-    if (policy_.contentHashCheck && segment.method == SegmentMethod::Copy &&
-        measurement.value().contentHash.has_value()) {
-        ProcessSpec spec;
-        spec.program = ffmpegPath_;
-        spec.arguments = rangeStreamHashArgs(plan.sourcePath, segment.startSeconds, segment.endSeconds);
-        spec.captureStdout = true;
-        ProcessCallbacks callbacks;
-        callbacks.shouldCancel = shouldCancel;
-        const ProcessResult result = runner_.run(spec, callbacks);
-        if (result.canceled) {
-            return Error{ErrorCode::ProcessCanceled, "The source hash check was cancelled."};
+    if (policy_.contentHashCheck) {
+        if (segment.method != SegmentMethod::Copy) {
+            return Error{ErrorCode::UnsupportedOperation, "Source hash comparison requires stream-copy mode."};
         }
-        if (result.launched && result.exitCode == 0 && !result.stdoutText.empty()) {
-            if (result.stdoutText != *measurement.value().contentHash) {
-                return Error{ErrorCode::VerificationFailed, "The part's stream hash differs from the source range.",
-                             file.string(), "The part was not published."};
-            } else {
-                measurement.value().notes.push_back(
-                    "the stream hash matches the same range of the source: the part carries the same packets");
+        auto source = prober_.probeAll(plan.sourcePath);
+        if (!source.has_value()) {
+            return failure<VerificationResult>(source.error());
+        }
+        const auto actual = splitLines(*measurement.value().contentHash);
+        std::size_t outputIndex = 0;
+        for (const auto& stream : source.value().container.streams) {
+            if (!segment.expectedStreamIndexes.empty() &&
+                std::find(segment.expectedStreamIndexes.begin(), segment.expectedStreamIndexes.end(), stream.index) ==
+                    segment.expectedStreamIndexes.end()) {
+                continue;
             }
-        } else {
-            return Error{ErrorCode::VerificationFailed, "The source range's stream hash could not be computed.",
-                         joinForDisplay(result.stderrTail), "The part was not published."};
+            const auto* track = source.value().packets.track(stream.index);
+            if (track == nullptr || outputIndex >= actual.size()) {
+                return Error{ErrorCode::VerificationFailed, "A selected stream could not be compared with the source."};
+            }
+            StreamTrimRequest trim;
+            trim.input = plan.sourcePath;
+            trim.output = "-";
+            trim.inputStreamIndex = stream.index;
+            trim.start = subtractRational(segment.startSeconds, source.value().container.startTime)
+                             .value_or(segment.startSeconds);
+            trim.seekMode = stream.kind == StreamKind::Video ? StreamTrimRequest::SeekMode::InputKeyframe
+                                                            : StreamTrimRequest::SeekMode::OutputPrecise;
+            trim.packetCount = track->packetsInRange(segment.startSeconds, segment.endSeconds);
+            trim.containerFormat = "streamhash";
+            ProcessSpec spec;
+            spec.program = ffmpegPath_;
+            spec.arguments = trimStreamArgs(trim);
+            spec.captureStdout = true;
+            ProcessCallbacks callbacks;
+            callbacks.shouldCancel = shouldCancel;
+            const auto expected = runner_.run(spec, callbacks);
+            if (expected.canceled) {
+                return Error{ErrorCode::ProcessCanceled, "The source hash check was cancelled."};
+            }
+            const auto lines = splitLines(expected.stdoutText);
+            if (!expected.launched || expected.exitCode != 0 || lines.size() != 1) {
+                return Error{ErrorCode::VerificationFailed, "The source stream's hash could not be computed.",
+                             joinForDisplay(expected.stderrTail), "The part was not published."};
+            }
+            const auto expectedComma = lines[0].find(',');
+            const auto actualComma = actual[outputIndex].find(',');
+            if (expectedComma == std::string::npos || actualComma == std::string::npos ||
+                lines[0].substr(expectedComma) != actual[outputIndex].substr(actualComma)) {
+                return Error{ErrorCode::VerificationFailed, "The part's stream hash differs from the source range.",
+                             "stream " + std::to_string(stream.index), "The part was not published."};
+            }
+            ++outputIndex;
         }
+        if (outputIndex != actual.size()) {
+            return Error{ErrorCode::VerificationFailed, "The part has unexpected stream hashes."};
+        }
+        measurement.value().notes.push_back("every copied stream hash matches its exact source packet range");
     }
 
     VerificationResult result = evaluateSegment(plan, segment, measurement.value(), policy_);

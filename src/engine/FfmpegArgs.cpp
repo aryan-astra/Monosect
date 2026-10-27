@@ -571,13 +571,6 @@ std::vector<std::string> frameHashArgs(const std::string& input, int streamIndex
             "-map", "0:" + numberText(streamIndex), "-f", "framemd5", "-hash", "sha256", "-"};
 }
 
-std::vector<std::string> rangeStreamHashArgs(const std::string& input, const Rational& start, const Rational& end) {
-    Rational duration = subtractRational(end, start).value_or(Rational{0, 1});
-    return {"-hide_banner", "-nostdin", "-loglevel", "error", "-ss", formatSecondsForFfmpeg(start), "-i", input,
-            "-t", formatSecondsForFfmpeg(duration), "-map", "0", "-c", "copy", "-f", "streamhash", "-hash",
-            "sha256", "-"};
-}
-
 bool parseProgressLine(const std::string& line, std::string* key, std::string* value) {
     const std::size_t separator = line.find('=');
     if (separator == std::string::npos || separator == 0) {

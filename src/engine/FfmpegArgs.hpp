@@ -254,10 +254,6 @@ struct MuxStreamsRequest {
 /// Per-frame hashes of one stream, used to verify a merged file's decoded video.
 [[nodiscard]] std::vector<std::string> frameHashArgs(const std::string& input, int streamIndex);
 
-/// Frame hash of a time range of the source, for comparing a copied region.
-[[nodiscard]] std::vector<std::string> rangeStreamHashArgs(const std::string& input, const Rational& start,
-                                                          const Rational& end);
-
 /// `-progress pipe:2` lines are key=value pairs; this parses one.
 [[nodiscard]] bool parseProgressLine(const std::string& line, std::string* key, std::string* value);
 
