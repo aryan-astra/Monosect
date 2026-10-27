@@ -1632,7 +1632,7 @@ private:
         const bool typedFolder = ImGui::InputText("##mergeout", mergeOutputBuffer_, sizeof(mergeOutputBuffer_));
         ImGui::TextUnformatted("File name:");
         ImGui::SetNextItemWidth(-1.0f);
-        const bool typedName = ImGui::InputText("##mergename", mergeNameBuffer_, sizeof(mergeOutputBuffer_));
+        const bool typedName = ImGui::InputText("##mergename", mergeNameBuffer_, sizeof(mergeNameBuffer_));
         if (typedFolder || typedName) {
             merge.outputDirectory = mergeOutputBuffer_;
             merge.outputName = mergeNameBuffer_;
@@ -2334,7 +2334,7 @@ private:
 
     std::jthread bootstrapThread_;
     std::atomic<bool> toolsReady_{false};
-    bool bootstrapRunning_ = false;
+    std::atomic<bool> bootstrapRunning_{false};
     std::string bootstrapError_;
     std::vector<std::string> bootstrapLog_;
     std::mutex bootstrapMutex_;
