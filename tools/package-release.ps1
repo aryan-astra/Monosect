@@ -2,7 +2,8 @@ param(
     [Parameter(Mandatory = $true)][string]$BuildDirectory,
     [Parameter(Mandatory = $true)][string]$ToolsDirectory,
     [Parameter(Mandatory = $true)][string]$Destination,
-    [switch]$OmitMediaTools
+    [switch]$OmitMediaTools,
+    [switch]$UseSoftwareOpenGl
 )
 $ErrorActionPreference = 'Stop'
 $repo = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
@@ -37,27 +38,40 @@ $compilerEntry = Select-String -LiteralPath (Join-Path $BuildDirectory 'CMakeCac
 if (-not $compilerEntry) { throw 'The build does not identify its C++ compiler' }
 $compiler = $compilerEntry.Matches[0].Groups[1].Value
 $compilerDirectory = Split-Path $compiler
-$pending = [Collections.Generic.Queue[string]]::new()
-$pending.Enqueue((Join-Path $stage 'Monosect.exe'))
-$seen = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
-while ($pending.Count) {
-    $binary = $pending.Dequeue()
-    $imports = & (Join-Path $compilerDirectory 'objdump.exe') -p $binary
-    if ($LASTEXITCODE -ne 0) { throw "Could not inspect imports: $binary" }
-    foreach ($line in $imports) {
-        if ($line -notmatch 'DLL Name:\s*(\S+)') { continue }
-        $dll = $Matches[1]
-        if (-not $seen.Add($dll)) { continue }
-        $runtime = Join-Path $compilerDirectory $dll
-        if (Test-Path -LiteralPath $runtime) {
+function Copy-ImportedLibraries([string]$RootBinary) {
+    $pending = [Collections.Generic.Queue[string]]::new()
+    $pending.Enqueue($RootBinary)
+    $seen = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    while ($pending.Count) {
+        $binary = $pending.Dequeue()
+        $imports = & (Join-Path $compilerDirectory 'objdump.exe') -p $binary
+        if ($LASTEXITCODE -ne 0) { throw "Could not inspect imports: $binary" }
+        foreach ($line in $imports) {
+            if ($line -notmatch 'DLL Name:\s*(\S+)') { continue }
+            $dll = $Matches[1]
+            if (-not $seen.Add($dll)) { continue }
+            if ($dll -match '^(api-ms-win-|ext-ms-win-)' -or
+                (Test-Path -LiteralPath (Join-Path "$env:SystemRoot/System32" $dll))) { continue }
+            $runtime = Join-Path $compilerDirectory $dll
+            if (-not (Test-Path -LiteralPath $runtime)) { throw "A required DLL is missing: $dll" }
             $target = Join-Path $stage $dll
             Copy-Item -LiteralPath $runtime -Destination $target
             $pending.Enqueue($target)
-        } elseif ($dll -notmatch '^(api-ms-win-|ext-ms-win-)' -and
-                  -not (Test-Path -LiteralPath (Join-Path "$env:SystemRoot/System32" $dll))) {
-            throw "A required DLL is missing: $dll"
         }
     }
+}
+Copy-ImportedLibraries (Join-Path $stage 'Monosect.exe')
+# Hosted Windows runners may have no OpenGL 3.3 driver. Mesa is test-only.
+$softwareLibraries = @()
+if ($UseSoftwareOpenGl) {
+    $packageLibraries = @(Get-ChildItem -LiteralPath $stage -Filter '*.dll' | Select-Object -ExpandProperty Name)
+    foreach ($driver in @('opengl32.dll', 'libgallium_wgl.dll')) {
+        $driverTarget = Join-Path $stage $driver
+        Copy-Item -LiteralPath (Join-Path $compilerDirectory $driver) -Destination $driverTarget
+        Copy-ImportedLibraries $driverTarget
+    }
+    $softwareLibraries = @(Get-ChildItem -LiteralPath $stage -Filter '*.dll' |
+        Where-Object Name -NotIn $packageLibraries | Select-Object -ExpandProperty FullName)
 }
 $manifest = @{
     version = $version
@@ -69,17 +83,27 @@ $manifest = @{
 $manifest | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $stage 'build-manifest.json') -Encoding utf8
 
 $previousPath = $env:PATH
+$previousGallium = $env:GALLIUM_DRIVER
 try {
+    if ($UseSoftwareOpenGl) { $env:GALLIUM_DRIVER = 'llvmpipe' }
     $env:PATH = "$env:SystemRoot\System32;$env:SystemRoot"
-    $process = Start-Process -FilePath (Join-Path $stage 'Monosect.exe') -ArgumentList '--smoke-test' -WorkingDirectory $stage -WindowStyle Hidden -PassThru
+    $smokeOutput = Join-Path $stage 'smoke-stdout.log'
+    $smokeError = Join-Path $stage 'smoke-stderr.log'
+    $process = Start-Process -FilePath (Join-Path $stage 'Monosect.exe') -ArgumentList '--smoke-test' -WorkingDirectory $stage -WindowStyle Hidden -PassThru -RedirectStandardOutput $smokeOutput -RedirectStandardError $smokeError
     if (-not $process.WaitForExit(30000)) {
         $process.Kill($true)
         throw 'Packaged GUI smoke test timed out'
     }
-    if ($process.ExitCode -ne 0) { throw "Packaged GUI smoke test failed: $($process.ExitCode)" }
+    if ($process.ExitCode -ne 0) {
+        $diagnostic = Get-Content -LiteralPath $smokeError -Raw
+        throw "Packaged GUI smoke test failed: $($process.ExitCode). $diagnostic"
+    }
     $process.Dispose()
+    Remove-Item -LiteralPath $smokeOutput, $smokeError
 } finally {
     $env:PATH = $previousPath
+    $env:GALLIUM_DRIVER = $previousGallium
+    foreach ($library in $softwareLibraries) { Remove-Item -LiteralPath $library }
 }
 if ($OmitMediaTools) {
     foreach ($file in @('ffmpeg.exe', 'ffprobe.exe', 'FFmpeg-LICENSE.txt', 'FFmpeg-README.txt')) {

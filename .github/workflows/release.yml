@@ -50,6 +50,7 @@ jobs:
             mingw-w64-x86_64-cmake
             mingw-w64-x86_64-ninja
             mingw-w64-x86_64-python
+            mingw-w64-x86_64-mesa
 
       - name: Configure CMake
         shell: msys2 {0}
@@ -86,7 +87,7 @@ jobs:
           MONOSECT_RELEASE_SIGNING_KEY_ID: ${{ secrets.MONOSECT_RELEASE_SIGNING_KEY_ID }}
         run: |
           $ErrorActionPreference = 'Stop'
-          ./tools/package-release.ps1 -BuildDirectory build -ToolsDirectory release -Destination release -OmitMediaTools
+          ./tools/package-release.ps1 -BuildDirectory build -ToolsDirectory release -Destination release -OmitMediaTools -UseSoftwareOpenGl
           $version = (Get-Content version.txt -Raw).Trim()
           $uploadFiles = @("release/Monosect-$version-portable.zip", 'release/SHA256SUMS.txt')
           if ($env:MONOSECT_RELEASE_SIGNING_KEY) {

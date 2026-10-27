@@ -391,6 +391,9 @@ public:
         // Before glfwInit: DPI awareness is set once per process and must be in place
         // before a window exists, so it cannot be left to whoever creates one.
         makeDpiAware();
+        glfwSetErrorCallback([](int code, const char* description) {
+            std::fprintf(stderr, "GLFW error %d: %s\n", code, description);
+        });
         if (glfwInit() == 0) {
             return false;
         }
