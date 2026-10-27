@@ -57,9 +57,10 @@ with the number of parts it would need.
   per-stream preservation.
 * **Precision policies** — fast, balanced (calibrates from the first written
   part) and maximum (extra search for the closest safe part).
-* **Post-write verification** — size, duration, stream signatures, first-packet
-  keyframe, decoded frame hashes and content hashes; failures are reported, not
-  hidden.
+* **Post-write verification** — size, container and packet duration, stream
+  signatures and the first video keyframe. Optional decoding checks for errors;
+  the harness also compares copied stream hashes. Requested check failures stop
+  publication, and sequence failures report an incomplete job with retained parts.
 * **Transactional output** — parts are written into a working folder on the
   destination volume and renamed into place; a part is either absent or complete.
 * **Real cancel and pause** — cancel finishes the part in flight and keeps the
@@ -85,16 +86,17 @@ ctest --test-dir build --output-on-failure
 ```
 
 The GUI target `Monosect` is skipped with an explanatory message on any platform
-that is not Windows. There is no vcpkg and no network access at run time: the
-third-party libraries are fetched at configure time, and the media tools come
-from a pinned address whose SHA-256 is verified when the release defines one
-(`-DMONOSECT_FFMPEG_SHA256=...`). Without a pinned hash — as in a developer
-build — the hash of the first download is recorded next to the binaries and
-enforced afterwards, so a tool that is swapped later is still detected.
+that is not Windows. Third-party libraries are fetched at configure time. Media
+processing stays local. If the pinned tools are missing, the first GUI run downloads
+FFmpeg; subsequent processing needs no network. Archive and executable SHA-256 pins
+are shared in `resources/ffmpeg-pin.json`. After changing the pin, use a fresh build
+directory or clear the `MONOSECT_FFMPEG_*` CMake cache entries.
+Developer cache overrides with empty digests use trust on first use and are not
+suitable for release packaging.
 
 ## Verification
 
-Two suites run in CI and on any developer machine:
+The unit, harness-safety and real-media suites run in CI:
 
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
@@ -109,7 +111,7 @@ ctest --test-dir build --output-on-failure
   through `monosect-cli` and checks the written files with an **independent**
   Python checker (`tests/harness/check_parts.py`) that parses the parts rather
   than trusting MonoSect's own report. It is pure Python, so the same suite runs
-  on Windows, macOS and Linux, against a digest-checked pinned FFmpeg.
+  with the same digest-checked FFmpeg binaries used by the Windows package.
 
 Checks that need Windows — the GUI, the job-object process runner, the pinned
 toolchain download, DXGI and PDH telemetry, and the hardware encoder probe —
@@ -132,7 +134,29 @@ src/monitor/   measured resource telemetry (n/a rather than zero when unknown)
 tests/         unit tests, the CLI harness and the end-to-end suite
 ```
 
+## Release candidates
+
+Use `tools/prepare-ffmpeg.ps1 -Destination ffmpeg` to fetch and verify the pinned
+tools. After building and testing, run:
+
+```powershell
+./tools/package-release.ps1 -BuildDirectory build -ToolsDirectory ffmpeg -Destination release
+```
+
+The package includes compiler runtime DLLs, upstream notices, the tool pin and a
+build manifest. Packaging renders one GUI frame with compiler directories removed
+from PATH; it fails if the package cannot start. Tags produce draft releases only.
+Review [production readiness](docs/PRODUCTION_READINESS.md) before publishing.
+
+Hardware probes report available encoders; current jobs use stream copy or software
+encoders. Hardware acceleration is not wired into job execution.
+
 ## Licence and credits
+
+MonoSect's own source is **GPL-3.0-only** (SPDX). See [LICENSE](LICENSE) and
+[third-party notices](THIRD_PARTY_NOTICES.md). Redistributors must review the
+Corresponding Source requirements for the bundled FFmpeg and runtime libraries.
+
 
 MonoSect drives FFmpeg rather than linking it. The core, the command line harness
 and the unit tests build and run on Linux and macOS as well as Windows; the GUI,

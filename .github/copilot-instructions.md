@@ -13,10 +13,9 @@ cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
 cmake --build build
 ```
 
-- This repo targets **Windows + MinGW-w64 g++**. `CMakeLists.txt` refuses MSVC
-  explicitly. There is no POSIX build target, so the Windows-specific sources
-  (`src/engine/win/`, `src/monitor/SystemMonitor.cpp`) are compiled unconditionally
-  on the only supported platform and are not behind `#if` in practice.
+- The GUI targets **Windows + MinGW-w64 g++**. MSVC is refused for the GUI.
+  The core, harness and tests also have a POSIX build; Windows-only process and
+  watcher implementations are selected conditionally in CMake.
 - `CMAKE_BUILD_TYPE` defaults to `Release`.
 - The GUI target is `Monosect`; there are also `monosect-cli` (a headless harness that
   drives the same engine) and `monosect-tests`. `cmake --build build` builds all three.
@@ -42,7 +41,6 @@ It needs the pinned FFmpeg binaries:
 ```powershell
 $env:MONOSECT_FFMPEG  = "C:\path\to\ffmpeg.exe"
 $env:MONOSECT_FFPROBE = "C:\path\to\ffprobe.exe"
-python tests/harness/make_fixtures.py e2e-work\fixtures
 python tests/harness/end_to_end.py build\monosect-cli.exe e2e-work
 ```
 
@@ -63,7 +61,7 @@ thing standing between a plausible change and a broken product.
 
 `python` is required and `bash` is not available on this platform - do not add shell
 scripts. `end_to_end.py` takes `<cli-path> [work-directory]`; `MONOSECT_E2E_SKIP`
-skips sections and the run writes its verdict to `<work-dir>/e2e.log`.
+can skip cancellation and the run writes its verdict to `<work-dir>/e2e.log`.
 
 ### Lint
 
@@ -126,11 +124,21 @@ the rest.
   once. The exact rules `-ss`/`-t`/`-frames` do and do not obey are recorded in
   `src/engine/FfmpegArgs.hpp` with the measurements behind them.
 - MonoSect does not trust the FFmpeg it finds: `DependencyPin` verifies the archive
-  and each executable against digests compiled in by CMake. Update the three CMake
-  variables together; one archive hash cannot match two different files.
+  and each executable against digests compiled in by CMake. Update `resources/ffmpeg-pin.json`, then independently verify the archive and both
+  executables; CMake and both workflows read that same pin.
 - FFmpeg availability is not usability. `HardwareCapabilityProbe` asks each listed
   encoder to encode a real frame, because a static build lists every vendor encoder
   whether or not the hardware exists. Only a listed **and** usable encoder may be
   offered, or a requested stream copy silently becomes an encode.
 - The help topics in `src/ui/HelpContent.cpp` describe panels that must exist. If a
   topic names a control, there is a panel that draws it.
+
+### Release validation
+
+Use `tools/prepare-ffmpeg.ps1` and `tools/package-release.ps1`; do not duplicate pin
+values in workflows. Package only after unit, harness-safety and real-media checks
+pass. `Monosect.exe --smoke-test` renders one frame without starting jobs or
+network bootstrap. The release workflow creates a draft for human review.
+Do not infer GPU job acceleration from the hardware probe: jobs currently use
+software encoders. The end-to-end harness only removes directories carrying its
+ownership marker and redirects job history away from the real user profile.
