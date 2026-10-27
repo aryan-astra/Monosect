@@ -15,6 +15,8 @@ status must be checked separately from these local validation results.
   shortcuts to the visible session, and discard stale source plans.
 - Own native dialogs, preserve the working directory and clear stale dialog input.
 - Distinguish preview-only results and wrap progress details below the progress bar.
+- Preserve cancelled status during verification and stop publication after cancellation;
+  exercise that boundary with deterministic harness injection.
 - Reject size-read errors, requested decode failures and failed/mismatching hashes.
 - Fail incomplete sequences while retaining already published parts; show warnings.
 - Replan from the actual successful retry boundary and retain the final actual plan.
@@ -49,7 +51,7 @@ the existing local checkout after verifying their revision IDs matched the pins.
 
 - Full Windows GUI/core/CLI build with strict core warnings: passed. Third-party
   code emits warnings; strict core warnings no longer break on third-party code.
-- All 119 unit tests (1,061 checks) and the harness-safety CTest suite: passed, including long temporary paths,
+- All 120 unit tests (1,069 checks) and the harness-safety CTest suite: passed, including long temporary paths,
   failed verification, retry boundaries, safe work directories and cancelled bootstrap.
 - Full real-media run: 149 passed, zero failed, zero skipped. An independent
   frame-count check found all 1,800 source frames across the eight winning-retry
@@ -73,6 +75,12 @@ the existing local checkout after verifying their revision IDs matched the pins.
   verified split were exercised through the desktop UI.
 - Public release packaging omits FFmpeg executables and uses that verified upstream
   download on first launch. Bundled-media local packages remain a separate option.
+- Hosted GCC 16 strict compilation, unit checks and the 149-check media suite passed
+  for revision `0ac2168`. A later cancellation regression adds three checks; the
+  focused eight-check cancellation section passed locally with the corrected engine.
+- The first hosted release failed at GUI startup despite passing build and media
+  checks. Packaging now captures GLFW diagnostics and can use MSYS2 Mesa for the CI
+  smoke test. That software driver and its extra libraries are removed before ZIP creation.
 
 Key commands:
 
@@ -92,8 +100,8 @@ python -B tests/harness/end_to_end.py build/monosect-cli.exe e2e-work
 The result is tested against the cases above, not certification of every supported
 machine or media format. Remaining validation and limitations:
 
-1. Run the updated workflow on GitHub; no remote workflow was dispatched locally.
-   The local test does not establish hosted-runner OpenGL or signing behavior.
+1. Inspect each release workflow result. Hosted CI is verified as recorded above;
+   no release signing key is configured, so checksum files are unsigned.
 2. Test clean supported Windows 10 and 11 machines, high-DPI/multiple-monitor
    layouts, shutdown during a real first-run download, and representative user media.
 3. Resolve screen-reader accessibility. ImGui keyboard navigation is enabled but
