@@ -355,7 +355,7 @@ public:
     /// The planner settings the UI exposes (calibration renders etc.).
     [[nodiscard]] PlannerSettings& plannerSettings() noexcept { return plannerSettings_; }
     [[nodiscard]] const std::string& outputDirectory() const noexcept { return outputDirectory_; }
-    void setOutputDirectory(const std::string& directory) { outputDirectory_ = directory; }
+    void setOutputDirectory(const std::string& directory);
     [[nodiscard]] int ffmpegThreads() const noexcept { return ffmpegThreads_; }
     void setFfmpegThreads(int threads) { ffmpegThreads_ = threads; }
     [[nodiscard]] bool lowPriority() const noexcept { return lowPriority_; }
@@ -432,6 +432,7 @@ private:
     std::atomic<bool> pauseRequested_{false};
     std::thread worker_;
     std::atomic<bool> workerFinished_{true};
+    bool workerResultPending_ = false;
     std::vector<SegmentOutcome> workerParts_;
     std::string workerJobId_;
     bool workerVerified_ = false;

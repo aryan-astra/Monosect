@@ -105,6 +105,7 @@ UiController::UiController(UiEngine& engine, HardwareCapabilitySource* hardware)
 // Queue
 
 int UiController::addSource(const std::string& path) {
+    if (jobRunning() || mergeRunning()) { return 0; }
     QueueItem item;
     item.id = nextId_++;
     item.path = path;
@@ -125,28 +126,34 @@ int UiController::addSource(const std::string& path) {
 }
 
 void UiController::removeSource(int id) {
+    if (jobRunning() || mergeRunning()) { return; }
+    poll();
     queue_.erase(std::remove_if(queue_.begin(), queue_.end(),
                                 [id](const QueueItem& item) { return item.id == id; }),
                  queue_.end());
     if (selectedId_ == id) {
         selectedId_ = queue_.empty() ? 0 : queue_.front().id;
         probed_.reset();
-        invalidatePreview();
-        snapshot_.phase = queue_.empty() ? SessionPhase::Empty : SessionPhase::Empty;
+        discardPreview();
+        snapshot_ = SessionSnapshot{};
         snapshot_.statusHeadline = queue_.empty() ? "No source selected" : "Select a source to read it";
         snapshot_.statusDetail.clear();
     }
 }
 
 void UiController::clearSources() {
+    if (jobRunning() || mergeRunning()) { return; }
+    poll();
     queue_.clear();
     selectedId_ = 0;
     probed_.reset();
-    invalidatePreview();
+    discardPreview();
     snapshot_ = SessionSnapshot{};
 }
 
 void UiController::select(int id) {
+    if (jobRunning() || mergeRunning() || id == selectedId_) { return; }
+    poll();
     const auto found = std::find_if(queue_.begin(), queue_.end(),
                                     [id](const QueueItem& item) { return item.id == id; });
     if (found == queue_.end()) {
@@ -154,20 +161,11 @@ void UiController::select(int id) {
     }
     selectedId_ = id;
     probed_.reset();
-    invalidatePreview();
-    if (found->probed) {
-        snapshot_.phase = SessionPhase::Ready;
-        snapshot_.statusHeadline = "Source ready";
-        snapshot_.statusDetail = sourceHeadline(*found);
-        snapshot_.tone = StatusTone::Neutral;
-    } else {
-        snapshot_.phase = SessionPhase::Empty;
-        snapshot_.statusHeadline = "Not read yet - press Read";
-        snapshot_.statusDetail.clear();
-        snapshot_.tone = StatusTone::Neutral;
-    }
-    snapshot_.parts.clear();
-    snapshot_.plan.reset();
+    discardPreview();
+    snapshot_ = SessionSnapshot{};
+    found->probed = false;
+    found->status = "not read yet";
+    snapshot_.statusHeadline = "Not read yet - press Read";
 }
 
 const QueueItem* UiController::selected() const {
@@ -180,6 +178,9 @@ const QueueItem* UiController::selected() const {
 // Probing
 
 void UiController::probeSelected() {
+    if (jobRunning() || mergeRunning()) { return; }
+    poll();
+    discardPreview();
     const QueueItem* item = selected();
     if (item == nullptr) {
         snapshot_.phase = SessionPhase::Empty;
@@ -203,6 +204,7 @@ void UiController::probeSelected() {
         probed_.reset();
         invalidatePreview();
         snapshot_.phase = SessionPhase::Failed;
+        snapshot_.tone = StatusTone::Bad;
         snapshot_.statusHeadline = "The source could not be read";
         snapshot_.statusDetail = probed.error().message;
         if (!probed.error().detail.empty()) {
@@ -285,6 +287,13 @@ void UiController::setNamingPattern(const std::string& pattern) {
     invalidatePreview();
 }
 
+void UiController::setOutputDirectory(const std::string& directory) {
+    if (outputDirectory_ != directory) {
+        outputDirectory_ = directory;
+        invalidatePreview();
+    }
+}
+
 ConstraintReport UiController::validate() const {
     ConstraintReport report;
     if (probed_.has_value()) {
@@ -350,10 +359,12 @@ JobRequest UiController::makeRequest() const {
 }
 
 void UiController::previewPlan(const std::string& outputDirectory) {
-    outputDirectory_ = outputDirectory;
-    if (jobRunning()) {
+    if (jobRunning() || mergeRunning()) {
         return;
     }
+    poll();
+    outputDirectory_ = outputDirectory;
+    discardPreview();
     const ConstraintReport report = validate();
     if (!report.valid) {
         preview_.reset();
@@ -478,11 +489,12 @@ JobEvents UiController::makeEvents() {
 }
 
 void UiController::start(const std::string& outputDirectory) {
-    outputDirectory_ = outputDirectory;
-    if (jobRunning()) {
-        snapshot_.statusDetail = "A job is already running.";
+    if (jobRunning() || mergeRunning()) {
+        snapshot_.statusDetail = "Another job is already running.";
         return;
     }
+    poll();
+    outputDirectory_ = outputDirectory;
     if (outputDirectory_.empty()) {
         snapshot_.phase = SessionPhase::Failed;
         snapshot_.tone = StatusTone::Warning;
@@ -519,6 +531,8 @@ void UiController::start(const std::string& outputDirectory) {
     snapshot_.bytesWritten = 0;
     snapshot_.fraction = 0.0;
     snapshot_.elapsedSeconds = 0.0;
+    snapshot_.jobId.clear();
+    snapshot_.stage.clear();
     snapshot_.phase = SessionPhase::Running;
     snapshot_.tone = StatusTone::Working;
     snapshot_.statusHeadline = "Starting";
@@ -526,6 +540,7 @@ void UiController::start(const std::string& outputDirectory) {
     jobStartSeconds_ = steadyNow();
 
     const JobRequest request = makeRequest();
+    workerResultPending_ = true;
     workerFinished_ = false;
     worker_ = std::thread([this, request]() {
         const JobEvents events = makeEvents();
@@ -679,7 +694,7 @@ void UiController::poll() {
 
     // Results arrive from the worker; copy them once the worker is done so the
     // tables cannot show a half-written list.
-    if (workerFinished_.load() || worker_.joinable()) {
+    if (workerResultPending_ && workerFinished_.load()) {
         std::lock_guard<std::mutex> lock(workerMutex_);
         if (!workerParts_.empty()) {
             snapshot_.parts = workerParts_;
@@ -702,8 +717,12 @@ void UiController::poll() {
         if (workerCanceled_) {
             snapshot_.canceled = true;
         }
+        workerResultPending_ = false;
     }
-    snapshot_.elapsedSeconds = jobStartSeconds_ > 0.0 ? steadyNow() - jobStartSeconds_ : 0.0;
+    if (jobStartSeconds_ > 0.0) {
+        snapshot_.elapsedSeconds = steadyNow() - jobStartSeconds_;
+        if (!jobRunning()) { jobStartSeconds_ = 0.0; }
+    }
     if (snapshot_.phase == SessionPhase::Planned && previewIsStale()) {
         snapshot_.tone = StatusTone::Warning;
         snapshot_.statusHeadline = "The plan is out of date";
@@ -738,9 +757,8 @@ void UiController::pushLog(const std::string& line) {
 // Resources and history
 
 const ResourceSample& UiController::sampleResources() {
-    const SessionSnapshot snapshot = snapshot_;
-    ResourceSample sample = monitor_.sample(static_cast<std::int64_t>(snapshot.bytesWritten),
-                                            snapshot.elapsedSeconds, 0.0);
+    ResourceSample sample = monitor_.sample(static_cast<std::int64_t>(snapshot_.bytesWritten),
+                                            snapshot_.elapsedSeconds, 0.0);
     lastSample_ = std::move(sample);
     return lastSample_;
 }
@@ -928,6 +946,7 @@ JobStatusLine UiController::verificationLine() const {
 
 
 void UiController::showMerge() {
+    if (jobRunning()) { return; }
     merge_.active = true;
 }
 
@@ -943,6 +962,7 @@ void UiController::hideMerge() {
 }
 
 void UiController::addMergeInput(const std::string& path) {
+    if (jobRunning() || mergeRunning()) { return; }
     if (path.empty()) {
         return;
     }
@@ -954,6 +974,7 @@ void UiController::addMergeInput(const std::string& path) {
 }
 
 void UiController::removeMergeInput(std::size_t index) {
+    if (jobRunning() || mergeRunning()) { return; }
     if (index >= merge_.inputs.size()) {
         return;
     }
@@ -963,6 +984,7 @@ void UiController::removeMergeInput(std::size_t index) {
 }
 
 void UiController::clearMergeInputs() {
+    if (jobRunning() || mergeRunning()) { return; }
     merge_.inputs.clear();
     merge_.planned = false;
     merge_.planSummary.clear();
@@ -970,6 +992,7 @@ void UiController::clearMergeInputs() {
 }
 
 void UiController::moveMergeInput(std::size_t index, int delta) {
+    if (jobRunning() || mergeRunning()) { return; }
     const std::size_t count = merge_.inputs.size();
     if (index >= count) {
         return;
@@ -989,11 +1012,14 @@ void UiController::moveMergeInput(std::size_t index, int delta) {
 }
 
 void UiController::previewMerge(const std::string& outputDirectory, const std::string& outputName) {
+    if (jobRunning() || mergeRunning()) { return; }
+    poll();
     merge_.outputDirectory = outputDirectory;
     merge_.outputName = outputName;
     merge_.planned = false;
     merge_.planSummary.clear();
     merge_.planProblem.clear();
+    merge_.warnings.clear();
 
     if (merge_.inputs.size() < 2) {
         merge_.planProblem = "A merge needs at least two files.";

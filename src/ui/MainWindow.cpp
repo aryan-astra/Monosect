@@ -661,7 +661,7 @@ private:
     }
 
     void addSourceFromDialog() {
-        if (!controller_) {
+        if (!controller_ || controller_->jobRunning() || controller_->mergeRunning()) {
             return;
         }
         const std::vector<std::string> paths = openFileDialogMulti(L"Add source files");
@@ -682,13 +682,19 @@ private:
             addSourceFromDialog();
         }
         if (ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_Enter)) {
-            controller_->previewPlan(controller_->outputDirectory());
+            if (controller_->mergeVisible()) {
+                controller_->previewMerge(mergeOutputBuffer_, mergeNameBuffer_);
+            } else {
+                controller_->previewPlan(controller_->outputDirectory());
+            }
         }
         if (ImGui::IsKeyPressed(ImGuiKey_F5)) {
-            controller_->start(controller_->outputDirectory());
+            if (controller_->mergeVisible()) { controller_->startMerge(); }
+            else { controller_->start(controller_->outputDirectory()); }
         }
         if (ImGui::IsKeyPressed(ImGuiKey_Escape)) {
             controller_->requestCancel();
+            controller_->requestMergeCancel();
         }
         if (ImGui::IsKeyPressed(ImGuiKey_F1)) {
             controller_->showHelp(HelpTopicId::FirstRun);
@@ -720,13 +726,14 @@ private:
             }
             if (ImGui::BeginMenu("Job")) {
                 const bool running = controller_ && controller_->jobRunning();
-                if (ImGui::MenuItem("Read the selected source", nullptr, false, controller_ != nullptr && !running)) {
+                const bool canSplit = controller_ && !running && !controller_->mergeRunning() && !controller_->mergeVisible();
+                if (ImGui::MenuItem("Read the selected source", nullptr, false, canSplit)) {
                     controller_->probeSelected();
                 }
-                if (ImGui::MenuItem("Preview plan", "Ctrl+Enter", false, controller_ != nullptr && !running)) {
+                if (ImGui::MenuItem("Preview plan", "Ctrl+Enter", false, canSplit)) {
                     controller_->previewPlan(controller_->outputDirectory());
                 }
-                if (ImGui::MenuItem("Start", "F5", false, controller_ != nullptr && !running)) {
+                if (ImGui::MenuItem("Start", "F5", false, canSplit)) {
                     controller_->start(controller_->outputDirectory());
                 }
                 ImGui::Separator();
@@ -736,8 +743,9 @@ private:
                 if (ImGui::MenuItem("Resume", nullptr, false, running)) {
                     controller_->requestResume();
                 }
-                if (ImGui::MenuItem("Cancel", "Esc", false, running)) {
+                if (ImGui::MenuItem("Cancel", "Esc", false, running || (controller_ && controller_->mergeRunning()))) {
                     controller_->requestCancel();
+                    controller_->requestMergeCancel();
                 }
                 ImGui::EndMenu();
             }
@@ -1074,6 +1082,7 @@ private:
             ImGui::TextDisabled("Waiting for the toolchain.");
             return;
         }
+        ImGui::BeginDisabled(controller_->jobRunning() || controller_->mergeRunning());
         if (ImGui::Button("Add file...")) {
             addSourceFromDialog();
         }
@@ -1116,6 +1125,7 @@ private:
             ImGui::EndTable();
         }
         ImGui::TextDisabled("Drop files onto the window to queue them.");
+        ImGui::EndDisabled();
     }
 
     void drawConstraintPanel() {

@@ -227,6 +227,78 @@ MONOSECT_TEST(the_queue_is_one_source_at_a_time) {
     CHECK(controller.selected() == nullptr);
 }
 
+MONOSECT_TEST(source_changes_discard_old_plans_and_require_a_fresh_read) {
+    FakeEngine engine;
+    UiController controller(engine);
+    const int first = controller.addSource("first.mkv");
+    controller.probeSelected();
+    controller.constraint() = sizeLimit(200000);
+    controller.previewPlan("out");
+    controller.select(first);
+    CHECK(controller.validate().valid);
+    CHECK(controller.preview().has_value());
+    controller.addSource("second.mkv");
+    CHECK(!controller.preview().has_value());
+    CHECK(!controller.snapshot().plan.has_value());
+    controller.select(first);
+    CHECK(!controller.validate().valid);
+    CHECK(controller.snapshot().statusHeadline.find("Read") != std::string::npos);
+}
+
+MONOSECT_TEST(finished_results_are_consumed_once_and_elapsed_time_stops) {
+    FakeEngine engine;
+    UiController controller(engine);
+    controller.addSource("first.mkv");
+    controller.probeSelected();
+    controller.constraint() = sizeLimit(200000);
+    controller.start("out");
+    controller.waitForJob();
+    CHECK(controller.snapshot().verified);
+    const double elapsed = controller.snapshot().elapsedSeconds;
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    controller.poll();
+    CHECK_EQ(elapsed, controller.snapshot().elapsedSeconds);
+    controller.addSource("second.mkv");
+    controller.poll();
+    CHECK(controller.snapshot().parts.empty());
+    CHECK(!controller.snapshot().verified);
+    CHECK(controller.snapshot().jobId.empty());
+}
+
+MONOSECT_TEST(running_split_protects_its_source_and_merge_inputs) {
+    FakeEngine engine;
+    engine.runSleepsUntilCanceled = true;
+    UiController controller(engine);
+    const int source = controller.addSource("first.mkv");
+    controller.probeSelected();
+    controller.constraint() = sizeLimit(200000);
+    controller.start("out");
+    CHECK_EQ(0, controller.addSource("second.mkv"));
+    controller.removeSource(source);
+    controller.clearSources();
+    controller.probeSelected();
+    controller.addMergeInput("part.mkv");
+    CHECK_EQ(source, controller.selectedId());
+    CHECK_EQ(1, engine.probeCalls);
+    CHECK_EQ(1u, controller.queue().size());
+    CHECK(controller.merge().inputs.empty());
+    controller.requestCancel();
+    controller.waitForJob();
+}
+
+MONOSECT_TEST(output_folder_changes_invalidate_the_preview) {
+    FakeEngine engine;
+    UiController controller(engine);
+    controller.addSource("first.mkv");
+    controller.probeSelected();
+    controller.constraint() = sizeLimit(200000);
+    controller.previewPlan("out");
+    controller.setOutputDirectory("another-folder");
+    CHECK(controller.previewIsStale());
+    controller.poll();
+    CHECK(controller.snapshot().statusHeadline.find("out of date") != std::string::npos);
+}
+
 MONOSECT_TEST(reading_a_source_fills_the_list_and_the_status) {
     FakeEngine engine;
     UiController controller(engine);
@@ -355,7 +427,7 @@ MONOSECT_TEST(starting_requires_a_source_a_folder_and_a_valid_request) {
 
     // No source read: refused with the reason from validate().
     controller.setOutputDirectory("C:/out");
-    controller.select(controller.selectedId());
+    controller.addSource("C:/media/unread.mkv");
     controller.start("C:/out");
     CHECK_EQ(0, engine.runCalls);
     CHECK(controller.snapshot().statusHeadline.find("cannot be started") != std::string::npos);
