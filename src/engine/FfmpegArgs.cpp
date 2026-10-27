@@ -182,12 +182,9 @@ std::vector<std::string> renderSegmentArgs(const SegmentRenderRequest& request) 
     // than one stream of a kind the per-stream form is used, which FFmpeg
     // documents as `-option:stream_index`.
     std::size_t reencodedVideoCount = 0;
-    std::size_t reencodedAudioCount = 0;
     for (const auto& stream : request.reencodedStreams) {
         if (stream.kind == StreamKind::Video) {
             ++reencodedVideoCount;
-        } else if (stream.kind == StreamKind::Audio) {
-            ++reencodedAudioCount;
         }
     }
 
