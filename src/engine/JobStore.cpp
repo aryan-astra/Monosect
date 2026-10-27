@@ -33,7 +33,7 @@ Rational rationalFromJson(const JsonValue& value) {
 
 std::filesystem::path applicationDataDirectory() {
 #if defined(_WIN32)
-    if (const char* localAppData = std::getenv("LOCALAPPDATA"); localAppData != nullptr) {
+    if (const wchar_t* localAppData = ::_wgetenv(L"LOCALAPPDATA"); localAppData != nullptr) {
         return std::filesystem::path(localAppData) / "MonoSect";
     }
     return std::filesystem::temp_directory_path() / "MonoSect";

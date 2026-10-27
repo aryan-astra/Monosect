@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
+#include <cstdlib>
 
 using namespace monosect::core;
 using namespace monosect::test;
@@ -101,3 +102,23 @@ MONOSECT_TEST(an_unwritable_database_reports_an_error_instead_of_crashing) {
     CHECK(!status.error.message.empty());
     std::filesystem::remove(blocker);
 }
+
+#if defined(_WIN32)
+MONOSECT_TEST(default_history_preserves_unicode_profile_paths) {
+    const auto root = std::filesystem::temp_directory_path() / makeJobId() /
+                      std::filesystem::path(L"\u65e5\u672c\u8a9e");
+    const wchar_t* previous = ::_wgetenv(L"LOCALAPPDATA");
+    const std::wstring saved = previous != nullptr ? previous : L"";
+    CHECK_EQ(0, ::_wputenv_s(L"LOCALAPPDATA", root.c_str()));
+    const auto store = JobStore::defaultStore();
+    CHECK_EQ(0, ::_wputenv_s(L"LOCALAPPDATA", saved.c_str()));
+    CHECK(store.path() == root / "MonoSect" / "jobs.jsonl");
+    CHECK(store.append(makeRecord("unicode-profile", "completed", 1)).ok());
+    const auto loaded = store.loadRecent(1);
+    CHECK(loaded.has_value());
+    CHECK_EQ(1u, loaded.value().size());
+    std::error_code error;
+    std::filesystem::remove_all(root.parent_path(), error);
+    CHECK(!error);
+}
+#endif
