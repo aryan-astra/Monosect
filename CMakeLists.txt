@@ -106,57 +106,14 @@ add_library(monosect_core STATIC ${MONOSECT_CORE_SOURCES})
 target_include_directories(monosect_core PUBLIC src)
 target_compile_definitions(monosect_core PUBLIC MONOSECT_VERSION_STR="${PROJECT_VERSION}")
 
-# The pinned FFmpeg the product ships (TODO 215 - TODO 225).
-#
-# These three variables are what turns the download into something identifiable.
-# The URL points at an *immutable* autobuild tag, never at `latest`, and
-# `MONOSECT_FFMPEG_SHA256` is the archive's SHA-256: the value GitHub publishes as
-# the asset's `digest`, which can be read without downloading 200 MB with
-#
-#   gh api repos/BtbN/FFmpeg-Builds/releases/tags/<tag> --jq '.assets[]
-#         | select(.name|test("win64-gpl\\.zip$")) | .digest'
-#
-# When the hash is empty (a developer build) core/DependencyPin.cpp falls back to
-# trust-on-first-use: the hash of the first download is recorded next to the
-# tools and enforced from then on, so a substituted binary is still detected.  The
-# values reach C++ as compile definitions, which is why they are declared here
-# rather than being read from an environment variable at run time: a build that
-# cannot state what it expects must not be able to silently accept anything.
-#
-# Maintenance: the pin has to be refreshed when the FFmpeg release MonoSect
-# tracks is updated.  That is a deliberate, visible edit with a checksum in it -
-# which is the point.  Note that upstream prunes old autobuild tags, so a very
-# old pin can become a 404; the bootstrap reports that as an actionable download
-# error rather than falling back to an unpinned address.
-set(MONOSECT_FFMPEG_URL "https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-10-03-18-14/ffmpeg-N-127142-g12b7b9891b-win64-gpl.zip"
-    CACHE STRING "URL of the pinned FFmpeg archive MonoSect downloads")
-set(MONOSECT_FFMPEG_VERSION "N-127142-g12b7b9891b (autobuild-2026-10-03-18-14, win64 gpl)"
-    CACHE STRING "Release name of the pinned FFmpeg build, recorded in every job record")
-set(MONOSECT_FFMPEG_SHA256 "a885f564dee2b60f69ab866c6c89b96ae531fc2ee1f24ff8b5b1a6d29960a96b"
-    CACHE STRING "SHA-256 of the pinned FFmpeg archive (empty = trust on first use)")
-# The two executables are separate files with separate digests, so they need their
-# own pins; one archive hash cannot match both.  They are defence in depth on top
-# of the archive pin, and they matter because extraction on Windows shells out to
-# PowerShell.
-#
-# All three digests below were taken from the artefact itself and are reproducible:
-# download the archive named in MONOSECT_FFMPEG_URL, check it against
-# MONOSECT_FFMPEG_SHA256, then hash the two files in its bin/ folder.  The archive
-# digest is also published by GitHub as the asset's `digest`, which is how it was
-# cross-checked here without trusting the download alone.
-#
-#   ffmpeg.exe   168 868 352 bytes
-#   ffprobe.exe  168 657 408 bytes
-#   version      N-127142-g12b7b9891b-20261003
-set(MONOSECT_FFMPEG_EXE_SHA256 "6de576f371de489d091a59e2b6906c8e14611d85627869100ee6fc12cdc47e33"
-    CACHE STRING "SHA-256 of ffmpeg.exe inside the pinned archive")
-set(MONOSECT_FFPROBE_EXE_SHA256 "3844bf66836cb7668742bfd4cc29b9fc9a5eebcbd198e212938448d1373cb532"
-    CACHE STRING "SHA-256 of ffprobe.exe inside the pinned archive")
+# One pin shared by the application, CI and release packaging.
+set(MONOSECT_PIN_FILE "${CMAKE_SOURCE_DIR}/resources/ffmpeg-pin.json")
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${MONOSECT_PIN_FILE}")
+file(READ "${MONOSECT_PIN_FILE}" MONOSECT_PIN_JSON)
 foreach (variable MONOSECT_FFMPEG_URL MONOSECT_FFMPEG_VERSION MONOSECT_FFMPEG_SHA256
                  MONOSECT_FFMPEG_EXE_SHA256 MONOSECT_FFPROBE_EXE_SHA256)
-    if (NOT DEFINED ${variable})
-        message(FATAL_ERROR "${variable} must have a value")
-    endif ()
+    string(JSON MONOSECT_PIN_DEFAULT GET "${MONOSECT_PIN_JSON}" "${variable}")
+    set(${variable} "${MONOSECT_PIN_DEFAULT}" CACHE STRING "FFmpeg pin: ${variable}")
 endforeach ()
 # A pinned hash that is not 64 hex characters is a build error, not something the
 # runtime discovers later: shipping a "pinned" build with a broken pin would mean
@@ -334,21 +291,6 @@ set(APP_SOURCES
 
 set(MONOSECT_ICON_SQUARE "${CMAKE_SOURCE_DIR}/Monosect-icon-square.png")
 set(MONOSECT_LOGO_FULL "${CMAKE_SOURCE_DIR}/Monosect-full-logo.png")
-set(MONOSECT_ICO "${CMAKE_SOURCE_DIR}/resources/Monosect.ico")
-
-if (EXISTS "${MONOSECT_ICON_SQUARE}")
-    execute_process(
-        COMMAND powershell -NoProfile -ExecutionPolicy Bypass -Command
-        "Add-Type -AssemblyName System.Drawing; $src='${MONOSECT_ICON_SQUARE}'; $dst='${MONOSECT_ICO}'; $sizes=@(16,32,48,64,256); $source=[System.Drawing.Image]::FromFile($src); $images=@(); foreach($s in $sizes){ $bmp=New-Object System.Drawing.Bitmap($s,$s); $g=[System.Drawing.Graphics]::FromImage($bmp); $g.InterpolationMode=[System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic; $g.DrawImage($source,0,0,$s,$s); $ms=New-Object System.IO.MemoryStream; $bmp.Save($ms,[System.Drawing.Imaging.ImageFormat]::Png); $g.Dispose(); $bmp.Dispose(); $images += ,@($s,$ms.ToArray()); }; $source.Dispose(); $fs=[System.IO.File]::Open($dst,[System.IO.FileMode]::Create); $bw=New-Object System.IO.BinaryWriter($fs); $bw.Write([UInt16]0); $bw.Write([UInt16]1); $bw.Write([UInt16]$images.Count); $offset=6 + 16*$images.Count; foreach($img in $images){ $s=[int]$img[0]; $bytes=[byte[]]$img[1]; $bw.Write([byte]($(if($s -ge 256){0}else{$s}))); $bw.Write([byte]($(if($s -ge 256){0}else{$s}))); $bw.Write([byte]0); $bw.Write([byte]0); $bw.Write([UInt16]1); $bw.Write([UInt16]32); $bw.Write([UInt32]$bytes.Length); $bw.Write([UInt32]$offset); $offset += $bytes.Length; }; foreach($img in $images){ $bw.Write([byte[]]$img[1]); } $bw.Close(); $fs.Close();"
-        RESULT_VARIABLE MONOSECT_ICO_RESULT
-    )
-    if (NOT MONOSECT_ICO_RESULT EQUAL 0)
-        message(WARNING "Failed to generate Monosect.ico from Monosect-icon-square.png")
-    endif ()
-else ()
-    message(WARNING "Monosect-icon-square.png not found; executable icon resource may be missing")
-endif ()
-
 # The resource compiler cannot see CMake's variables, and hardcoding the version in
 # two places guarantees they drift.  So the numbers are written out as macros and
 # included by resources/Monosect.rc: version.txt stays the single source of truth for

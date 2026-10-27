@@ -27,6 +27,7 @@ jobs:
             mingw-w64-x86_64-toolchain
             mingw-w64-x86_64-cmake
             mingw-w64-x86_64-ninja
+            mingw-w64-x86_64-python
 
       - name: Configure
         shell: msys2 {0}
@@ -38,36 +39,11 @@ jobs:
 
       - name: Run quality checks
         shell: msys2 {0}
-        run: ctest --test-dir build --output-on-failure --verbose
+        run: ctest --test-dir build -R '^monosect-unit-tests$' --output-on-failure --verbose
 
-      # The unit tests check the rules.  This checks the product: it drives the real
-      # CLI against real media in every container MonoSect claims to support, and
-      # re-checks every output with ffprobe alone.  It found every defect that the
-      # unit tests could not - a stream-copy that failed on the last part of a job, a
-      # seek that silently dropped the tail of a transport stream, an attachment that
-      # was dropped from every part - because each of those only appears when FFmpeg
-      # is actually asked to split a real file.
-      #
-      # It needs the pinned FFmpeg, not whatever is on the runner: the same build the
-      # product ships and verifies.  Fetched from the same pinned release and checked
-      # against the same digests CMake compiles in, so a mismatch fails here rather
-      # than producing results from a build nobody released.
-      - name: Fetch the pinned FFmpeg
+      - name: Fetch and verify the pinned FFmpeg
         shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $tag = "autobuild-2026-10-03-18-14"
-          $asset = "ffmpeg-N-127142-g12b7b9891b-win64-gpl.zip"
-          $expected = "a885f564dee2b60f69ab866c6c89b96ae531fc2ee1f24ff8b5b1a6d29960a96b"
-          $url = "https://github.com/BtbN/FFmpeg-Builds/releases/download/$tag/$asset"
-          Invoke-WebRequest -Uri $url -OutFile ffmpeg.zip
-          $actual = (Get-FileHash -Algorithm SHA256 ffmpeg.zip).Hash.ToLowerInvariant()
-          if ($actual -ne $expected) { throw "FFmpeg archive digest mismatch: $actual" }
-          Expand-Archive -Path ffmpeg.zip -DestinationPath ffmpeg -Force
-          $bin = (Get-ChildItem ffmpeg -Recurse -Filter ffmpeg.exe | Select-Object -First 1).DirectoryName
-          "MONOSECT_FFMPEG=$bin\ffmpeg.exe" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-          "MONOSECT_FFPROBE=$bin\ffprobe.exe" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-          & "$bin\ffmpeg.exe" -hide_banner -version | Select-Object -First 1
+        run: ./tools/prepare-ffmpeg.ps1 -Destination ffmpeg
 
       - name: Run the end-to-end suite
         shell: msys2 {0}

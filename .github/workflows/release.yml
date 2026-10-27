@@ -47,92 +47,34 @@ jobs:
             mingw-w64-x86_64-toolchain
             mingw-w64-x86_64-cmake
             mingw-w64-x86_64-ninja
+            mingw-w64-x86_64-python
 
       - name: Configure CMake
         shell: msys2 {0}
         run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
 
-      - name: Build Monosect
+      - name: Build all release targets
         shell: msys2 {0}
-        run: cmake --build build --target Monosect -j 4
+        run: cmake --build build -j 4
 
-      - name: Run quality checks
+      - name: Run unit tests
         shell: msys2 {0}
-        run: |
-          if [ -f "build/MonosectQualityChecks" ]; then
-            build/MonosectQualityChecks
-          fi
+        run: ctest --test-dir build -R '^monosect-unit-tests$' --output-on-failure
 
-      - name: Bundle FFmpeg binaries
+      - name: Bundle and verify the pinned FFmpeg
         shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          Write-Host "Downloading FFmpeg binaries..."
-          New-Item -ItemType Directory -Force -Path release | Out-Null
+        run: ./tools/prepare-ffmpeg.ps1 -Destination release
 
-          # The same pinned release CMake builds against, and the same digests.
-          #
-          # This used to fetch `releases/download/latest/ffmpeg-master-latest-...`,
-          # which is a moving target: two release builds of MonoSect would bundle
-          # different FFmpeg builds, so a bug report against one could not be
-          # reproduced against the other.  It also meant the digests compiled into
-          # MonoSect (MONOSECT_FFMPEG_SHA256 and the two executable pins) described
-          # a build that was never shipped - and the product verifies the tools next
-          # to it, so a user who trusted that check would have had it fail on every
-          # release.
-          #
-          # To move the pin, take the digest from the release asset itself and update
-          # the three CMake variables together:
-          #   gh api repos/BtbN/FFmpeg-Builds/releases/tags/<tag> \
-          #     --jq '.assets[] | select(.name|test("win64-gpl\\.zip$")) | .digest'
-          $ffmpegTag = "autobuild-2026-10-03-18-14"
-          $ffmpegAsset = "ffmpeg-N-127142-g12b7b9891b-win64-gpl.zip"
-          $ffmpegArchiveSha256 = "a885f564dee2b60f69ab866c6c89b96ae531fc2ee1f24ff8b5b1a6d29960a96b"
-          $ffmpegExeSha256 = "6de576f371de489d091a59e2b6906c8e14611d85627869100ee6fc12cdc47e33"
-          $ffprobeExeSha256 = "3844bf66836cb7668742bfd4cc29b9fc9a5eebcbd198e212938448d1373cb532"
+      - name: Run the end-to-end suite
+        shell: msys2 {0}
+        run: python tests/harness/end_to_end.py build/monosect-cli.exe e2e-work
 
-          $ffmpegUrl = "https://github.com/BtbN/FFmpeg-Builds/releases/download/$ffmpegTag/$ffmpegAsset"
-          $zipPath = "ffmpeg_download.zip"
-          $tmpDir = "ffmpeg_tmp"
-
-          try {
-            Invoke-WebRequest -Uri $ffmpegUrl -OutFile $zipPath -ErrorAction Stop
-
-            $actual = (Get-FileHash -Algorithm SHA256 $zipPath).Hash.ToLowerInvariant()
-            if ($actual -ne $ffmpegArchiveSha256) {
-              throw "FFmpeg archive digest mismatch: expected $ffmpegArchiveSha256, got $actual. The pin and the download must be updated together."
-            }
-            Write-Host "Archive digest verified: $actual"
-
-            Expand-Archive -Path $zipPath -DestinationPath $tmpDir -Force
-
-            $ffmpegBin = Get-ChildItem -Path $tmpDir -Recurse -Filter ffmpeg.exe | Select-Object -First 1
-            $ffprobeBin = Get-ChildItem -Path $tmpDir -Recurse -Filter ffprobe.exe | Select-Object -First 1
-
-            if ($null -eq $ffmpegBin -or $null -eq $ffprobeBin) {
-              throw "Unable to locate ffmpeg.exe/ffprobe.exe in downloaded archive"
-            }
-
-            # The archive digest proves the archive.  These prove the two files that
-            # actually ship, which is what MonoSect checks at runtime - and which is
-            # why one archive hash can never stand in for them.
-            $actualFfmpeg = (Get-FileHash -Algorithm SHA256 $ffmpegBin.FullName).Hash.ToLowerInvariant()
-            if ($actualFfmpeg -ne $ffmpegExeSha256) {
-              throw "ffmpeg.exe digest mismatch: expected $ffmpegExeSha256, got $actualFfmpeg"
-            }
-            $actualFfprobe = (Get-FileHash -Algorithm SHA256 $ffprobeBin.FullName).Hash.ToLowerInvariant()
-            if ($actualFfprobe -ne $ffprobeExeSha256) {
-              throw "ffprobe.exe digest mismatch: expected $ffprobeExeSha256, got $actualFfprobe"
-            }
-            Write-Host "ffmpeg.exe and ffprobe.exe digests verified"
-
-            Copy-Item $ffmpegBin.FullName "release/ffmpeg.exe" -Force
-            Copy-Item $ffprobeBin.FullName "release/ffprobe.exe" -Force
-            Write-Host "FFmpeg binaries bundled from the pinned release $ffmpegTag"
-          } finally {
-            if (Test-Path $tmpDir) { Remove-Item -Recurse -Force $tmpDir }
-            if (Test-Path $zipPath) { Remove-Item -Force $zipPath }
-          }
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: release-e2e-log
+          path: e2e-work/e2e.log
+          if-no-files-found: ignore
 
       - name: Prepare release assets
         id: prepare_assets
