@@ -52,7 +52,8 @@ Result<SegmentMeasurement> VerificationEngine::measure(const std::filesystem::pa
     measurement.exists = true;
     measurement.fileSizeBytes = static_cast<ByteCount>(std::filesystem::file_size(file, error));
     if (error) {
-        measurement.fileSizeBytes = 0;
+        return Error{ErrorCode::VerificationFailed, "The written part's size could not be measured.",
+                     file.string() + ": " + error.message(), "The part was not published."};
     }
 
     auto model = prober_.probe(file);
@@ -83,13 +84,16 @@ Result<SegmentMeasurement> VerificationEngine::measure(const std::filesystem::pa
         ProcessCallbacks callbacks;
         callbacks.shouldCancel = shouldCancel;
         const ProcessResult result = runner_.run(spec, callbacks);
+        if (result.canceled) {
+            return Error{ErrorCode::ProcessCanceled, "The decode check was cancelled."};
+        }
         if (!result.launched) {
             return Error{ErrorCode::FfmpegBinaryMissing, "ffmpeg could not be started for the decode check.",
                          result.launchError, "Install the FFmpeg runtime from Settings."};
         }
         if (result.exitCode != 0) {
-            measurement.notes.push_back("the decode check reported errors: " +
-                                        joinForDisplay(result.stderrTail));
+            return Error{ErrorCode::DecodeFailed, "The written part failed the decode check.",
+                         joinForDisplay(result.stderrTail), "The part was not published."};
         } else {
             measurement.notes.push_back("the decode check passed: the part decodes from start to end");
         }
@@ -103,10 +107,14 @@ Result<SegmentMeasurement> VerificationEngine::measure(const std::filesystem::pa
         ProcessCallbacks callbacks;
         callbacks.shouldCancel = shouldCancel;
         const ProcessResult result = runner_.run(spec, callbacks);
-        if (result.launched && result.exitCode == 0) {
+        if (result.canceled) {
+            return Error{ErrorCode::ProcessCanceled, "The content hash check was cancelled."};
+        }
+        if (result.launched && result.exitCode == 0 && !result.stdoutText.empty()) {
             measurement.contentHash = result.stdoutText;
         } else {
-            measurement.notes.push_back("the stream hash could not be computed");
+            return Error{ErrorCode::VerificationFailed, "The written part's stream hash could not be computed.",
+                         joinForDisplay(result.stderrTail), "The part was not published."};
         }
     }
 
@@ -126,7 +134,7 @@ Result<VerificationResult> VerificationEngine::verifyPart(const SplitPlan& plan,
     // source range with the same boundaries.  This is the strongest statement
     // MonoSect can make, so it is only made when the check is enabled and the
     // mode really copies everything.
-    if (policy_.contentHashCheck && segment.method == SegmentMethod::Copy && segment.endsAtSourceEnd == false &&
+    if (policy_.contentHashCheck && segment.method == SegmentMethod::Copy &&
         measurement.value().contentHash.has_value()) {
         ProcessSpec spec;
         spec.program = ffmpegPath_;
@@ -135,15 +143,20 @@ Result<VerificationResult> VerificationEngine::verifyPart(const SplitPlan& plan,
         ProcessCallbacks callbacks;
         callbacks.shouldCancel = shouldCancel;
         const ProcessResult result = runner_.run(spec, callbacks);
-        if (result.launched && result.exitCode == 0) {
+        if (result.canceled) {
+            return Error{ErrorCode::ProcessCanceled, "The source hash check was cancelled."};
+        }
+        if (result.launched && result.exitCode == 0 && !result.stdoutText.empty()) {
             if (result.stdoutText != *measurement.value().contentHash) {
-                measurement.value().notes.push_back(
-                    "the stream hash of the part differs from the same range of the source; the part is not a "
-                    "byte-identical copy of that range");
+                return Error{ErrorCode::VerificationFailed, "The part's stream hash differs from the source range.",
+                             file.string(), "The part was not published."};
             } else {
                 measurement.value().notes.push_back(
                     "the stream hash matches the same range of the source: the part carries the same packets");
             }
+        } else {
+            return Error{ErrorCode::VerificationFailed, "The source range's stream hash could not be computed.",
+                         joinForDisplay(result.stderrTail), "The part was not published."};
         }
     }
 

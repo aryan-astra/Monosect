@@ -224,6 +224,7 @@ if (MONOSECT_BUILD_TESTS)
         tests/core/ConstraintsTests.cpp
         tests/core/PlannerTests.cpp
         tests/core/VerificationTests.cpp
+        tests/core/VerificationEngineTests.cpp
         tests/core/NamingTests.cpp
         tests/core/MergePlannerTests.cpp
         tests/core/JobStoreTests.cpp
