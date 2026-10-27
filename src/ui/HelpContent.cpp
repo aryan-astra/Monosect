@@ -224,12 +224,12 @@ const std::vector<HelpTopic>& topicList() {
             HelpTopicId::GpuEncoders,
             "gpu-encoders",
             "GPU encoders",
-            "An encoder that exists is not automatically an encoder that works. MonoSect tests it before offering it.",
+            "An encoder that exists is not automatically an encoder that works. MonoSect probes it with a test encode.",
             "The list of encoders comes from ffmpeg's own list, but a driver can list an encoder whose hardware or "
             "driver version cannot run it. MonoSect therefore runs a one-frame encode with the encoder and only "
-            "offers it when that succeeds, showing the reason when it does not.\n"
-            "GPU encoding is only used where re-encoding happens (smart cut or full re-encode). A pure copy job is "
-            "limited by storage, not by the encoder.",
+            "reports it as usable when that succeeds, showing the reason when it does not.\n"
+            "Hardware detection is informational. Smart cut and full re-encode jobs currently use software "
+            "encoders. Copy jobs preserve the compressed streams without encoding.",
             "h264_nvenc present but the probe failed: \"listed by ffmpeg, but the driver refused a test encode\".",
             {"resource-modes"},
         },
