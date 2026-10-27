@@ -411,6 +411,8 @@ MONOSECT_TEST(a_failed_job_keeps_the_parts_it_published_and_says_so) {
     CHECK(controller.snapshot().phase == SessionPhase::Failed);
     CHECK_EQ(std::string("Failed"), controller.statusLine().headline);
     CHECK(controller.statusLine().tone == StatusTone::Bad);
+    CHECK(!controller.snapshot().verified);
+    CHECK(!controller.snapshot().parts.empty());
 }
 
 MONOSECT_TEST(cancelling_keeps_verified_parts_and_is_described_honestly) {

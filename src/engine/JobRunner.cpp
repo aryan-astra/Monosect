@@ -1020,6 +1020,13 @@ Result<JobOutcome> JobRunner::runInternal(const JobRequest& request, const JobEv
                         auto bigger = closerPlanner.planOnePart(plan, segment.startSeconds, segment.index,
                                                                 segment.total, request.outputDirectory);
                         if (bigger.has_value() && compareRational(bigger.value().endSeconds, segment.endSeconds) > 0) {
+                            bigger.value().outputFileName = segment.outputFileName;
+                            SplitPlan candidate = plan;
+                            candidate.segments[index] = bigger.value();
+                            auto remaining = closerPlanner.replanRemaining(candidate, index + 1);
+                            if (!remaining.has_value() || !remaining.value().planned) {
+                                log("the larger boundary was skipped because the remaining source could not be planned");
+                            } else {
                             const std::filesystem::path retryPath =
                                 committer.temporaryPathFor(segment.outputFileName + ".closer");
                             auto renderedRetry = renderPart(plan, bigger.value(), retryPath, request, events);
@@ -1040,7 +1047,12 @@ Result<JobOutcome> JobRunner::runInternal(const JobRequest& request, const JobEv
                                     // this path and not the one just discarded.
                                     verifiedPath = retryPath;
                                     partOutcome = renderedRetry.value().outcome;
-                                    segment = bigger.value();
+                                    plan = std::move(remaining.value());
+                                    segment = plan.segments[index];
+                                    outcome.plan = plan;
+                                    if (events.onPlanReady) {
+                                        events.onPlanReady(plan);
+                                    }
                                     outcome.partsRewrittenForCloseness++;
                                     if (measurements.size() > beforeRetry) {
                                         // The retry is the file that is kept, so its
@@ -1067,6 +1079,7 @@ Result<JobOutcome> JobRunner::runInternal(const JobRequest& request, const JobEv
                                 }
                             } else {
                                 committer.discard(retryPath);
+                            }
                             }
                         } else {
                             // Keep the calibration from the verified part.
@@ -1181,15 +1194,26 @@ Result<JobOutcome> JobRunner::runInternal(const JobRequest& request, const JobEv
         std::chrono::duration<double>(std::chrono::steady_clock::now() - executionStart).count();
 
     // Sequence-level check: coverage, completeness and the sum of the durations.
-    if (outcome.parts.size() == plan.segments.size()) {
+    outcome.plan = plan;
+    {
         auto sequence = verifier.verifySequence(plan, measurements);
         if (sequence.has_value()) {
             log("sequence check: " + sequence.value().renderFindings());
             for (const auto& finding : sequence.value().findings) {
-                if (finding.severity == FindingSeverity::Error) {
+                if (finding.severity != FindingSeverity::Info) {
                     outcome.warnings.push_back(finding.message);
                 }
             }
+        }
+        if (!sequence.has_value() || !sequence.value().passed) {
+            cleanUpWorkingFolder(request);
+            outcome.message = "The split is incomplete. " + std::to_string(outcome.parts.size()) +
+                              " individually verified part(s) remain in the output folder. " +
+                              (sequence.has_value() ? sequence.value().renderFindings()
+                                                    : sequence.error().toString());
+            setState(JobState::Failed, outcome.message);
+            stampExecution();
+            return outcome;
         }
     }
 

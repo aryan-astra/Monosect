@@ -534,7 +534,7 @@ void UiController::start(const std::string& outputDirectory) {
             if (result.has_value()) {
                 workerParts_ = result.value().parts;
                 workerJobId_ = result.value().jobId;
-                workerVerified_ = !result.value().parts.empty() &&
+                workerVerified_ = result.value().succeeded && !result.value().parts.empty() &&
                                   std::all_of(result.value().parts.begin(), result.value().parts.end(),
                                               [](const SegmentOutcome& part) { return part.verified; });
                 workerCanceled_ = result.value().canceled;

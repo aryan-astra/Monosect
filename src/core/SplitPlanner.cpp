@@ -783,12 +783,17 @@ Result<SplitPlan> SplitPlanner::plan(const std::string& outputDirectory) {
 
 Result<SplitPlan> SplitPlanner::replanRemaining(const SplitPlan& previous, std::size_t completedParts) {
     stats_ = PlannerStats{};
-    if (completedParts >= previous.segments.size()) {
+    if (completedParts > previous.segments.size()) {
+        return Error{ErrorCode::PlanningFailed, "The completed part count exceeds the plan."};
+    }
+    if (completedParts == previous.segments.size() &&
+        (previous.segments.empty() || compareRational(previous.segments.back().endSeconds, sourceEnd()) >= 0)) {
         SplitPlan plan = previous;
         plan.sizeModel = sizeModel_;
         return plan;
     }
-    const Rational start = previous.segments[completedParts].startSeconds;
+    const Rational start = completedParts > 0 ? previous.segments[completedParts - 1].endSeconds
+                                             : previous.segments.front().startSeconds;
     auto result = buildPlan(previous.outputDirectory, static_cast<int>(completedParts) + 1, start,
                             completedParts, &previous);
     if (!result.has_value()) {
@@ -840,7 +845,9 @@ Result<SegmentPlan> SplitPlanner::planOnePart(const SplitPlan& reference, Ration
     boundary.exact = choice.exact;
     boundary.reason = choice.reason;
     boundary.explanation = choice.explanation;
-    return makeSegment(shell, startSeconds, choice.end, index, totalHint, boundary);
+    SegmentPlan segment = makeSegment(shell, startSeconds, choice.end, index, totalHint, boundary);
+    segment.endsAtSourceEnd = compareRational(choice.end, end) >= 0;
+    return segment;
 }
 
 } // namespace monosect::core

@@ -136,3 +136,27 @@ MONOSECT_TEST(the_size_model_learns_from_a_measurement) {
     CHECK(model.predictFileBytes(100'000) >= 140'000);
     CHECK(model.maxPayloadForLimit(150'000) <= 150'000);
 }
+
+MONOSECT_TEST(replanning_starts_at_the_actual_completed_boundary) {
+    const SyntheticSource source = makeSyntheticSource();
+    UserConstraint constraint;
+    constraint.size = SizeLimit{.maxBytes = 200000, .minBytes = std::nullopt};
+    SplitPlan plan = planFor(source, constraint);
+    CHECK(plan.segments.size() > 2);
+    plan.segments.front().endSeconds = plan.segments[1].endSeconds;
+    SplitPlanner planner(source.model, source.index, constraint, {}, plan.sizeModel);
+    const auto revised = planner.replanRemaining(plan, 1);
+    CHECK(revised.has_value());
+    CHECK(revised.value().planned);
+    CHECK_EQ(plan.segments.front().endSeconds, revised.value().segments[1].startSeconds);
+    CHECK_EQ(plan.segments.front().endSeconds, revised.value().segments.front().endSeconds);
+    for (std::size_t i = 1; i < revised.value().segments.size(); ++i) {
+        CHECK_EQ(revised.value().segments[i - 1].endSeconds, revised.value().segments[i].startSeconds);
+    }
+    CHECK(revised.value().segments.back().endsAtSourceEnd);
+    CHECK(!planner.replanRemaining(plan, plan.segments.size() + 1).has_value());
+    const auto tail = planner.planOnePart(plan, plan.segments.back().startSeconds,
+                                        plan.segments.back().index, plan.partCount(), "out");
+    CHECK(tail.has_value());
+    CHECK(tail.value().endsAtSourceEnd);
+}
