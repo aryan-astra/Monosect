@@ -247,7 +247,9 @@ ProgressView UiModel::progress(int partsDone, int partsTotal, double bytesWritte
     view.partsTotal = partsTotal;
     view.bytesWritten = bytesWritten;
     view.fraction = partsTotal > 0 ? std::min(1.0, static_cast<double>(partsDone) / partsTotal) : 0.0;
-    if (remainingSeconds.has_value() && *remainingSeconds >= 0.0) {
+    if (partsTotal > 0 && partsDone >= partsTotal) {
+        // There is no remaining work to estimate once every part is done.
+    } else if (remainingSeconds.has_value() && *remainingSeconds >= 0.0) {
         view.secondsRemaining = remainingSeconds;
     } else if (partsTotal == 0) {
         view.etaExplanation = "The number of parts is not known yet.";

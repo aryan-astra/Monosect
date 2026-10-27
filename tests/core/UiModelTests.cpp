@@ -206,6 +206,10 @@ MONOSECT_TEST(metrics_are_never_invented) {
 }
 
 MONOSECT_TEST(an_eta_is_only_offered_when_it_can_be_computed) {
+    const ProgressView finished = UiModel::progress(5, 5, 5000000.0, 30.0);
+    CHECK(!finished.secondsRemaining.has_value());
+    CHECK(finished.etaExplanation.empty());
+    CHECK(finished.describe().find("remaining") == std::string::npos);
     const ProgressView none = UiModel::progress(0, 5, 0.0, std::nullopt);
     CHECK(!none.secondsRemaining.has_value());
     const std::string text = none.describe();

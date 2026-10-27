@@ -1312,7 +1312,9 @@ private:
 
         const ProgressView progress = controller_->progressView();
         const float fraction = static_cast<float>(progress.fraction);
-        ImGui::ProgressBar(fraction, ImVec2(-1.0f, 0.0f), progress.describe().c_str());
+        const std::string count = std::to_string(progress.partsDone) + " / " + std::to_string(progress.partsTotal);
+        ImGui::ProgressBar(fraction, ImVec2(-1.0f, 0.0f), count.c_str());
+        ImGui::TextWrapped("%s", progress.describe().c_str());
         if (progress.etaExplanation.empty() && progress.secondsRemaining.has_value()) {
             ImGui::TextDisabled("The estimate comes from the parts already written; it is not a promise.");
         }
