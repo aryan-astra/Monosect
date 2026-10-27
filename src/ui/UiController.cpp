@@ -580,10 +580,8 @@ void UiController::requestCancel() {
     pauseRequested_ = false;
     snapshot_.phase = SessionPhase::Cancelling;
     snapshot_.tone = StatusTone::Warning;
-    // Honest wording: the part being written is always finished, so cancelling
-    // does not stop the file in the middle.
     snapshot_.statusHeadline = "Cancelling";
-    snapshot_.statusDetail = "The part being written is finished first; already published parts stay on disk.";
+    snapshot_.statusDetail = "Stopping FFmpeg and discarding the unfinished part; already published parts stay on disk.";
 }
 
 void UiController::requestPause() {

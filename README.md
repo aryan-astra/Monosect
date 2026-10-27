@@ -63,8 +63,8 @@ with the number of parts it would need.
   publication, and sequence failures report an incomplete job with retained parts.
 * **Transactional output** — parts are written into a working folder on the
   destination volume and renamed into place; a part is either absent or complete.
-* **Real cancel and pause** — cancel finishes the part in flight and keeps the
-  verified parts (the log says exactly how many); pause takes effect at the next
+* **Real cancel and pause** — cancel stops FFmpeg, discards the unfinished part and
+  keeps published parts (the log says exactly how many); pause takes effect at the next
   part boundary, which is stated in the interface rather than implied.
 * **Job history** — every job that reaches a terminal state is appended to a
   local NDJSON database with the plan, the parts, the versions and the outcome.

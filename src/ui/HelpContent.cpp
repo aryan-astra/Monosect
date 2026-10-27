@@ -285,7 +285,7 @@ const std::vector<HelpTopic>& topicList() {
             "middle of one.",
             "Cancelling terminates the running FFmpeg process, waits for it, discards the unfinished part and records "
             "the job as cancelled. Parts that were already verified and published stay - that is what makes a "
-            "cancelled job resumable - and the record says exactly which parts exist.\n"
+            "record useful for recovery - and the record says exactly which parts exist.\n"
             "Pause is a segment-boundary pause by design. Suspending a process mid-write on Windows can leave a "
             "muxer with a half-written index and a file that looks complete; MonoSect does not do that. Pressing "
             "pause lets the current part finish and verify, and then waits. The UI says which of the two is "

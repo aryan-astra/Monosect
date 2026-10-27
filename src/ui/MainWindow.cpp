@@ -619,6 +619,7 @@ private:
                 bootstrapRunning_ = false;
                 continue;
             }
+            bootstrapStatus_ = line;
             logLines_.push_back(std::move(line));
         }
     }
@@ -1042,7 +1043,7 @@ private:
         }
         ImGui::SeparatorText("First run");
         if (bootstrapRunning_) {
-            ImGui::TextUnformatted("Checking for FFmpeg and FFprobe...");
+            ImGui::TextWrapped("%s", bootstrapStatus_.empty() ? "Checking for FFmpeg and FFprobe..." : bootstrapStatus_.c_str());
             ImGui::ProgressBar(-1.0f * static_cast<float>(ImGui::GetTime()), ImVec2(-1.0f, 0.0f),
                                "downloading when needed");
         } else if (!bootstrapError_.empty()) {
@@ -2351,6 +2352,7 @@ private:
     std::atomic<bool> toolsReady_{false};
     std::atomic<bool> bootstrapRunning_{false};
     std::string bootstrapError_;
+    std::string bootstrapStatus_;
     std::vector<std::string> bootstrapLog_;
     std::mutex bootstrapMutex_;
     std::string ffmpegPath_;

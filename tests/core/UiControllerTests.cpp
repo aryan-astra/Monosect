@@ -505,7 +505,7 @@ MONOSECT_TEST(cancelling_keeps_verified_parts_and_is_described_honestly) {
     controller.poll();
     controller.requestCancel();
     CHECK(controller.snapshot().phase == SessionPhase::Cancelling);
-    CHECK(controller.snapshot().statusDetail.find("finished first") != std::string::npos);
+    CHECK(controller.snapshot().statusDetail.find("discarding the unfinished part") != std::string::npos);
 
     for (int attempt = 0; attempt < 500 && controller.jobRunning(); ++attempt) {
         controller.poll();
