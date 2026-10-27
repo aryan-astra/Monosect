@@ -182,6 +182,7 @@ if (MONOSECT_BUILD_TESTS)
         tests/core/PlannerTests.cpp
         tests/core/VerificationTests.cpp
         tests/core/VerificationEngineTests.cpp
+        tests/core/FfmpegArgsTests.cpp
         tests/core/OutputCommitterTests.cpp
         tests/core/NamingTests.cpp
         tests/core/MergePlannerTests.cpp

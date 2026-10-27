@@ -2,6 +2,7 @@
 
 #include "core/ProbeParsing.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -160,17 +161,16 @@ std::vector<std::string> renderSegmentArgs(const SegmentRenderRequest& request) 
 
     // Stream selection: exactly the streams the plan names, independently of the
     // order FFmpeg would choose for -map 0.
-    if (request.copiedStreams.empty() && request.reencodedStreams.empty()) {
+    std::vector<int> mappedStreams = request.copiedStreams;
+    for (const auto& stream : request.reencodedStreams) { mappedStreams.push_back(stream.index); }
+    std::sort(mappedStreams.begin(), mappedStreams.end());
+    if (mappedStreams.empty()) {
         arguments.push_back("-map");
         arguments.push_back("0");
     } else {
-        for (const int index : request.copiedStreams) {
+        for (const int index : mappedStreams) {
             arguments.push_back("-map");
             arguments.push_back("0:" + numberText(index));
-        }
-        for (const auto& stream : request.reencodedStreams) {
-            arguments.push_back("-map");
-            arguments.push_back("0:" + numberText(stream.index));
         }
     }
 
@@ -194,7 +194,8 @@ std::vector<std::string> renderSegmentArgs(const SegmentRenderRequest& request) 
             // The caller validated this before starting; be explicit anyway.
             continue;
         }
-        const std::string suffix = ":" + numberText(stream.index);
+        const auto outputIndex = std::find(mappedStreams.begin(), mappedStreams.end(), stream.index) - mappedStreams.begin();
+        const std::string suffix = ":" + numberText(outputIndex);
         arguments.push_back("-c" + suffix);
         arguments.push_back(encoder);
 
@@ -216,7 +217,7 @@ std::vector<std::string> renderSegmentArgs(const SegmentRenderRequest& request) 
                 arguments.push_back(request.pixelFormat);
             }
             if (!request.profile.empty()) {
-                arguments.push_back("-profile:v" + std::string(reencodedVideoCount == 1 ? "" : suffix));
+                arguments.push_back(reencodedVideoCount == 1 ? "-profile:v" : "-profile" + suffix);
                 arguments.push_back(request.profile);
             }
             if (request.frameRateNumerator > 0 && request.frameRateDenominator > 0) {
@@ -234,7 +235,7 @@ std::vector<std::string> renderSegmentArgs(const SegmentRenderRequest& request) 
             }
         } else if (stream.kind == StreamKind::Audio) {
             if (stream.bitRate > 0) {
-                arguments.push_back("-b:a" + suffix);
+                arguments.push_back("-b" + suffix);
                 arguments.push_back(numberText(stream.bitRate));
             }
         }
