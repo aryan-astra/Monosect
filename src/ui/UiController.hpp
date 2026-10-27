@@ -330,7 +330,7 @@ public:
     void startMerge();
     void requestMergeCancel();
     [[nodiscard]] bool mergeRunning() const noexcept {
-        return mergeWorker_.joinable() && !mergeWorkerFinished_.load();
+        return mergeBusy_.load();
     }
     /// Waits for a running merge to finish and joins its worker.  Used on shutdown
     /// and by the tests.
@@ -435,6 +435,7 @@ private:
     std::vector<SegmentOutcome> workerParts_;
     std::string workerJobId_;
     bool workerVerified_ = false;
+    std::vector<std::string> workerWarnings_;
     bool workerCanceled_ = false;
     std::mutex workerMutex_;
 
@@ -443,7 +444,7 @@ private:
     /// for two jobs writing to the same output folder, and neither would finish
     /// cleanly.  `mergeBusy_` is what enforces that on both sides.
     MergeSession merge_;
-    std::mutex mergeMutex_;
+    std::optional<MergeSession> mergeResult_;
     std::thread mergeWorker_;
     std::atomic<bool> mergeWorkerFinished_{true};
     std::atomic<bool> mergeCancelRequested_{false};

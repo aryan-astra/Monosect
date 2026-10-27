@@ -31,6 +31,7 @@ public:
     bool runVerifiesEverything = true;
     bool runSleepsUntilCanceled = false;
     bool runSleepsUntilPaused = false;
+    std::string runWarning;
     std::string failureMessage = "the limit cannot be met";
     SyntheticSource source;
     int probeCalls = 0;
@@ -77,6 +78,7 @@ public:
         ++runCalls;
         JobOutcome outcome;
         outcome.jobId = "test-job";
+        if (!runWarning.empty()) { outcome.warnings.push_back(runWarning); }
         const auto say = [&events](JobState state, const std::string& text) {
             if (events.onState) {
                 events.onState(state, text);
@@ -361,6 +363,7 @@ MONOSECT_TEST(starting_requires_a_source_a_folder_and_a_valid_request) {
 
 MONOSECT_TEST(a_finished_job_reports_verified_only_when_every_part_verified) {
     FakeEngine engine;
+    engine.runWarning = "A sequence warning";
     UiController controller(engine);
     const TempDirectory directory;
     controller.addSource("C:/media/movie.mkv");
@@ -377,6 +380,7 @@ MONOSECT_TEST(a_finished_job_reports_verified_only_when_every_part_verified) {
     CHECK_EQ(std::string("Finished and verified"), line.headline);
     CHECK(line.tone == StatusTone::Good);
     CHECK(controller.snapshot().verified);
+    CHECK_EQ(std::string("A sequence warning"), controller.snapshot().warnings.front());
     CHECK(controller.snapshot().partsDone == controller.snapshot().partsTotal);
     CHECK(controller.verificationLine().headline.find("Verified") != std::string::npos);
     CHECK(controller.progressView().partsDone == controller.snapshot().partsDone);

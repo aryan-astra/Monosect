@@ -2,6 +2,7 @@
 #include "ui/MainWindow.hpp"
 
 #include "core/Bytes.hpp"
+#include "core/DependencyPin.hpp"
 #include "core/Utf8Path.hpp"
 #include "engine/FFmpegBootstrap.hpp"
 #include "engine/ProcessRunners.hpp"
@@ -372,7 +373,7 @@ public:
         return window_ != nullptr ? glfwGetWin32Window(window_) : nullptr;
     }
 
-    bool initialize() {
+    bool initialize(bool smokeTest = false) {
         // Before glfwInit: DPI awareness is set once per process and must be in place
         // before a window exists, so it cannot be left to whoever creates one.
         makeDpiAware();
@@ -399,6 +400,9 @@ public:
         IMGUI_CHECKVERSION();
         ImGui::CreateContext();
         ImGuiIO& io = ImGui::GetIO();
+        if (smokeTest) {
+            io.IniFilename = nullptr;
+        }
         io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
         applyTheme();
         float xscale = 1.0f;
@@ -470,11 +474,13 @@ public:
         std::snprintf(durationValueBuffer_, sizeof(durationValueBuffer_), "%s", "00:10:00");
         std::snprintf(databaseBuffer_, sizeof(databaseBuffer_), "%s",
                       utf8FromPath(JobStore::defaultStore().path()).c_str());
-        startToolBootstrap();
+        if (!smokeTest) {
+            startToolBootstrap();
+        }
         return true;
     }
 
-    int run() {
+    int run(bool smokeTest = false) {
         while (glfwWindowShouldClose(window_) == 0) {
             glfwPollEvents();
             ImGui_ImplOpenGL3_NewFrame();
@@ -496,6 +502,9 @@ public:
             ImGui::Render();
             ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
             glfwSwapBuffers(window_);
+            if (smokeTest) {
+                return 0;
+            }
         }
 
         // The window is closing: a running job is cancelled honestly (finished
@@ -1059,8 +1068,14 @@ private:
                     // Under the lock, because the bootstrap thread writes these same
                     // two strings; see startToolBootstrap().
                     std::lock_guard<std::mutex> lock(bootstrapMutex_);
-                    ffmpegPath_ = path;
                     const std::filesystem::path folder = std::filesystem::path(wideFromUtf8(path)).parent_path();
+                    const auto ffmpegCheck = verifyToolFile(std::filesystem::path(wideFromUtf8(path)), pinnedFfmpeg());
+                    const auto ffprobeCheck = verifyToolFile(folder / "ffprobe.exe", pinnedFfprobe());
+                    if (!ffmpegCheck.ok() || !ffprobeCheck.ok()) {
+                        bootstrapError_ = !ffmpegCheck.ok() ? ffmpegCheck.message : ffprobeCheck.message;
+                        return;
+                    }
+                    ffmpegPath_ = path;
                     ffprobePath_ = utf8FromPath(folder / "ffprobe.exe");
                     toolsReady_ = true;
                     // The explicit choice ends the "still working" state, which
@@ -1071,7 +1086,7 @@ private:
                 }
             }
         }
-        ImGui::TextDisabled("MonoSect runs offline. The FFmpeg tools come from a pinned address and are identified by a SHA-256 before they run.");
+        ImGui::TextWrapped("Media stays on your computer. The first run downloads FFmpeg if needed; its SHA-256 is checked before use.");
         return;
     }
 
@@ -1254,10 +1269,12 @@ private:
         const ConstraintReport report = controller_->validate();
         const bool canStart = report.valid && !running && controller_->selected() != nullptr;
 
+        ImGui::BeginDisabled(running || controller_->selected() == nullptr);
         if (ImGui::Button("Preview plan", ImVec2(140.0f, 0.0f))) {
             controller_->previewPlan(controller_->outputDirectory());
         }
         helpMarker(HelpContent::find(HelpTopicId::Boundaries), [this](HelpTopicId id) { controller_->showHelp(id); });
+        ImGui::EndDisabled();
         ImGui::SameLine();
         ImGui::BeginDisabled(!canStart);
         if (ImGui::Button("Start", ImVec2(140.0f, 0.0f))) {
@@ -1359,6 +1376,11 @@ private:
             ImGui::TextWrapped("%s", verification.detail.c_str());
         }
         const SessionSnapshot& snapshot = controller_->snapshot();
+        for (const auto& warning : snapshot.warnings) {
+            ImGui::PushStyleColor(ImGuiCol_Text, toneColor(StatusTone::Warning));
+            ImGui::TextWrapped("%s", warning.c_str());
+            ImGui::PopStyleColor();
+        }
         if (snapshot.parts.empty()) {
             ImGui::TextDisabled("Nothing has been written yet.");
             return;
@@ -1562,6 +1584,8 @@ private:
     /// seconds later, and a plan states that up front with the actual difference.
     void drawMergePanel() {
         MergeSession& merge = controller_->merge();
+        const bool busy = controller_->mergeRunning() || controller_->jobRunning();
+        ImGui::BeginDisabled(busy);
 
         ImGui::SeparatorText("Merge");
         if (ImGui::Button("Back to splitting")) {
@@ -1636,6 +1660,8 @@ private:
         if (typedFolder || typedName) {
             merge.outputDirectory = mergeOutputBuffer_;
             merge.outputName = mergeNameBuffer_;
+            merge.planned = false;
+            merge.planSummary.clear();
         }
         if (ImGui::Button("Choose a folder...")) {
             const std::string folder = chooseFolderDialog(L"Write the merged file here", nativeWindow());
@@ -1644,6 +1670,8 @@ private:
                 // Pushed immediately rather than waiting for the next frame's typedFolder,
                 // which would never be true for a value the user did not type.
                 merge.outputDirectory = mergeOutputBuffer_;
+                merge.planned = false;
+                merge.planSummary.clear();
             }
         }
 
@@ -1655,19 +1683,24 @@ private:
             ImGui::TextWrapped("%s", merge.planSummary.c_str());
         }
 
+        ImGui::EndDisabled();
         if (controller_->mergeRunning()) {
-            ImGui::ProgressBar(0.0f, ImVec2(-1.0f, 0.0f), merge.headline.c_str());
+            ImGui::ProgressBar(-static_cast<float>(ImGui::GetTime()), ImVec2(-1.0f, 0.0f), merge.headline.c_str());
             if (ImGui::Button("Cancel the merge")) {
                 controller_->requestMergeCancel();
             }
         } else {
+            ImGui::BeginDisabled(busy || merge.inputs.size() < 2 || merge.outputDirectory.empty());
             if (ImGui::Button("Preview")) {
                 controller_->previewMerge(mergeOutputBuffer_, mergeNameBuffer_);
             }
             ImGui::SameLine();
+            ImGui::BeginDisabled(!merge.planned);
             if (ImGui::Button("Join the files") && !controller_->jobRunning()) {
                 controller_->startMerge();
             }
+            ImGui::EndDisabled();
+            ImGui::EndDisabled();
         }
 
         if (!merge.message.empty()) {
@@ -2388,13 +2421,15 @@ private:
     std::vector<float> gpuHistory_;
 };
 
-int runApplicationWindow(std::string appVersion) {
+int runApplicationWindow(std::string appVersion, bool smokeTest) {
     MainWindow window(appVersion.empty() ? std::string(MONOSECT_VERSION_STR) : std::move(appVersion));
-    if (!window.initialize()) {
-        MessageBoxW(nullptr, L"MonoSect could not open its window.", L"MonoSect", MB_ICONERROR | MB_OK);
+    if (!window.initialize(smokeTest)) {
+        if (!smokeTest) {
+            MessageBoxW(nullptr, L"MonoSect could not open its window.", L"MonoSect", MB_ICONERROR | MB_OK);
+        }
         return 1;
     }
-    return window.run();
+    return window.run(smokeTest);
 }
 
 } // namespace monosect::ui

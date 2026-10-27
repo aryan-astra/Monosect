@@ -504,6 +504,7 @@ void UiController::start(const std::string& outputDirectory) {
     cancelRequested_ = false;
     pauseRequested_ = false;
     workerVerified_ = false;
+    workerWarnings_.clear();
     workerCanceled_ = false;
     {
         std::lock_guard<std::mutex> lock(workerMutex_);
@@ -538,6 +539,7 @@ void UiController::start(const std::string& outputDirectory) {
                                   std::all_of(result.value().parts.begin(), result.value().parts.end(),
                                               [](const SegmentOutcome& part) { return part.verified; });
                 workerCanceled_ = result.value().canceled;
+                workerWarnings_ = result.value().warnings;
             }
         }
         std::lock_guard<std::mutex> lock(eventMutex_);
@@ -593,6 +595,7 @@ void UiController::requestResume() {
 
 void UiController::poll() {
     reapFinishedWorker();
+    reapFinishedMergeWorker();
     std::deque<PendingEvent> drained;
     {
         std::lock_guard<std::mutex> lock(eventMutex_);
@@ -695,6 +698,7 @@ void UiController::poll() {
             snapshot_.jobId = workerJobId_;
         }
         snapshot_.verified = workerVerified_;
+        snapshot_.warnings = workerWarnings_;
         if (workerCanceled_) {
             snapshot_.canceled = true;
         }
@@ -902,7 +906,7 @@ JobStatusLine UiController::verificationLine() const {
         return line;
     }
     VerificationResult result;
-    result.passed = !snapshot_.canceled && std::all_of(snapshot_.parts.begin(), snapshot_.parts.end(),
+    result.passed = snapshot_.verified && !snapshot_.canceled && std::all_of(snapshot_.parts.begin(), snapshot_.parts.end(),
                                                        [](const SegmentOutcome& part) { return part.verified; });
     std::size_t verified = 0;
     for (const SegmentOutcome& part : snapshot_.parts) {
@@ -1071,32 +1075,31 @@ void UiController::startMerge() {
     merge_.durationKnown = false;
 
     const MergeJobRequest request = makeMergeRequest();
-    mergeWorker_ = std::thread([this, request]() {
+    mergeWorker_ = std::thread([this, request, completed = merge_]() mutable {
         JobEvents events = makeEvents();
         events.shouldCancel = [this] { return mergeCancelRequested_.load(); };
         const Result<MergeOutcome> result = engine_.runMerge(request, events);
         {
-            std::lock_guard<std::mutex> lock(mergeMutex_);
             if (result.has_value()) {
                 const MergeOutcome& outcome = result.value();
-                merge_.succeeded = outcome.succeeded && !outcome.canceled;
-                merge_.canceled = outcome.canceled;
-                merge_.message = outcome.message;
-                merge_.path = outcome.path;
-                merge_.fileSizeBytes = outcome.fileSizeBytes;
-                merge_.duration = outcome.duration;
-                merge_.durationKnown = outcome.durationMeasured;
-                merge_.verified = outcome.verified;
-                merge_.findings = outcome.findings;
-                merge_.warnings = outcome.warnings;
-                merge_.jobId = outcome.jobId;
+                completed.succeeded = outcome.succeeded && !outcome.canceled;
+                completed.canceled = outcome.canceled;
+                completed.message = outcome.message;
+                completed.path = outcome.path;
+                completed.fileSizeBytes = outcome.fileSizeBytes;
+                completed.duration = outcome.duration;
+                completed.durationKnown = outcome.durationMeasured;
+                completed.verified = outcome.verified;
+                completed.findings = outcome.findings;
+                completed.warnings = outcome.warnings;
+                completed.jobId = outcome.jobId;
             } else {
-                merge_.succeeded = false;
-                merge_.message = result.error().toString();
+                completed.succeeded = false;
+                completed.message = result.error().toString();
             }
         }
-        merge_.running = false;
-        mergeBusy_ = false;
+        completed.running = false;
+        mergeResult_ = std::move(completed);
         mergeWorkerFinished_ = true;
     });
 }
@@ -1116,18 +1119,23 @@ UiController::~UiController() {
 }
 
 void UiController::waitForMerge() {
-    // Joins a finished merge worker.  Never blocks on one that is still running,
-    // which is the same rule the split worker follows: a test and a shutdown path
-    // both need "wait until it is done" without turning it into "wait forever".
-    reapFinishedMergeWorker();
     if (mergeWorker_.joinable()) {
         mergeWorker_.join();
     }
+    reapFinishedMergeWorker();
 }
 
 void UiController::reapFinishedMergeWorker() {
-    if (mergeWorker_.joinable() && mergeWorkerFinished_.load()) {
+    if (!mergeWorkerFinished_.load()) {
+        return;
+    }
+    if (mergeWorker_.joinable()) {
         mergeWorker_.join();
+    }
+    if (mergeResult_.has_value()) {
+        merge_ = std::move(*mergeResult_);
+        mergeResult_.reset();
+        mergeBusy_ = false;
     }
 }
 

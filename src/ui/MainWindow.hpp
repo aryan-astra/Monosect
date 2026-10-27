@@ -21,6 +21,7 @@ namespace monosect::ui {
 
 /// Opens the window, runs the message/draw loop and returns the process exit
 /// code (0 = the window closed normally).
-[[nodiscard]] int runApplicationWindow(std::string appVersion);
+/// smokeTest renders one frame without downloading tools or starting jobs.
+[[nodiscard]] int runApplicationWindow(std::string appVersion, bool smokeTest = false);
 
 } // namespace monosect::ui
