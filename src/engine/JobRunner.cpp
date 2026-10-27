@@ -991,9 +991,9 @@ Result<JobOutcome> JobRunner::runInternal(const JobRequest& request, const JobEv
             if (!verification.has_value()) {
                 committer.discard(temporaryPath);
                 cleanUpWorkingFolder(request);
-                outcome.finalState = JobState::Failed;
+                outcome.canceled = verification.error().code == ErrorCode::ProcessCanceled;
                 outcome.message = verification.error().message;
-                setState(JobState::Failed, outcome.message);
+                setState(outcome.canceled ? JobState::Cancelled : JobState::Failed, outcome.message);
                 stampExecution();
                 return outcome;
             }
@@ -1104,6 +1104,16 @@ Result<JobOutcome> JobRunner::runInternal(const JobRequest& request, const JobEv
                             // Keep the calibration from the verified part.
                         }
                     }
+                }
+
+                if (canceled()) {
+                    committer.discard(verifiedPath);
+                    cleanUpWorkingFolder(request);
+                    outcome.canceled = true;
+                    outcome.message = "Cancelled before publishing part " + std::to_string(segment.index) + ".";
+                    setState(JobState::Cancelled, outcome.message);
+                    stampExecution();
+                    return outcome;
                 }
 
                 // Publish.

@@ -600,6 +600,10 @@ int commandSplit(const Options& options) {
     JobEvents events;
     const bool quiet = options.quiet;
     events.onState = [&](JobState state, const std::string& message) {
+        // Harness-only injection makes verification cancellation reproducible.
+        if (state == JobState::Verifying && std::getenv("MONOSECT_TEST_CANCEL_ON_VERIFY") != nullptr) {
+            g_cancelRequested = 1;
+        }
         if (!quiet) {
             std::cout << "[" << jobStateName(state) << "] " << message << "\n";
         }

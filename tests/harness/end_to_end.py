@@ -655,6 +655,20 @@ def section_history(cli: str, main: Path, fixtures: Path, work: Path) -> None:
 # ---------------------------------------------------------------------------
 def section_cancel(cli: str, fixtures: Path, work: Path) -> None:
     section("cancellation")
+    verify_out = work / "cancel-during-verification"
+    verify_db = work / "cancel-verification.jsonl"
+    verification_cancel = subprocess.run(
+        [cli, "split", str(fixtures / "h264_cfr.mp4"), "--duration", "3", "--out", str(verify_out),
+         "--verify-decode", "--db", str(verify_db)],
+        env={**os.environ, "MONOSECT_TEST_CANCEL_ON_VERIFY": "1"},
+        capture_output=True, text=True, timeout=120,
+    )
+    REPORT.ok("verification cancellation returns the cancelled exit code",
+              verification_cancel.returncode == 3, verification_cancel.stdout + verification_cancel.stderr)
+    verify_records = [json.loads(line) for line in verify_db.read_text(encoding="utf-8").splitlines() if line.strip()] if verify_db.exists() else []
+    REPORT.ok("verification cancellation records cancelled and publishes no files",
+              bool(verify_records) and verify_records[-1].get("state") == "cancelled"
+              and not any(verify_out.iterdir()), str(verify_records[-1:]))
     if "cancel" in SKIP:
         REPORT.skip("cancellation", "skipped by MONOSECT_E2E_SKIP")
         return
@@ -664,7 +678,9 @@ def section_cancel(cli: str, fixtures: Path, work: Path) -> None:
         return
     out = work / "split-cancel"
     log = work / "split-cancel.log"
-    command = [cli, "split", str(large), "--limit", "8MiB", "--out", str(out), "--verify-decode"]
+    database = work / "cancel-history.jsonl"
+    command = [cli, "split", str(large), "--limit", "8MiB", "--out", str(out), "--verify-decode",
+               "--db", str(database)]
     creation_flags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
     with open(log, "w", encoding="utf-8") as handle:
         process = subprocess.Popen(command, stdout=handle, stderr=subprocess.STDOUT,
@@ -692,6 +708,9 @@ def section_cancel(cli: str, fixtures: Path, work: Path) -> None:
     REPORT.ok(f"an interrupted split does not report success (exit {process.returncode})",
               process.returncode != 0, text[-2000:])
     REPORT.ok("the log says the job was cancelled", "cancel" in text.lower(), text[-2000:])
+    records = [json.loads(line) for line in database.read_text(encoding="utf-8").splitlines() if line.strip()] if database.exists() else []
+    REPORT.ok("cancellation is recorded as cancelled rather than failed",
+              bool(records) and records[-1].get("state") == "cancelled", str(records[-1:]))
     published = len(re.findall(r"^\s*published ", text, re.MULTILINE))
     present = [p for p in out.glob("*") if p.is_file() and not p.name.startswith(".")] if out.exists() else []
     REPORT.ok(f"every file in the output folder is a published (verified) part: "
