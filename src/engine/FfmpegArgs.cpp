@@ -314,7 +314,9 @@ Status writeConcatList(const std::filesystem::path& listPath,
                          "path: " + listPath.string(), "Check that the output folder is writable.");
     }
     for (const auto& part : parts) {
-        std::string path = part.generic_string();
+        // Relative siblings keep Win32 extended-path prefixes out of FFmpeg's concat parser.
+        std::string path = part.parent_path() == listPath.parent_path() ? part.filename().generic_string()
+                                                                       : part.generic_string();
         std::string escaped;
         for (const char c : path) {
             if (c == '\'') {

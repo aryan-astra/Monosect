@@ -1,6 +1,7 @@
 #include "TestSupport.hpp"
 #include "engine/JobStore.hpp"
 #include "engine/OutputCommitter.hpp"
+#include "engine/FfmpegArgs.hpp"
 
 #include <fstream>
 
@@ -18,6 +19,13 @@ MONOSECT_TEST(long_temporary_paths_can_be_verified_published_and_cleaned) {
         CHECK(stream.good());
     }
     CHECK(committer.fileSize(temporary).has_value());
+    const auto list = committer.jobDirectory() / "parts.list";
+    CHECK(writeConcatList(list, {temporary}).ok());
+    {
+        std::ifstream stream(list);
+        const std::string contents((std::istreambuf_iterator<char>(stream)), {});
+        CHECK(contents.find("file '" + temporary.filename().generic_string() + "'") == 0);
+    }
     CHECK(committer.flushToDisk(temporary).ok());
     const auto final = output / "published.mp4";
     CHECK(committer.commit(temporary, final).ok());

@@ -25,6 +25,7 @@ MONOSECT_TEST(placeholders_are_filled_and_unknown_ones_refused) {
 MONOSECT_TEST(windows_reserved_names_and_trailing_characters_are_repaired) {
     CHECK(isReservedDeviceName("CON"));
     CHECK(isReservedDeviceName("com1"));
+    CHECK(isReservedDeviceName("CON.archive.mp4"));
     CHECK(!isReservedDeviceName("console"));
     CHECK_EQ(std::string("name"), sanitizeFileName("name..."));
     CHECK_EQ(std::string("name"), sanitizeFileName("name   "));
@@ -32,6 +33,13 @@ MONOSECT_TEST(windows_reserved_names_and_trailing_characters_are_repaired) {
     CHECK_EQ(std::string("part"), sanitizeFileName("   "));
     CHECK(!sanitizeFileName("a\nb").empty());
     CHECK_EQ(std::string("vidéo été"), sanitizeFileName("vidéo été"));
+}
+
+MONOSECT_TEST(output_paths_reject_traversal_and_reserved_names) {
+    CHECK(validateOutputPath("out", "joined.mp4").has_value());
+    for (const char* name : {"../joined.mp4", "..\\joined.mp4", "C:\\joined.mp4", "CON.mp4", "a.mp4 ", ""}) {
+        CHECK(!validateOutputPath("out", name).has_value());
+    }
 }
 
 MONOSECT_TEST(collisions_resolve_deterministically) {

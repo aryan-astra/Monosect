@@ -101,6 +101,18 @@ Result<SplitPlan> JobRunner::planOnly(const JobRequest& request, const JobEvents
     if (!plan.has_value()) {
         return plan;
     }
+    for (const auto& segment : plan.value().segments) {
+        const auto output = validateOutputPath(request.outputDirectory, segment.outputFileName);
+        if (!output.has_value()) {
+            return failure<SplitPlan>(output.error());
+        }
+        std::error_code error;
+        if (request.naming.overwriteExisting &&
+            std::filesystem::equivalent(request.sourcePath, output.value(), error)) {
+            return Error{ErrorCode::ConstraintInvalid, "A split output cannot replace the source file.",
+                         output.value(), "Choose a different naming pattern or output folder."};
+        }
+    }
 
     for (const auto& issue : report.issues) {
         if (issue.severity == ConstraintIssue::Severity::Warning) {
@@ -578,7 +590,8 @@ Result<JobRunner::RenderResult> JobRunner::renderSmartCut(const SplitPlan& plan,
     }
     ProcessSpec concatSpec;
     concatSpec.program = ffmpegPath_;
-    concatSpec.arguments = concatArgs(listPath.string(), temporaryPath.string(),
+    concatSpec.workingDirectory = listPath.parent_path().string();
+    concatSpec.arguments = concatArgs(listPath.filename().string(), temporaryPath.string(),
                                       containerNameForExtension(plan.outputExtension));
     const ProcessResult concatResult = runner_.run(concatSpec, callbacks);
     std::error_code error;
@@ -1092,6 +1105,11 @@ Result<JobOutcome> JobRunner::runInternal(const JobRequest& request, const JobEv
                 const Status flushStatus = committer.flushToDisk(verifiedPath);
                 if (!flushStatus.ok()) {
                     log(flushStatus.error.toString());
+                    log("the verified temporary file was kept: " + verifiedPath.string());
+                    outcome.message = flushStatus.error.message;
+                    setState(JobState::Failed, outcome.message);
+                    stampExecution();
+                    return outcome;
                 }
                 const Status commitStatus = committer.commit(verifiedPath, finalPath);
                 if (!commitStatus.ok()) {

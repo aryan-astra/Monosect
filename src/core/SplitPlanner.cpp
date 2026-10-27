@@ -759,10 +759,14 @@ Result<SplitPlan> SplitPlanner::buildPlan(const std::string& outputDirectory, in
 Result<SplitPlan> SplitPlanner::plan(const std::string& outputDirectory) {
     stats_ = PlannerStats{};
     Rational start{0, 1};
-    if (const StreamPacketTrack* track = boundaryTrack(); track != nullptr) {
-        if (auto first = track->firstPresentationTime(); first.has_value() &&
-                                                         compareRational(*first, Rational{0, 1}) > 0) {
-            start = *first;
+    bool foundStart = false;
+    for (const auto& track : index_.tracks()) {
+        for (const auto& packet : track.packets()) {
+            if (!packet.isDiscard() && packet.presentationSeconds.isValid() &&
+                (!foundStart || compareRational(packet.presentationSeconds, start) < 0)) {
+                start = packet.presentationSeconds;
+                foundStart = true;
+            }
         }
     }
     if (!model_.durationResolved.known() && !constraint_.hasDurationLimit()) {

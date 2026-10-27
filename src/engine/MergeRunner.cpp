@@ -116,8 +116,17 @@ MergeRunner::MergeRunner(FFprobeService& prober, IProcessRunner& runner, std::st
     : prober_(prober), runner_(runner), ffmpegPath_(std::move(ffmpegPath)) {}
 
 Result<MergePlan> MergeRunner::planOnly(const MergeJobRequest& request, const JobEvents& events) {
+    const auto output = validateOutputPath(request.outputDirectory, request.outputFileName);
+    if (!output.has_value()) {
+        return failure<MergePlan>(output.error());
+    }
     std::vector<MediaModel> models;
     for (const std::string& input : request.inputs) {
+        std::error_code error;
+        if (request.overwriteExisting && std::filesystem::equivalent(input, output.value(), error)) {
+            return Error{ErrorCode::ConstraintInvalid, "The merged output cannot replace an input file.", input,
+                         "Choose a different output name."};
+        }
         auto model = prober_.probe(input);
         if (!model.has_value()) {
             return failure<MergePlan>(model.error());
@@ -612,6 +621,8 @@ Result<MergeOutcome> MergeRunner::runInternal(const MergeJobRequest& request, co
     const Status flushStatus = committer.flushToDisk(temporaryPath);
     if (!flushStatus.ok()) {
         log(flushStatus.error.toString());
+        log("the verified temporary file was kept: " + temporaryPath.string());
+        return failure<MergeOutcome>(flushStatus.error);
     }
     const Status commitStatus = committer.commit(temporaryPath, outputPath);
     if (!commitStatus.ok()) {

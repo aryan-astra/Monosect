@@ -160,3 +160,26 @@ MONOSECT_TEST(replanning_starts_at_the_actual_completed_boundary) {
     CHECK(tail.has_value());
     CHECK(tail.value().endsAtSourceEnd);
 }
+
+MONOSECT_TEST(the_source_start_includes_audio_before_the_first_video_frame) {
+    SyntheticSource source = makeSyntheticSource();
+    PacketIndex shifted;
+    for (const auto& original : source.index.tracks()) {
+        StreamPacketTrack track(original.streamIndex(), original.timebase());
+        for (auto packet : original.packets()) {
+            if (original.streamIndex() == 0) {
+                packet.presentationSeconds = addRational(packet.presentationSeconds, Rational{1, 1}).value();
+                packet.endSeconds = addRational(packet.endSeconds, Rational{1, 1}).value();
+            }
+            track.add(packet);
+        }
+        shifted.addTrack(std::move(track));
+    }
+    shifted.finalize();
+    source.index = std::move(shifted);
+    UserConstraint constraint;
+    constraint.duration = DurationLimit{Rational{3, 1}};
+    const auto plan = planFor(source, constraint);
+    CHECK(plan.planned);
+    CHECK(plan.segments.front().startSeconds.isZero());
+}

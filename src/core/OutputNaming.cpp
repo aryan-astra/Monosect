@@ -124,7 +124,7 @@ std::string sanitizeFileName(std::string_view name) {
 
 bool isReservedDeviceName(std::string_view name) {
     std::string stem(name);
-    if (const std::size_t dot = stem.find_last_of('.'); dot != std::string::npos) {
+    if (const std::size_t dot = stem.find('.'); dot != std::string::npos) {
         stem = stem.substr(0, dot);
     }
     // Windows resolves "CON.txt" to the device as well, and trailing spaces are
@@ -277,6 +277,10 @@ Result<std::string> validateOutputPath(const std::string& directory, const std::
     if (fileName.empty()) {
         return Error{ErrorCode::OutputWriteFailed, "The output file name is empty.", "",
                      "Check the naming pattern."};
+    }
+    if (fileName != sanitizeFileName(fileName) || isReservedDeviceName(fileName)) {
+        return Error{ErrorCode::ConstraintInvalid, "The output name is not a valid file name.", fileName,
+                     "Use a file name without folders, reserved names or trailing dots and spaces."};
     }
     std::string path = directory;
     if (!path.empty() && path.back() != '/' && path.back() != '\\') {

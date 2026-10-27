@@ -66,6 +66,32 @@ Result<SegmentMeasurement> VerificationEngine::measure(const std::filesystem::pa
         measurement.duration = *model.value().durationResolved.seconds;
         measurement.durationKnown = true;
     }
+    auto packets = prober_.packetIndex(file);
+    if (!packets.has_value()) {
+        return failure<SegmentMeasurement>(packets.error());
+    }
+    std::optional<Rational> first;
+    std::optional<Rational> last;
+    for (const auto& track : packets.value().tracks()) {
+        for (const auto& packet : track.packets()) {
+            if (packet.isDiscard() || !packet.presentationSeconds.isValid()) {
+                continue;
+            }
+            if (!first || compareRational(packet.presentationSeconds, *first) < 0) {
+                first = packet.presentationSeconds;
+            }
+            if (packet.endSeconds.isValid() && (!last || compareRational(packet.endSeconds, *last) > 0)) {
+                last = packet.endSeconds;
+            }
+        }
+    }
+    if (first && last) {
+        const auto span = subtractRational(*last, *first);
+        if (span.has_value() && (!measurement.durationKnown || compareRational(span.value(), measurement.duration) > 0)) {
+            measurement.duration = span.value();
+            measurement.durationKnown = true;
+        }
+    }
 
     if (policy_.requireKeyframeStart) {
         auto keyframe = firstVideoPacketIsKeyframe(file, shouldCancel);
